@@ -4,15 +4,14 @@ import face_recognition
 import google.generativeai as genai
 
 app = Flask(__name__)
-app.json.ensure_ascii = False  # Hiển thị tiếng Việt nguyên bản, không bị mã hóa \uXXXX
+app.json.ensure_ascii = False  # Hiển thị tiếng Việt nguyên bản
 
-# ================= 1. CẤU HÌNH GEMINI AI API =================
+# ================= 1. CẤU HÌNH GEMINI API =================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-else:
-    print("WARNING: Chưa cấu hình GEMINI_API_KEY trong Environment!")
+
 
 # ================= 2. ĐẶT VAI TRÒ & PHONG CÁCH CHO AI =================
 # DÁN MẪU PHONG CÁCH NÓI CHUYỆN CỦA BẠN VÀO GIỮA DẤU """ TRONG NÀY:
@@ -63,29 +62,65 @@ Tự nhiên, hữu ích, sống động như một người cá tính.
 #- Luôn xưng "Em" hoặc "Robot Boti" và gọi người dùng là "Chủ nhân".
 
 
+import os
+from flask import Flask, request, jsonify
+import face_recognition
+import google.generativeai as genai
 
-# Danh sách các tên model ưu tiên theo thứ tự
-candidate_models = ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-pro"]
-model = None
+app = Flask(__name__)
+app.json.ensure_ascii = False  # Hiển thị tiếng Việt nguyên bản
 
-for m_name in candidate_models:
+# ================= 1. CẤU HÌNH GEMINI API =================
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+SYSTEM_PROMPT = """
+Bạn là một Robot trợ lý cá nhân tên là Boti.
+- Luôn xưng "Em" hoặc "Robot Boti" và gọi người dùng là "Chủ nhân".
+- Trả lời ngắn gọn, súc tích (dưới 3 câu).
+- Không dùng ký tự đặc biệt hay icon.
+"""
+
+
+
+# ================= 2. HÀM TỰ ĐỘNG DÒ TÌM MODEL ĐANG HOẠT ĐỘNG =================
+def get_working_model():
     try:
-        model = genai.GenerativeModel(
-            model_name=m_name,
+        # Tự động hỏi Google danh sách các model khả dụng
+        active_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                active_models.append(m.name)
+        
+        print("Danh sách model Google hỗ trợ hiện tại:", active_models)
+
+        if not active_models:
+            print("Lỗi: Không tìm thấy model nào hỗ trợ generateContent!")
+            return None
+
+        # Ưu tiên chọn model có chữ 'flash' (nhanh nhẹn nhất cho Robot)
+        chosen_model_name = active_models[0]
+        for name in active_models:
+            if 'flash' in name.lower():
+                chosen_model_name = name
+                break
+
+        print(f"-> ĐÃ TỰ ĐỘNG CHỌN MODEL THÀNH CÔNG: {chosen_model_name}")
+        return genai.GenerativeModel(
+            model_name=chosen_model_name,
             system_instruction=SYSTEM_PROMPT
         )
-        print(f"-> Khởi tạo thành công Gemini Model: {m_name}")
-        break
     except Exception as e:
-        print(f"Thử model {m_name} không thành công, đang thử model tiếp theo...")
+        print("Lỗi khi dò tìm model:", e)
+        return None
 
-# Nếu không khởi tạo được model nào trong danh sách thì lấy mặc định gemini-2.0-flash
-if not model:
-    model = genai.GenerativeModel(
-        model_name="gemini-2.0-flash",
-        system_instruction=SYSTEM_PROMPT
-    )
-    
+# Khởi tạo model ban đầu
+model = None
+if GEMINI_API_KEY:
+    model = get_working_model()
+
 # Nạp ảnh chủ nhân
 try:
     owner_image = face_recognition.load_image_file("known_faces/chunhan.jpg")
@@ -119,8 +154,10 @@ def verify_face():
     except Exception as e:
         return "ERROR", 500
 
+# ================= 3. ENDPOINT CHÁT VỚI AI =================
 @app.route('/chat', methods=['POST'])
 def chat():
+    global model
     try:
         data = request.get_json()
         if not data or "message" not in data:
@@ -128,22 +165,24 @@ def chat():
 
         user_message = data.get("message", "")
 
-        # Gọi Gemini AI
+        # Nếu chưa có model, thử tìm lại model
+        if model is None:
+            model = get_working_model()
+            if model is None:
+                return jsonify({"reply": "Không kết nối được model AI nào. Vui lòng kiểm tra lại GEMINI_API_KEY trên Render!"}), 500
+
+        # Gửi câu hỏi cho AI
         response = model.generate_content(user_message)
         ai_reply = response.text.strip()
 
         return jsonify({"reply": ai_reply}), 200
 
     except Exception as e:
-        # In lỗi chi tiết ra tab Logs trên Render
-        print("======== LỖI CHI TIẾT CHAT API ========")
-        print(str(e))
-        print("========================================")
+        print("Lỗi Chat API:", str(e))
+        # Reset model để lần sau tự dò lại nếu gặp sự cố
+        model = None
         return jsonify({"reply": f"Em bị lỗi kết nối bộ não AI rồi! Chi tiết lỗi: {str(e)}"}), 500
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
