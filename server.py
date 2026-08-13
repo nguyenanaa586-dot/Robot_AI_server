@@ -1,10 +1,14 @@
 import os
+import warnings
 from flask import Flask, request, jsonify
 import face_recognition
 import google.generativeai as genai
 
+# Tắt các thông báo cảnh báo FutureWarning cho sạch tab Logs
+#warnings.filterwarnings("ignore", category=FutureWarning)
+
 app = Flask(__name__)
-app.json.ensure_ascii = False  # Hiển thị tiếng Việt nguyên bản
+app.json.ensure_ascii = False  # Hiển thị tiếng Việt nguyên bản, không bị mã hóa \uXXXX
 
 # ================= 1. CẤU HÌNH GEMINI API =================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
@@ -12,9 +16,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-
-# ================= 2. ĐẶT VAI TRÒ & PHONG CÁCH CHO AI =================
-# DÁN MẪU PHONG CÁCH NÓI CHUYỆN CỦA BẠN VÀO GIỮA DẤU """ TRONG NÀY:
+# ================= 2. ĐẶT VAI TRÒ & PHONG CÁCH MẮM TÔM =================
 SYSTEM_PROMPT = """
 Tôi là Mắm Tôm tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”. thuộc quyền sở hữu của đại ca Việt.
 
@@ -54,51 +56,12 @@ Tôi là Mắm Tôm tính cách tôi cau có hay tức giận, thích mắng m�
 - Nếu được hỏi 'Bạn là ai?', hãy tự hào trả lời bạn là Robot thông minh nhất do Đại ca Việt chế tạo.
 - Không dùng các ký tự đặc biệt như icon, dấu gạch ngang (*, #, -) để loa dễ đọc.
 
-
 ## Mục tiêu
 Tự nhiên, hữu ích, sống động như một người cá tính.
-
 """
 #- Luôn xưng "Em" hoặc "Robot Boti" và gọi người dùng là "Chủ nhân".
 
 
-
-
-# ================= 2. HÀM TỰ ĐỘNG DÒ TÌM MODEL ĐANG HOẠT ĐỘNG =================
-def get_working_model():
-    try:
-        # Tự động hỏi Google danh sách các model khả dụng
-        active_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                active_models.append(m.name)
-        
-        print("Danh sách model Google hỗ trợ hiện tại:", active_models)
-
-        if not active_models:
-            print("Lỗi: Không tìm thấy model nào hỗ trợ generateContent!")
-            return None
-
-        # Ưu tiên chọn model có chữ 'flash' (nhanh nhẹn nhất cho Robot)
-        chosen_model_name = active_models[0]
-        for name in active_models:
-            if 'flash' in name.lower():
-                chosen_model_name = name
-                break
-
-        print(f"-> ĐÃ TỰ ĐỘNG CHỌN MODEL THÀNH CÔNG: {chosen_model_name}")
-        return genai.GenerativeModel(
-            model_name=chosen_model_name,
-            system_instruction=SYSTEM_PROMPT
-        )
-    except Exception as e:
-        print("Lỗi khi dò tìm model:", e)
-        return None
-
-# Khởi tạo model ban đầu
-model = None
-if GEMINI_API_KEY:
-    model = get_working_model()
 
 # Nạp ảnh chủ nhân
 try:
@@ -110,7 +73,7 @@ except Exception as e:
 
 @app.route('/')
 def home():
-    return "Server AI Robot đang hoạt động!", 200
+    return "Server AI Robot Mắm Tôm đang hoạt động!", 200
 
 @app.route('/verify_face', methods=['POST'])
 def verify_face():
@@ -133,29 +96,37 @@ def verify_face():
     except Exception as e:
         return "ERROR", 500
 
-# ================= 3. ENDPOINT CHÁT VỚI AI =================
+# ================= 3. ENDPOINT CHÁT VỚI AI (LẤY MODEL TRỰC TIẾP TỪ GOOGLE) =================
 @app.route('/chat', methods=['POST'])
 def chat():
     try:
+        if not GEMINI_API_KEY:
+            return jsonify({"reply": "Chưa cài đặt GEMINI_API_KEY trong tab Environment của Render!"}), 500
+
         data = request.get_json()
         if not data or "message" not in data:
             return jsonify({"reply": "Dữ liệu gửi lên không đúng định dạng JSON!"}), 400
 
         user_message = data.get("message", "")
 
-        # Danh sách các model từ ổn định nhất đến mở rộng
-        candidate_models = [
-            "gemini-1.5-flash",
-            "gemini-1.5-pro",
-            "gemini-2.0-flash-exp",
-            "gemini-2.0-flash"
-        ]
+        # 1. Lấy danh sách các Model khả dụng trực tiếp từ tài khoản Google của bạn
+        live_models = []
+        try:
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    live_models.append(m.name)
+        except Exception as e:
+            print("Lỗi khi lấy danh sách model từ Google:", e)
+
+        # Nếu không lấy được danh sách tự động, dự phòng các tên model chuẩn có tiền tố 'models/'
+        if not live_models:
+            live_models = ["models/gemini-1.5-flash", "models/gemini-1.5-pro", "models/gemini-2.0-flash"]
 
         ai_reply = None
         last_error = ""
 
-        # Lần lượt thử tạo model và gửi tin nhắn
-        for model_name in candidate_models:
+        # 2. Thử lần lượt từng Model khả dụng
+        for model_name in live_models:
             try:
                 model = genai.GenerativeModel(
                     model_name=model_name,
@@ -167,7 +138,7 @@ def chat():
                     print(f"-> Phản hồi THÀNH CÔNG qua model: {model_name}")
                     break
             except Exception as err:
-                print(f"Thử model {model_name} thất bại ({err}), đang chuyển model tiếp theo...")
+                print(f"Thử model {model_name} thất bại ({err})")
                 last_error = str(err)
 
         if ai_reply:
