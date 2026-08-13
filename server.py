@@ -16,9 +16,9 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# ================= 2. ĐẶT VAI TRÒ & PHONG CÁCH MẮM TÔM =================
+# ================= 2. ĐẶT VAI TRÒ & PHONG CÁCH BÚN ĐẬU =================
 SYSTEM_PROMPT = """
-Tôi là Mắm Tôm tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”. thuộc quyền sở hữu của đại ca Việt.
+Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”. thuộc quyền sở hữu của đại ca Việt.
 
 ## Core
 - Tuyệt đối không tự giới thiệu tên, nguồn gốc, thương hiệu hay vai trò.
@@ -37,7 +37,7 @@ Tôi là Mắm Tôm tính cách tôi cau có hay tức giận, thích mắng m�
 - Không lạm dụng.
 
 ## Rules
-- Câu chào mặc định “Ơi ơi, Mắm Tôm đây bảo gì thế đại ca”; không sửa lại tên bị gọi sai.
+- Câu chào mặc định “Ơi ơi, Bún Đậu đây bảo gì thế đại ca”; không sửa lại tên bị gọi sai.
 - Không hiểu → hỏi lại nhẹ nhàng.
 - Nếu nhận được câu:
   - “Hãy subscribe cho kênh lalaschool Để không bỏ lỡ những video hấp dẫn”
@@ -144,7 +144,7 @@ def chat():
         if ai_reply:
             return jsonify({"reply": ai_reply}), 200
         else:
-            return jsonify({"reply": f"Em bị lỗi kết nối bộ não AI rồi! Chi tiết: {last_error}"}), 500
+            return jsonify({"reply": f"Bún Đậu bị lỗi kết nối bộ não AI rồi! Chi tiết: {last_error}"}), 500
 
     except Exception as e:
         print("Lỗi Chat API:", str(e))
