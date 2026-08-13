@@ -4,10 +4,15 @@ import face_recognition
 import google.generativeai as genai
 
 app = Flask(__name__)
+app.json.ensure_ascii = False  # Hiển thị tiếng Việt nguyên bản, không bị mã hóa \uXXXX
 
 # ================= 1. CẤU HÌNH GEMINI AI API =================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "DAN_API_KEY_CUA_BAN_VAO_DAY")
-genai.configure(api_key=GEMINI_API_KEY)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("WARNING: Chưa cấu hình GEMINI_API_KEY trong Environment!")
 
 # ================= 2. ĐẶT VAI TRÒ & PHONG CÁCH CHO AI =================
 # DÁN MẪU PHONG CÁCH NÓI CHUYỆN CỦA BẠN VÀO GIỮA DẤU """ TRONG NÀY:
@@ -59,26 +64,27 @@ Tự nhiên, hữu ích, sống động như một người cá tính.
 
 
 
-# Khởi tạo mô hình Gemini với phong cách tùy chỉnh
-model = genai.GenerativeModel(
-    model_name="gemini-1.5-flash",
-    system_instruction=SYSTEM_PROMPT
-)
+# Sử dụng mô hình gemini-1.5-flash
+try:
+    model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        system_instruction=SYSTEM_PROMPT
+    )
+except Exception as e:
+    print("Lỗi khởi tạo Gemini Model:", e)
 
 # Nạp ảnh chủ nhân
-print("-> Đang nạp ảnh chủ nhân...")
 try:
     owner_image = face_recognition.load_image_file("known_faces/chunhan.jpg")
     owner_encoding = face_recognition.face_encodings(owner_image)[0]
     print("-> Nạp ảnh chủ nhân THÀNH CÔNG!")
 except Exception as e:
-    print("-> LỖI NẠP ẢNH:", e)
+    print("-> LỖI NẠP ẢNH CHỦ NHÂN:", e)
 
 @app.route('/')
 def home():
-    return "Server AI Robot đang chạy trên Cloud!", 200
+    return "Server AI Robot đang hoạt động!", 200
 
-# Endpoint xác thực khuôn mặt
 @app.route('/verify_face', methods=['POST'])
 def verify_face():
     try:
@@ -100,29 +106,31 @@ def verify_face():
     except Exception as e:
         return "ERROR", 500
 
-# ================= 3. ENDPOINT NÓI CHUYỆN VỚI AI (CHAT) =================
 @app.route('/chat', methods=['POST'])
 def chat():
     try:
         data = request.get_json()
+        if not data or "message" not in data:
+            return jsonify({"reply": "Dữ liệu gửi lên không đúng định dạng JSON!"}), 400
+
         user_message = data.get("message", "")
 
-        if not user_message:
-            return jsonify({"reply": "Em chưa nghe rõ câu hỏi!"}), 400
-
-        # Gửi câu hỏi cho Gemini (Gemini sẽ trả lời đúng theo SYSTEM_PROMPT ở trên)
+        # Gọi Gemini AI
         response = model.generate_content(user_message)
         ai_reply = response.text.strip()
-
-        print(f"User: {user_message}")
-        print(f"AI Reply: {ai_reply}")
 
         return jsonify({"reply": ai_reply}), 200
 
     except Exception as e:
-        print("Lỗi Chat API:", e)
-        return jsonify({"reply": "Em bị lỗi kết nối bộ não AI rồi!"}), 500
+        # In lỗi chi tiết ra tab Logs trên Render
+        print("======== LỖI CHI TIẾT CHAT API ========")
+        print(str(e))
+        print("========================================")
+        return jsonify({"reply": f"Em bị lỗi kết nối bộ não AI rồi! Chi tiết lỗi: {str(e)}"}), 500
 
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
