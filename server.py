@@ -64,15 +64,28 @@ Tự nhiên, hữu ích, sống động như một người cá tính.
 
 
 
-# Sử dụng mô hình gemini-1.5-flash
-try:
+# Danh sách các tên model ưu tiên theo thứ tự
+candidate_models = ["gemini-2.0-flash", "gemini-1.5-flash-latest", "gemini-1.5-pro"]
+model = None
+
+for m_name in candidate_models:
+    try:
+        model = genai.GenerativeModel(
+            model_name=m_name,
+            system_instruction=SYSTEM_PROMPT
+        )
+        print(f"-> Khởi tạo thành công Gemini Model: {m_name}")
+        break
+    except Exception as e:
+        print(f"Thử model {m_name} không thành công, đang thử model tiếp theo...")
+
+# Nếu không khởi tạo được model nào trong danh sách thì lấy mặc định gemini-2.0-flash
+if not model:
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
+        model_name="gemini-2.0-flash",
         system_instruction=SYSTEM_PROMPT
     )
-except Exception as e:
-    print("Lỗi khởi tạo Gemini Model:", e)
-
+    
 # Nạp ảnh chủ nhân
 try:
     owner_image = face_recognition.load_image_file("known_faces/chunhan.jpg")
