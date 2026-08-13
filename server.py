@@ -62,27 +62,6 @@ Tự nhiên, hữu ích, sống động như một người cá tính.
 #- Luôn xưng "Em" hoặc "Robot Boti" và gọi người dùng là "Chủ nhân".
 
 
-import os
-from flask import Flask, request, jsonify
-import face_recognition
-import google.generativeai as genai
-
-app = Flask(__name__)
-app.json.ensure_ascii = False  # Hiển thị tiếng Việt nguyên bản
-
-# ================= 1. CẤU HÌNH GEMINI API =================
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-
-SYSTEM_PROMPT = """
-Bạn là một Robot trợ lý cá nhân tên là Boti.
-- Luôn xưng "Em" hoặc "Robot Boti" và gọi người dùng là "Chủ nhân".
-- Trả lời ngắn gọn, súc tích (dưới 3 câu).
-- Không dùng ký tự đặc biệt hay icon.
-"""
-
 
 
 # ================= 2. HÀM TỰ ĐỘNG DÒ TÌM MODEL ĐANG HOẠT ĐỘNG =================
@@ -157,7 +136,6 @@ def verify_face():
 # ================= 3. ENDPOINT CHÁT VỚI AI =================
 @app.route('/chat', methods=['POST'])
 def chat():
-    global model
     try:
         data = request.get_json()
         if not data or "message" not in data:
@@ -165,23 +143,41 @@ def chat():
 
         user_message = data.get("message", "")
 
-        # Nếu chưa có model, thử tìm lại model
-        if model is None:
-            model = get_working_model()
-            if model is None:
-                return jsonify({"reply": "Không kết nối được model AI nào. Vui lòng kiểm tra lại GEMINI_API_KEY trên Render!"}), 500
+        # Danh sách các model từ ổn định nhất đến mở rộng
+        candidate_models = [
+            "gemini-1.5-flash",
+            "gemini-1.5-pro",
+            "gemini-2.0-flash-exp",
+            "gemini-2.0-flash"
+        ]
 
-        # Gửi câu hỏi cho AI
-        response = model.generate_content(user_message)
-        ai_reply = response.text.strip()
+        ai_reply = None
+        last_error = ""
 
-        return jsonify({"reply": ai_reply}), 200
+        # Lần lượt thử tạo model và gửi tin nhắn
+        for model_name in candidate_models:
+            try:
+                model = genai.GenerativeModel(
+                    model_name=model_name,
+                    system_instruction=SYSTEM_PROMPT
+                )
+                response = model.generate_content(user_message)
+                if response and response.text:
+                    ai_reply = response.text.strip()
+                    print(f"-> Phản hồi THÀNH CÔNG qua model: {model_name}")
+                    break
+            except Exception as err:
+                print(f"Thử model {model_name} thất bại ({err}), đang chuyển model tiếp theo...")
+                last_error = str(err)
+
+        if ai_reply:
+            return jsonify({"reply": ai_reply}), 200
+        else:
+            return jsonify({"reply": f"Em bị lỗi kết nối bộ não AI rồi! Chi tiết: {last_error}"}), 500
 
     except Exception as e:
         print("Lỗi Chat API:", str(e))
-        # Reset model để lần sau tự dò lại nếu gặp sự cố
-        model = None
-        return jsonify({"reply": f"Em bị lỗi kết nối bộ não AI rồi! Chi tiết lỗi: {str(e)}"}), 500
+        return jsonify({"reply": f"Lỗi Server: {str(e)}"}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
