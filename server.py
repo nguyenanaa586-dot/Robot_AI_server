@@ -64,6 +64,7 @@ Tự nhiên, hữu ích, sống động như một người cá tính.
 
 
 
+
 # Nạp ảnh chủ nhân
 try:
     owner_image = face_recognition.load_image_file("known_faces/chunhan.jpg")
