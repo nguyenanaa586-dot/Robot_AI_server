@@ -3,3 +3,4 @@ gunicorn
 face_recognition
 Pillow
 gTTS
+google-generativeai
