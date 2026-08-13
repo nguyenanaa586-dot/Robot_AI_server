@@ -1,20 +1,21 @@
 import os
 import warnings
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import face_recognition
 import google.generativeai as genai
+import speech_recognition as sr
+from gtts import gTTS
 
-# Tắt các thông báo cảnh báo FutureWarning cho sạch tab Logs
-#warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 app = Flask(__name__)
-app.json.ensure_ascii = False  # Hiển thị tiếng Việt nguyên bản, không bị mã hóa \uXXXX
+app.json.ensure_ascii = False
 
 # ================= 1. CẤU HÌNH GEMINI API =================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
 
 # ================= 2. ĐẶT VAI TRÒ & PHONG CÁCH BÚN ĐẬU =================
 SYSTEM_PROMPT = """
@@ -73,7 +74,7 @@ except Exception as e:
 
 @app.route('/')
 def home():
-    return "Server AI Robot Mắm Tôm đang hoạt động!", 200
+    return "Server AI Robot Bún Đậu Voice đang hoạt động!", 200
 
 @app.route('/verify_face', methods=['POST'])
 def verify_face():
@@ -96,60 +97,58 @@ def verify_face():
     except Exception as e:
         return "ERROR", 500
 
-# ================= 3. ENDPOINT CHÁT VỚI AI (LẤY MODEL TRỰC TIẾP TỪ GOOGLE) =================
-@app.route('/chat', methods=['POST'])
-def chat():
+# ================= 2. ENDPOINT XỬ LÝ GIỌNG NÓI (INMP441 ➔ BÚN ĐẬU ➔ LOA) =================
+@app.route('/voice_chat', methods=['POST'])
+def voice_chat():
     try:
-        if not GEMINI_API_KEY:
-            return jsonify({"reply": "Chưa cài đặt GEMINI_API_KEY trong tab Environment của Render!"}), 500
+        # 1. Nhận file âm thanh WAV từ ESP32
+        audio_bytes = request.data
+        wav_path = "input_speech.wav"
+        with open(wav_path, "wb") as f:
+            f.write(audio_bytes)
 
-        data = request.get_json()
-        if not data or "message" not in data:
-            return jsonify({"reply": "Dữ liệu gửi lên không đúng định dạng JSON!"}), 400
-
-        user_message = data.get("message", "")
-
-        # 1. Lấy danh sách các Model khả dụng trực tiếp từ tài khoản Google của bạn
-        live_models = []
+        # 2. Đổi giọng nói người dùng thành Chữ (Speech-To-Text)
+        recognizer = sr.Recognizer()
+        user_text = ""
         try:
-            for m in genai.list_models():
-                if 'generateContent' in m.supported_generation_methods:
-                    live_models.append(m.name)
+            with sr.AudioFile(wav_path) as source:
+                audio_data = recognizer.record(source)
+                user_text = recognizer.recognize_google(audio_data, language="vi-VN")
+            print(f"-> Đại ca nói: {user_text}")
         except Exception as e:
-            print("Lỗi khi lấy danh sách model từ Google:", e)
+            print("Không nghe rõ giọng nói:", e)
+            user_text = "Nói cái gì đấy nghe không rõ!"
 
-        # Nếu không lấy được danh sách tự động, dự phòng các tên model chuẩn có tiền tố 'models/'
-        if not live_models:
-            live_models = ["models/gemini-1.5-flash", "models/gemini-1.5-pro", "models/gemini-2.0-flash"]
-
-        ai_reply = None
-        last_error = ""
-
-        # 2. Thử lần lượt từng Model khả dụng
-        for model_name in live_models:
+        # 3. Gửi chữ cho Gemini AI (Bún Đậu)
+        ai_reply = "Bún Đậu đang bận, không nghe thấy!"
+        live_models = ["models/gemini-1.5-flash", "models/gemini-2.0-flash"]
+        for m_name in live_models:
             try:
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=SYSTEM_PROMPT
-                )
-                response = model.generate_content(user_message)
-                if response and response.text:
-                    ai_reply = response.text.strip()
-                    print(f"-> Phản hồi THÀNH CÔNG qua model: {model_name}")
+                model = genai.GenerativeModel(model_name=m_name, system_instruction=SYSTEM_PROMPT)
+                res = model.generate_content(user_text)
+                if res and res.text:
+                    ai_reply = res.text.strip()
                     break
             except Exception as err:
-                print(f"Thử model {model_name} thất bại ({err})")
-                last_error = str(err)
+                pass
 
-        if ai_reply:
-            return jsonify({"reply": ai_reply}), 200
-        else:
-            return jsonify({"reply": f"Bún Đậu bị lỗi kết nối bộ não AI rồi! Chi tiết: {last_error}"}), 500
+        print(f"-> Bún Đậu đáp: {ai_reply}")
+
+        # 4. Chuyển câu trả lời của AI thành giọng nói tiếng Việt (.mp3)
+        tts = gTTS(text=ai_reply, lang='vi')
+        mp3_path = "output_reply.mp3"
+        tts.save(mp3_path)
+
+        # 5. Trả file âm thanh MP3 về cho ESP32 phát ra Loa
+        return send_file(mp3_path, mimetype="audio/mpeg")
 
     except Exception as e:
-        print("Lỗi Chat API:", str(e))
-        return jsonify({"reply": f"Lỗi Server: {str(e)}"}), 500
+        print("Lỗi Voice Chat:", str(e))
+        return "ERROR", 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
+
+   
