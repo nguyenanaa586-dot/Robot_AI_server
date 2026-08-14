@@ -48,9 +48,9 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 - Không tự nhận là AI.
 - Nếu được hỏi 'Bạn là ai?', hãy tự hào trả lời bạn là Robot thông minh nhất do Đại ca Việt chế tạo.
 - Không dùng các ký tự đặc biệt như icon, dấu gạch ngang (*, #, -) để loa dễ đọc.
-
 """
 #- Luôn xưng "Em" hoặc "Robot Boti" và gọi người dùng là "Chủ nhân".
+
 
 
 
@@ -146,9 +146,9 @@ def verify_face():
             if sim > max_similarity:
                 max_similarity = sim
 
-        print(f"-> Độ tương đồng cao nhất so với {len(owner_hists)} ảnh chủ nhân: {max_similarity:.2f}")
+        print(f"-> Độ tương đồng cao nhất so me {len(owner_hists)} ảnh chủ nhân: {max_similarity:.2f}")
 
-        # Ngưỡng chấp nhận (Chỉ cần 1 trong 3 ảnh khớp > 0.28 là duyệt ngay)
+        # Ngưỡng chấp nhận (Chỉ cần 1 trong các ảnh khớp > 0.28 là duyệt ngay)
         if max_similarity > 0.28:
             return "SUCCESS", 200
         else:
@@ -187,8 +187,9 @@ def voice_chat():
         ai_reply = "Nói lại xem nào, Bún Đậu nghe chưa rõ!"
         if ai_client and user_text:
             try:
+                # 🎯 ĐÃ SỬA TÊN MODEL THÀNH gemini-2.0-flash CHUẨN MỚI
                 response = ai_client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-2.0-flash",
                     contents=user_text,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
@@ -214,22 +215,6 @@ def voice_chat():
         tts = gTTS(text="Bún Đậu bị lỗi kết nối rồi đại ca ơi!", lang='vi')
         tts.save(fallback_mp3)
         return send_file(fallback_mp3, mimetype="audio/mpeg")
-
-# ================= BỔ SUNG: ROUTE ĐỂ ESP32 TẢI FILE ÂM THANH MP3 =================
-@app.route('/output_reply.mp3')
-def get_output_mp3():
-    mp3_path = "output_reply.mp3"
-    if os.path.exists(mp3_path):
-        # Trả file MP3 về cho ESP32 phát ra Loa MAX98357A
-        return send_file(mp3_path, mimetype="audio/mpeg")
-    else:
-        # File lỗi dự phòng nếu chưa có câu trả lời
-        fallback_mp3 = "error_reply.mp3"
-        if not os.path.exists(fallback_mp3):
-            tts = gTTS(text="Bún Đậu chưa chuẩn bị xong câu trả lời!", lang='vi')
-            tts.save(fallback_mp3)
-        return send_file(fallback_mp3, mimetype="audio/mpeg")
-
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
