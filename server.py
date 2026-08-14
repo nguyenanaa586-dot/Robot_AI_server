@@ -187,9 +187,9 @@ def voice_chat():
         ai_reply = "Nói lại xem nào, Bún Đậu nghe chưa rõ!"
         if ai_client and user_text:
             try:
-                # 🎯 ĐÃ SỬA TÊN MODEL THÀNH gemini-2.0-flash CHUẨN MỚI
+                # 🎯 ĐÃ SỬA TÊN MODEL THÀNH gemini-1.5-flash CHUẨN MỚI
                 response = ai_client.models.generate_content(
-                    model="gemini-2.0-flash",
+                    model="gemini-1.5-flash",
                     contents=user_text,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
