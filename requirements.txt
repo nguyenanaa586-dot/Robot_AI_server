@@ -1,7 +1,6 @@
-Flask
-gunicorn
-face_recognition
-Pillow
-google-generativeai
-SpeechRecognition
-gTTS
+Flask==3.0.3
+opencv-python-headless==4.9.0.80
+numpy==1.26.4
+google-generativeai==0.8.3
+SpeechRecognition==3.10.4
+gTTS==2.5.1
