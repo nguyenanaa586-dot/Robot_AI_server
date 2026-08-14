@@ -5,7 +5,7 @@ import warnings
 import cv2
 import numpy as np
 from flask import Flask, request, jsonify, send_file
-# --- SỬ DỤNG THƯ VIỆN GEMINI SDK MỚI CỦA GOOGLE ---
+# --- THƯ VIỆN GEMINI SDK MỚI ---
 from google import genai
 from google.genai import types
 
@@ -17,12 +17,11 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 app = Flask(__name__)
 app.json.ensure_ascii = False
 
-# ================= 1. CẤU HÌNH GEMINI CLIENT (MỚI) =================
+# ================= 1. CẤU HÌNH GEMINI CLIENT =================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ai_client = None
 
 if GEMINI_API_KEY:
-    # Khởi tạo Client theo chuẩn SDK google-genai mới
     ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ================= 2. ĐẶT VAI TRÒ & PHONG CÁCH BÚN ĐẬU =================
@@ -49,48 +48,63 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 - Không tự nhận là AI.
 - Nếu được hỏi 'Bạn là ai?', hãy tự hào trả lời bạn là Robot thông minh nhất do Đại ca Việt chế tạo.
 - Không dùng các ký tự đặc biệt như icon, dấu gạch ngang (*, #, -) để loa dễ đọc.
+
 """
 #- Luôn xưng "Em" hoặc "Robot Boti" và gọi người dùng là "Chủ nhân".
 
 
 
-# ================= 3. QUẢN LÝ NHẬN DIỆN KHUÔN MẶT BẰNG OPENCV =================
+# ================= 3. NẠP TOÀN BỘ ẢNH TRONG THƯ MỤC KNOWN_FACES =================
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-owner_hist = None
-OWNER_IMG_PATH = "known_faces/chunhan.jpg"
+owner_hists = []  # Mảng chứa đặc trưng của TẤT CẢ ảnh chủ nhân
+OWNER_DIR = "known_faces"
 
-def init_owner_face():
-    global owner_hist
-    try:
-        if os.path.exists(OWNER_IMG_PATH):
-            img = cv2.imread(OWNER_IMG_PATH)
+def init_owner_faces():
+    global owner_hists
+    owner_hists = []
+    
+    if not os.path.exists(OWNER_DIR):
+        print(f"-> CẢNH BÁO: Chưa tạo thư mục {OWNER_DIR}")
+        return
+
+    # Lấy danh sách tất cả các file ảnh trong thư mục known_faces/
+    image_files = [f for f in os.listdir(OWNER_DIR) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+    print(f"-> Tìm thấy {len(image_files)} ảnh chủ nhân trong thư mục '{OWNER_DIR}': {image_files}")
+
+    for file_name in image_files:
+        img_path = os.path.join(OWNER_DIR, file_name)
+        try:
+            img = cv2.imread(img_path)
             if img is not None:
                 img = cv2.resize(img, (320, 240))
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4)
+                
                 if len(faces) > 0:
                     (x, y, w, h) = faces[0]
                     face_roi = gray[y:y+h, x:x+w]
-                    owner_hist = cv2.calcHist([face_roi], [0], None, [256], [0, 256])
-                    cv2.normalize(owner_hist, owner_hist, 0, 1, cv2.NORM_MINMAX)
-                    print("-> Nạp ảnh chủ nhân THÀNH CÔNG bằng OpenCV!")
+                    hist = cv2.calcHist([face_roi], [0], None, [256], [0, 256])
+                    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+                    
+                    owner_hists.append(hist) # Lưu Histogram của ảnh này vào mảng
+                    print(f"  + Nạp THÀNH CÔNG ảnh: {file_name}")
                 else:
-                    print("-> CẢNH BÁO: Không tìm thấy khuôn mặt trong chunhan.jpg")
-        else:
-            print(f"-> CẢNH BÁO: Không tìm thấy file {OWNER_IMG_PATH}")
-    except Exception as e:
-        print("-> LỖI NẠP ẢNH CHỦ NHÂN:", str(e))
+                    print(f"  - CẢNH BÁO: Không thấy khuôn mặt trong ảnh {file_name}")
+        except Exception as e:
+            print(f"  - Lỗi khi đọc ảnh {file_name}: {e}")
 
-init_owner_face()
+    print(f"=> TỔNG CỘNG ĐÃ NẠP THÀNH CÔNG {len(owner_hists)} MẪU KHUÔN MẶT CHỦ NHÂN!")
+
+init_owner_faces()
 
 def clean_text_for_tts(text):
-    """Làm sạch văn bản, loại bỏ các ký tự Markdown để gTTS đọc chuẩn nhất"""
+    """Loại bỏ ký tự đặc biệt Markdown để gTTS đọc chuẩn"""
     text = re.sub(r'[\*\#\-\_\~\`\>\[\]\(\)]', '', text)
     return text.strip()
 
 @app.route('/')
 def home():
-    return "Server AI Robot Bún Đậu Voice đang hoạt động mượt mà!", 200
+    return f"Server AI Robot Bún Đậu đang chạy! Đã nạp {len(owner_hists)} mẫu ảnh chủ nhân.", 200
 
 # ================= 4. ENDPOINT XÁC THỰC MẶT (/VERIFY_FACE) =================
 @app.route('/verify_face', methods=['POST'])
@@ -114,18 +128,28 @@ def verify_face():
         if len(faces) == 0:
             return "NO_FACE", 200
 
-        if owner_hist is None:
+        # Nếu chưa nạp được ảnh nào trong known_faces, mặc định thấy mặt là cho qua
+        if len(owner_hists) == 0:
+            print("-> Chưa có ảnh mẫu chủ nhân, cho qua mặc định.")
             return "SUCCESS", 200
 
+        # Cắt lấy khuôn mặt thu được từ ESP32
         (x, y, w, h) = faces[0]
         face_roi = gray[y:y+h, x:x+w]
         curr_hist = cv2.calcHist([face_roi], [0], None, [256], [0, 256])
         cv2.normalize(curr_hist, curr_hist, 0, 1, cv2.NORM_MINMAX)
 
-        similarity = cv2.compareHist(owner_hist, curr_hist, cv2.HISTCMP_CORREL)
-        print(f"-> Độ tương đồng khuôn mặt: {similarity:.2f}")
+        # 🎯 ĐỐI CHIẾU VỚI TẤT CẢ CÁC ẢNH CHỦ NHÂN TRONG MẢNG (LẤY ĐỘ TƯƠNG ĐỒNG CAO NHẤT)
+        max_similarity = 0.0
+        for hist in owner_hists:
+            sim = cv2.compareHist(hist, curr_hist, cv2.HISTCMP_CORREL)
+            if sim > max_similarity:
+                max_similarity = sim
 
-        if similarity > 0.30:
+        print(f"-> Độ tương đồng cao nhất so với {len(owner_hists)} ảnh chủ nhân: {max_similarity:.2f}")
+
+        # Ngưỡng chấp nhận (Chỉ cần 1 trong 3 ảnh khớp > 0.28 là duyệt ngay)
+        if max_similarity > 0.28:
             return "SUCCESS", 200
         else:
             return "DENIED", 200
@@ -146,7 +170,6 @@ def voice_chat():
             with open(wav_path, "wb") as f:
                 f.write(audio_bytes)
 
-            # 1. Speech-To-Text
             recognizer = sr.Recognizer()
             user_text = ""
             try:
@@ -161,11 +184,9 @@ def voice_chat():
             if os.path.exists(wav_path):
                 os.remove(wav_path)
 
-        # 2. Gửi câu thoại cho Gemini AI qua SDK mới google-genai
         ai_reply = "Nói lại xem nào, Bún Đậu nghe chưa rõ!"
         if ai_client and user_text:
             try:
-                # Gọi Model Gemini 2.5 Flash mới nhất
                 response = ai_client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=user_text,
@@ -177,11 +198,10 @@ def voice_chat():
                 if response and response.text:
                     ai_reply = clean_text_for_tts(response.text)
             except Exception as err:
-                print("Lỗi Gemini API (google-genai):", err)
+                print("Lỗi Gemini API:", err)
 
         print(f"-> Bún Đậu đáp: {ai_reply}")
 
-        # 3. Chuyển thành file MP3
         mp3_path = "output_reply.mp3"
         tts = gTTS(text=ai_reply, lang='vi')
         tts.save(mp3_path)
