@@ -5,7 +5,10 @@ import warnings
 import cv2
 import numpy as np
 from flask import Flask, request, jsonify, send_file
-import google.generativeai as genai
+# --- SỬ DỤNG THƯ VIỆN GEMINI SDK MỚI CỦA GOOGLE ---
+from google import genai
+from google.genai import types
+
 import speech_recognition as sr
 from gtts import gTTS
 
@@ -14,10 +17,13 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 app = Flask(__name__)
 app.json.ensure_ascii = False
 
-# ================= 1. CẤU HÌNH GEMINI API =================
+# ================= 1. CẤU HÌNH GEMINI CLIENT (MỚI) =================
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+ai_client = None
+
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    # Khởi tạo Client theo chuẩn SDK google-genai mới
+    ai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ================= 2. ĐẶT VAI TRÒ & PHONG CÁCH BÚN ĐẬU =================
 SYSTEM_PROMPT = """
@@ -48,9 +54,7 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 
 
 
-
-
-# ================= 3. QUẢN LÝ NHẬN DIỆN KHUÔN MẶT BẰNG OPENCV (SIÊU NHẸ) =================
+# ================= 3. QUẢN LÝ NHẬN DIỆN KHUÔN MẶT BẰNG OPENCV =================
 face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 owner_hist = None
 OWNER_IMG_PATH = "known_faces/chunhan.jpg"
@@ -67,7 +71,6 @@ def init_owner_face():
                 if len(faces) > 0:
                     (x, y, w, h) = faces[0]
                     face_roi = gray[y:y+h, x:x+w]
-                    # Tính Histogram khuôn mặt chủ nhân
                     owner_hist = cv2.calcHist([face_roi], [0], None, [256], [0, 256])
                     cv2.normalize(owner_hist, owner_hist, 0, 1, cv2.NORM_MINMAX)
                     print("-> Nạp ảnh chủ nhân THÀNH CÔNG bằng OpenCV!")
@@ -89,7 +92,7 @@ def clean_text_for_tts(text):
 def home():
     return "Server AI Robot Bún Đậu Voice đang hoạt động mượt mà!", 200
 
-# ================= 4. ENDPOINT XÁC THỰC MẶT (OPENCV / VERIFY_FACE) =================
+# ================= 4. ENDPOINT XÁC THỰC MẶT (/VERIFY_FACE) =================
 @app.route('/verify_face', methods=['POST'])
 def verify_face():
     try:
@@ -97,28 +100,23 @@ def verify_face():
         if not image_bytes or len(image_bytes) < 2000:
             return "NO_FACE", 200
 
-        # Giải mã ảnh trực tiếp từ RAM, không ghi ra ổ đĩa
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if img is None:
             return "NO_FACE", 200
 
-        # Thu nhỏ ảnh về 320x240 để tiết kiệm RAM tối đa
         img_small = cv2.resize(img, (320, 240))
         gray = cv2.cvtColor(img_small, cv2.COLOR_BGR2GRAY)
 
-        # Quét tìm khuôn mặt
         faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(30, 30))
 
         if len(faces) == 0:
             return "NO_FACE", 200
 
-        # Nếu chưa nạp được ảnh chủ nhân, mặc định thấy mặt là cho qua
         if owner_hist is None:
             return "SUCCESS", 200
 
-        # So sánh Histogram khuôn mặt thu được với chủ nhân
         (x, y, w, h) = faces[0]
         face_roi = gray[y:y+h, x:x+w]
         curr_hist = cv2.calcHist([face_roi], [0], None, [256], [0, 256])
@@ -127,16 +125,16 @@ def verify_face():
         similarity = cv2.compareHist(owner_hist, curr_hist, cv2.HISTCMP_CORREL)
         print(f"-> Độ tương đồng khuôn mặt: {similarity:.2f}")
 
-        if similarity > 0.30:  # Ngưỡng chấp nhận
+        if similarity > 0.30:
             return "SUCCESS", 200
         else:
             return "DENIED", 200
 
     except Exception as e:
         print(f"[VERIFY_FACE ERROR]: {e}")
-        return "NO_FACE", 200  # Trả về 200 để ESP32 không bị lỗi HTTP 500
+        return "NO_FACE", 200
 
-# ================= 5. ENDPOINT XỬ LÝ GIỌNG NÓI (VOICE_CHAT) =================
+# ================= 5. ENDPOINT XỬ LÝ GIỌNG NÓI (/VOICE_CHAT) =================
 @app.route('/voice_chat', methods=['POST'])
 def voice_chat():
     try:
@@ -160,23 +158,26 @@ def voice_chat():
                 print("Không nghe rõ giọng nói:", e)
                 user_text = "Nói cái gì đấy nghe không rõ!"
 
-            # Dọn dẹp file WAV tạm
             if os.path.exists(wav_path):
                 os.remove(wav_path)
 
-        # 2. Gửi câu thoại cho Gemini AI
+        # 2. Gửi câu thoại cho Gemini AI qua SDK mới google-genai
         ai_reply = "Nói lại xem nào, Bún Đậu nghe chưa rõ!"
-        if GEMINI_API_KEY and user_text:
-            live_models = ["gemini-1.5-flash", "gemini-2.0-flash", "models/gemini-1.5-flash"]
-            for m_name in live_models:
-                try:
-                    model = genai.GenerativeModel(model_name=m_name, system_instruction=SYSTEM_PROMPT)
-                    res = model.generate_content(user_text)
-                    if res and res.text:
-                        ai_reply = clean_text_for_tts(res.text)
-                        break
-                except Exception as err:
-                    print(f"Lỗi Gemini model {m_name}:", err)
+        if ai_client and user_text:
+            try:
+                # Gọi Model Gemini 2.5 Flash mới nhất
+                response = ai_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=user_text,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        temperature=0.7,
+                    ),
+                )
+                if response and response.text:
+                    ai_reply = clean_text_for_tts(response.text)
+            except Exception as err:
+                print("Lỗi Gemini API (google-genai):", err)
 
         print(f"-> Bún Đậu đáp: {ai_reply}")
 
@@ -189,7 +190,6 @@ def voice_chat():
 
     except Exception as e:
         print("[VOICE_CHAT ERROR]:", str(e))
-        # Tạo file MP3 phản hồi dự phòng để ESP32 vẫn có tiếng phát ra Loa
         fallback_mp3 = "error_reply.mp3"
         tts = gTTS(text="Bún Đậu bị lỗi kết nối rồi đại ca ơi!", lang='vi')
         tts.save(fallback_mp3)
