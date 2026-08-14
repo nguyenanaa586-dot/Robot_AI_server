@@ -215,6 +215,22 @@ def voice_chat():
         tts.save(fallback_mp3)
         return send_file(fallback_mp3, mimetype="audio/mpeg")
 
+# ================= BỔ SUNG: ROUTE ĐỂ ESP32 TẢI FILE ÂM THANH MP3 =================
+@app.route('/output_reply.mp3')
+def get_output_mp3():
+    mp3_path = "output_reply.mp3"
+    if os.path.exists(mp3_path):
+        # Trả file MP3 về cho ESP32 phát ra Loa MAX98357A
+        return send_file(mp3_path, mimetype="audio/mpeg")
+    else:
+        # File lỗi dự phòng nếu chưa có câu trả lời
+        fallback_mp3 = "error_reply.mp3"
+        if not os.path.exists(fallback_mp3):
+            tts = gTTS(text="Bún Đậu chưa chuẩn bị xong câu trả lời!", lang='vi')
+            tts.save(fallback_mp3)
+        return send_file(fallback_mp3, mimetype="audio/mpeg")
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
