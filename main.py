@@ -102,7 +102,7 @@ async def chat_audio(request: Request):
             err_str = str(api_err)
             print(f"[API ERROR]: {err_str}")
             if "429" in err_str:
-                reply_text = "úi dời, Hết lượt dùng miễn phí hôm nay rồi đại ca Việt ơi, mai thử lại nhá."
+                reply_text = "u là chời, Hết lượt dùng miễn phí hôm nay rồi đại ca Việt ơi, mai thử lại nhé ạ."
             else:
                 reply_text = "Có lỗi kết nối rồi, mày nói lại lần nữa xem."
 
