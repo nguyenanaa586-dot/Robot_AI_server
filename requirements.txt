@@ -1,7 +1,6 @@
-Flask==3.0.3
-gunicorn
-opencv-python-headless==4.9.0.80
-numpy==1.26.4
+fastapi
+uvicorn
 google-genai
-SpeechRecognition==3.10.4
-gTTS==2.5.1
+edge-tts
+pydub
+python-multipart
