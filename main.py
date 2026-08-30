@@ -43,16 +43,17 @@ async def chat_audio(request: Request):
             "ngắn gọn, súc tích (tối đa 2-3 câu)."
         )
 
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=[
-                prompt,
-                genai.types.Part.from_bytes(
-                    data=audio_bytes,
-                    mime_type="audio/wav"
-                )
-            ]
+        # Sửa tên model từ 'gemini-2.5-flash' thành 'gemini-3.6-flash'
+response = client.models.generate_content(
+    model='gemini-3.6-flash',
+    contents=[
+        prompt,
+        genai.types.Part.from_bytes(
+            data=audio_bytes,
+            mime_type="audio/wav"
         )
+    ]
+)
 
         reply_text = response.text
         print(f"[GEMINI RESPOND]: {reply_text}")
