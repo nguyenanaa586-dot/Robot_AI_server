@@ -4,3 +4,4 @@ google-genai
 edge-tts
 pydub
 python-multipart
+pyaudioop
