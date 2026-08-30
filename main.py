@@ -50,25 +50,34 @@ async def chat_audio(request: Request):
         # 2. Tạo WAV Header cho khối âm thanh PCM
         wav_bytes = create_wav_bytes(pcm_bytes, sample_rate=16000)
 
-        # 3. Gửi Audio tới Gemini 2.0 Flash
+        # 3. Gửi Audio tới Gemini 3.6 Flash
         prompt = (
             "Bạn là một Robot AI thông minh, thân thiện. "
             "Hãy lắng nghe âm thanh này và trả lời bằng văn bản tiếng Việt "
             "ngắn gọn, súc tích (tối đa 2-3 câu)."
         )
 
-        response = client.models.generate_content(
-            model='gemini-2.0-flash',
-            contents=[
-                prompt,
-                genai.types.Part.from_bytes(
-                    data=wav_bytes,
-                    mime_type="audio/wav"
-                )
-            ]
-        )
+        reply_text = ""
+        try:
+            response = client.models.generate_content(
+                model='gemini-3.6-flash',
+                contents=[
+                    prompt,
+                    genai.types.Part.from_bytes(
+                        data=wav_bytes,
+                        mime_type="audio/wav"
+                    )
+                ]
+            )
+            reply_text = response.text if (response and response.text) else "Tôi đã nghe nhưng chưa hiểu rõ, bạn nói lại nhé."
+        except Exception as api_err:
+            err_str = str(api_err)
+            print(f"[API ERROR]: {err_str}")
+            if "429" in err_str:
+                reply_text = "Hệ thống AI đã hết lượt dùng miễn phí trong ngày, vui lòng thử lại sau hoặc đổi API Key mới."
+            else:
+                reply_text = "Có lỗi xảy ra khi kết nối với AI, bạn thử lại sau nhé."
 
-        reply_text = response.text if (response and response.text) else "Tôi đã nghe nhưng chưa hiểu rõ, bạn nói lại nhé."
         print(f"[GEMINI RESPOND]: {reply_text}")
 
         # 4. Chuyển văn bản thành dữ liệu MP3 (Edge TTS)
