@@ -115,6 +115,28 @@ async def chat_audio(request: Request):
         tts = gTTS(text=reply_text, lang='vi')
         tts.write_to_fp(mp3_fp)
         mp3_data = mp3_fp.getvalue()
+
+
+        # 5. CHỈNH TÔNG GIỌNG (PITCH SHIFT)
+        # Giá trị mặc định là 16000. 
+        # Giảm số này xuống (14000 - 14400) làm cho giọng Google cao hơn, chua hơn, đanh đá đúng style video TikTok.
+        PITCH_SHIFT_RATE = 14200 
+
+        decoded = miniaudio.decode(
+            mp3_data,
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=PITCH_SHIFT_RATE
+        )
+        pcm_out_bytes = decoded.samples.tobytes()
+
+        print(f"[SERVER] Đã xuất {len(pcm_out_bytes)} bytes PCM. Đang gửi về ESP32-S3...")
+        return Response(content=pcm_out_bytes, media_type="application/octet-stream")
+
+    except Exception as e:
+        print(f"[ERROR]: {str(e)}")
+        return Response(status_code=500, content=str(e))
+
         
         # 5. Giải mã MP3 -> PCM 16kHz 16-bit Mono gửi về ESP32-S3
         decoded = miniaudio.decode(
