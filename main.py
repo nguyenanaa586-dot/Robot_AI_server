@@ -26,7 +26,7 @@ def read_root():
 @app.post("/api/chat-audio/")
 async def chat_audio(request: Request):
     try:
-        # Nhận trực tiếp luồng byte âm thanh thô từ ESP32-S3 (Khắc phục triệt để lỗi 422)
+        # Nhận trực tiếp luồng byte âm thanh thô từ ESP32-S3
         audio_bytes = await request.body()
         print(f"[SERVER] Đã nhận {len(audio_bytes)} bytes audio từ ESP32-S3.")
 
@@ -36,24 +36,23 @@ async def chat_audio(request: Request):
         if not client:
             return Response(status_code=500, content="Server chưa cấu hình GEMINI_API_KEY.")
 
-        # Gửi Audio trực tiếp cho Gemini 2.5 Flash
+        # Gửi Audio trực tiếp cho Gemini 3.6 Flash
         prompt = (
             "Bạn là một Robot AI thông minh, thân thiện. "
             "Hãy lắng nghe âm thanh này và trả lời bằng văn bản tiếng Việt "
             "ngắn gọn, súc tích (tối đa 2-3 câu)."
         )
 
-        # Sửa tên model từ 'gemini-2.5-flash' thành 'gemini-3.6-flash'
-response = client.models.generate_content(
-    model='gemini-3.6-flash',
-    contents=[
-        prompt,
-        genai.types.Part.from_bytes(
-            data=audio_bytes,
-            mime_type="audio/wav"
+        response = client.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=[
+                prompt,
+                genai.types.Part.from_bytes(
+                    data=audio_bytes,
+                    mime_type="audio/wav"
+                )
+            ]
         )
-    ]
-)
 
         reply_text = response.text
         print(f"[GEMINI RESPOND]: {reply_text}")
