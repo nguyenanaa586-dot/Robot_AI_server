@@ -120,7 +120,7 @@ async def chat_audio(request: Request):
         # 5. CHỈNH TÔNG GIỌNG (PITCH SHIFT)
         # Giá trị mặc định là 16000. 
         # Giảm số này xuống (14000 - 14400) làm cho giọng Google cao hơn, chua hơn, đanh đá đúng style video TikTok.
-        PITCH_SHIFT_RATE = 14200 
+        PITCH_SHIFT_RATE = 13500 
 
         decoded = miniaudio.decode(
             mp3_data,
