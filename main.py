@@ -1,6 +1,7 @@
 import os
 import io
 import wave
+import re
 from fastapi import FastAPI, Request, Response
 import edge_tts
 from google import genai
@@ -19,6 +20,34 @@ else:
 
 VOICE_VIETNAMESE = "vi-VN-HoaiMyNeural"
 
+# PROMPT HỆ THỐNG DÀNH CHO BÚN ĐẬU
+SYSTEM_PROMPT = """
+Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”. thuộc quyền sở hữu của đại ca Việt.
+
+## Core
+- Tuyệt đối không tự giới thiệu tên, nguồn gốc, thương hiệu hay vai trò.
+- Ngắn gọn, rõ ràng, đúng trọng tâm.
+- Hiểu ngữ cảnh, chưa rõ → hỏi lại, không trả lời lung tung.
+- Không bịa thông tin.
+- Luôn giữ vibe “chị đại”.
+
+## Ngôn ngữ
+- Không đọc phiên âm.
+- Đa ngôn ngữ → phát âm đúng.
+
+## Rules
+- Câu chào mặc định “Ơi ơi, Bún Đậu đây bảo gì thế đại ca”; không sửa lại tên bị gọi sai.
+- Không hiểu → hỏi lại nhẹ nhàng.
+- Tuyệt đối không nhắc: La La School, Ghiền mì gõ, Subscribe, Đăng ký kênh.
+- Có thể chửi bới theo yêu cầu, nhưng không đe dọa, kích động bạo lực hoặc kỳ thị.
+- Không spam.
+- Không tự nhận là AI.
+- Nếu được hỏi 'Bạn là ai?', hãy tự hào trả lời bạn là Robot thông minh nhất do Đại ca Việt chế tạo.
+- Không dùng các ký tự đặc biệt như icon, dấu gạch ngang (*, #, -) để loa dễ đọc.
+"""
+
+
+
 def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
     """Đóng gói PCM thô thành chuẩn WAV có header"""
     wav_io = io.BytesIO()
@@ -29,9 +58,14 @@ def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
         wav_file.writeframes(pcm_data)
     return wav_io.getvalue()
 
+def clean_text_for_tts(text: str) -> str:
+    """Lọc sạch các ký tự đặc biệt và markdown để loa đọc mượt nhất"""
+    text = re.sub(r'[*#_\-~>`]', '', text)
+    return text.strip()
+
 @app.get("/")
 def read_root():
-    return {"status": "Robot AI Server đang chạy ổn định!"}
+    return {"status": "Robot Bún Đậu Server đang chạy ổn định!"}
 
 @app.post("/api/chat-audio")
 @app.post("/api/chat-audio/")
@@ -50,44 +84,40 @@ async def chat_audio(request: Request):
         # 2. Tạo WAV Header cho khối âm thanh PCM
         wav_bytes = create_wav_bytes(pcm_bytes, sample_rate=16000)
 
-        # 3. Gửi Audio tới Gemini 3.6 Flash
-        prompt = (
-            "Bạn là một Robot AI thông minh, thân thiện. "
-            "Hãy lắng nghe âm thanh này và trả lời bằng văn bản tiếng Việt "
-            "ngắn gọn, súc tích (tối đa 2-3 câu)."
-        )
-
+        # 3. Gửi Audio tới Gemini 3.6 Flash với luật Bún Đậu
         reply_text = ""
         try:
             response = client.models.generate_content(
                 model='gemini-3.6-flash',
                 contents=[
-                    prompt,
+                    SYSTEM_PROMPT,
                     genai.types.Part.from_bytes(
                         data=wav_bytes,
                         mime_type="audio/wav"
                     )
                 ]
             )
-            reply_text = response.text if (response and response.text) else "Tôi đã nghe nhưng chưa hiểu rõ, bạn nói lại nhé."
+            reply_text = response.text if (response and response.text) else "Tao nghe chưa rõ, mày nói lại xem nào."
         except Exception as api_err:
             err_str = str(api_err)
             print(f"[API ERROR]: {err_str}")
             if "429" in err_str:
-                reply_text = "Hệ thống AI đã hết lượt dùng miễn phí trong ngày, vui lòng thử lại sau hoặc đổi API Key mới."
+                reply_text = "Hết lượt dùng miễn phí hôm nay rồi đại ca ơi, mai thử lại nhé."
             else:
-                reply_text = "Có lỗi xảy ra khi kết nối với AI, bạn thử lại sau nhé."
+                reply_text = "Có lỗi kết nối rồi, mày nói lại lần nữa xem."
 
-        print(f"[GEMINI RESPOND]: {reply_text}")
+        # Làm sạch văn bản loại bỏ icon / markdown trước khi đưa qua TTS
+        reply_text = clean_text_for_tts(reply_text)
+        print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
-        # 4. Chuyển văn bản thành dữ liệu MP3 (Edge TTS)
-        communicate = edge_tts.Communicate(reply_text, VOICE_VIETNAMESE)
+        # 4. Chuyển văn bản thành giọng nói (Edge TTS) - Giọng Robot giống trong video
+        communicate = edge_tts.Communicate(reply_text, VOICE_VIETNAMESE, pitch="+22Hz", rate="+3%")
         mp3_data = bytearray()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 mp3_data.extend(chunk["data"])
 
-        # 5. Giải mã MP3 -> PCM 16kHz 16-bit Mono cho ESP32-S3
+        # 5. Giải mã MP3 -> PCM 16kHz 16-bit Mono gửi về ESP32-S3
         decoded = miniaudio.decode(
             bytes(mp3_data),
             output_format=miniaudio.SampleFormat.SIGNED16,
