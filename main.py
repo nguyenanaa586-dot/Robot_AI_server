@@ -110,13 +110,12 @@ async def chat_audio(request: Request):
         reply_text = clean_text_for_tts(reply_text)
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
-        # 4. Chuyển văn bản thành giọng nói (Edge TTS) - Giọng Robot giống trong video
-        communicate = edge_tts.Communicate(reply_text, VOICE_VIETNAMESE, pitch="+22Hz", rate="+3%")
-        mp3_data = bytearray()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                mp3_data.extend(chunk["data"])
-
+        # 4. Chuyển văn bản thành giọng Nữ miền Bắc (gTTS)
+        mp3_fp = io.BytesIO()
+        tts = gTTS(text=reply_text, lang='vi')
+        tts.write_to_fp(mp3_fp)
+        mp3_data = mp3_fp.getvalue()
+        
         # 5. Giải mã MP3 -> PCM 16kHz 16-bit Mono gửi về ESP32-S3
         decoded = miniaudio.decode(
             bytes(mp3_data),
