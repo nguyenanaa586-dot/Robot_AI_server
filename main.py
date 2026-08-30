@@ -142,7 +142,7 @@ async def chat_audio(request: Request):
         mp3_data = mp3_fp.getvalue()
 
         # 5. Chỉnh tốc độ phát & nâng tông giọng (PITCH SHIFT)
-        PITCH_SHIFT_RATE = 12500
+        PITCH_SHIFT_RATE = 13500
 
         decoded = miniaudio.decode(
             mp3_data,
