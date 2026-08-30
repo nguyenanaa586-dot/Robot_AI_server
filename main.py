@@ -102,7 +102,7 @@ async def chat_audio(request: Request):
             err_str = str(api_err)
             print(f"[API ERROR]: {err_str}")
             if "429" in err_str:
-                reply_text = "u là chời, Hết lượt dùng miễn phí hôm nay rồi đại ca Việt ơi, mai thử lại nhé ạ."
+                reply_text = "u là chời, Hết lượt dùng miễn phí hôm nay rồi đại ca Việt ơi, đại ca mai thử lại nhé."
             else:
                 reply_text = "Có lỗi kết nối rồi, mày nói lại lần nữa xem."
 
@@ -120,7 +120,7 @@ async def chat_audio(request: Request):
         # 5. CHỈNH TÔNG GIỌNG (PITCH SHIFT)
         # Giá trị mặc định là 16000. 
         # Giảm số này xuống (14000 - 14400) làm cho giọng Google cao hơn, chua hơn, đanh đá đúng style video TikTok.
-        PITCH_SHIFT_RATE = 13500 
+        PITCH_SHIFT_RATE = 12500 
 
         decoded = miniaudio.decode(
             mp3_data,
