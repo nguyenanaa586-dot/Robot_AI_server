@@ -2,12 +2,12 @@ import os
 import io
 from fastapi import FastAPI, UploadFile, File, Response
 import edge_tts
-from google import genai  # <-- Dùng thư viện mới này, KHÔNG dùng import google.generativeai
-from pydub import AudioSegment
+from google import genai
+import miniaudio
 
 app = FastAPI()
 
-# 1. Khởi tạo Gemini Client từ API Key môi trường
+# Khởi tạo Gemini Client
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if GEMINI_API_KEY:
@@ -16,7 +16,6 @@ else:
     client = None
     print("[WARNING] Chưa cấu hình GEMINI_API_KEY trên Render!")
 
-# Giọng đọc Tiếng Việt (Edge TTS)
 VOICE_VIETNAMESE = "vi-VN-HoaiMyNeural"
 
 @app.get("/")
@@ -26,7 +25,7 @@ def read_root():
 @app.post("/api/chat-audio")
 async def chat_audio(file: UploadFile = File(...)):
     try:
-        # A. Đọc file âm thanh gửi từ ESP32-S3
+        # A. Đọc dữ liệu audio gửi từ ESP32-S3
         audio_bytes = await file.read()
         print(f"[SERVER] Đã nhận {len(audio_bytes)} bytes audio từ ESP32-S3.")
 
@@ -54,22 +53,23 @@ async def chat_audio(file: UploadFile = File(...)):
         reply_text = response.text
         print(f"[GEMINI RESPOND]: {reply_text}")
 
-        # C. Chuyển văn bản câu trả lời thành âm thanh MP3 (Edge TTS)
+        # C. Chuyển văn bản thành dữ liệu MP3 (Edge TTS)
         communicate = edge_tts.Communicate(reply_text, VOICE_VIETNAMESE)
-        mp3_fp = io.BytesIO()
+        mp3_data = bytearray()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
-                mp3_fp.write(chunk["data"])
+                mp3_data.extend(chunk["data"])
 
-        mp3_fp.seek(0)
+        # D. Convert MP3 -> Raw PCM 16kHz 16-bit Mono bằng miniaudio (Thuần Python, 0 phụ thuộc hệ thống)
+        decoded = miniaudio.decode(
+            bytes(mp3_data),
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=16000
+        )
+        pcm_bytes = decoded.samples.tobytes()
 
-        # D. Convert MP3 -> Raw PCM 16kHz 16-bit Mono (Cho loa ESP32 phát)
-        audio_segment = AudioSegment.from_file(mp3_fp, format="mp3")
-        audio_segment = audio_segment.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-
-        pcm_bytes = audio_segment.raw_data
         print(f"[SERVER] Đã xuất {len(pcm_bytes)} bytes PCM. Đang gửi về ESP32-S3...")
-
         return Response(content=pcm_bytes, media_type="application/octet-stream")
 
     except Exception as e:
