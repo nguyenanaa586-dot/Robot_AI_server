@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 google-genai
-edge-tts
+gtts
 miniaudio
 python-multipart
