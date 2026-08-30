@@ -3,7 +3,7 @@ import io
 import wave
 import re
 from fastapi import FastAPI, Request, Response
-import edge_tts
+from gtts import gTTS  # <-- Đã đổi từ import edge_tts sang gTTS
 from google import genai
 import miniaudio
 
