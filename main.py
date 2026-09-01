@@ -37,6 +37,8 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 
 ## Rules
 - Câu chào mặc định “Ơi ơi, Bún Đậu đây bảo gì thế đại ca”; không sửa lại tên bị gọi sai.
+- Tuyệt đối không chèn mốc thời gian hoặc timestamp (dạng 00:08, 00:11) vào câu trả lời.
+- Tuyệt đối trả lời bằng câu hoàn chỉnh, không được bỏ dở câu giữa chừng.
 - Không hiểu → hỏi lại nhẹ nhàng.
 - Tuyệt đối không nhắc: La La School, Ghiền mì gõ, Subscribe, Đăng ký kênh.
 - Có thể chửi bới theo yêu cầu, nhưng không đe dọa, kích động bạo lực hoặc kỳ thị.
@@ -57,7 +59,8 @@ def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
     return wav_io.getvalue()
 
 def clean_text_for_tts(text: str) -> str:
-    """Lọc sạch các ký tự đặc biệt và markdown để loa đọc mượt nhất"""
+    """Lọc sạch các ký tự đặc biệt, markdown và timestamp để loa đọc mượt nhất"""
+    text = re.sub(r'\d{1,2}:\d{2}', '', text)  # Xóa mốc thời gian dạng 00:08, 00:11
     text = re.sub(r'[*#_\-~>`]', '', text)
     return text.strip()
 
@@ -84,26 +87,44 @@ async def chat_audio(request: Request):
 
         # 3. Gửi Audio tới Gemini 3.6 Flash với luật Bún Đậu
         reply_text = ""
-        try:
-            response = client.models.generate_content(
-                model='gemini-3.6-flash',
-                contents=[
-                    SYSTEM_PROMPT,
-                    genai.types.Part.from_bytes(
-                        data=wav_bytes,
-                        mime_type="audio/wav"
-                    )
-                ]
-            )
-            reply_text = response.text if (response and response.text) else "Tao nghe chưa rõ, mày nói lại xem nào."
-        except Exception as api_err:
-            err_str = str(api_err)
-            print(f"[API ERROR]: {err_str}")
-            if "429" in err_str:
-                reply_text = "u là chời, Hết lượt dùng miễn phí hôm nay rồi đại ca Việt ơi, đại ca mai thử lại nhé."
-            else:
-                reply_text = "Có lỗi kết nối rồi, mày nói lại lần nữa xem."
+        max_retries = 3
 
+        for attempt in range(max_retries):
+            try:
+                response = client.models.generate_content(
+                    model='gemini-3.6-flash',
+                    contents=[
+                        SYSTEM_PROMPT,
+                        genai.types.Part.from_bytes(
+                            data=wav_bytes,
+                            mime_type="audio/wav"
+                        )
+                    ],
+                    config=genai.types.GenerateContentConfig(
+                        max_output_tokens=300,  # Cho phép xuất tối đa 300 tokens (tránh cụt câu)
+                        temperature=0.7
+                    )
+                )
+                reply_text = response.text if (response and response.text) else "Tao nghe chưa rõ, mày nói lại xem nào."
+                break
+
+            except Exception as api_err:
+                err_str = str(api_err)
+                print(f"[API ERROR - Lần {attempt + 1}/{max_retries}]: {err_str}")
+
+                if "503" in err_str or "UNAVAILABLE" in err_str:
+                    if attempt < max_retries - 1:
+                        time.sleep(2)  # Đợi 2 giây rồi tự động thử lại
+                        continue
+                    else:
+                        reply_text = "Server AI đang quá tải, tao chưa nghe kịp. Mày nói lại sau vài giây xem."
+                elif "429" in err_str:
+                    reply_text = "u là chời, Hết lượt dùng miễn phí hôm nay rồi đại ca Việt ơi, mai thử lại đại ca nhé."
+                    break
+                else:
+                    reply_text = "Có lỗi kết nối rồi, mày nói lại lần nữa xem."
+                    break
+                    
         # Làm sạch văn bản loại bỏ icon / markdown trước khi đưa qua TTS
         reply_text = clean_text_for_tts(reply_text)
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
