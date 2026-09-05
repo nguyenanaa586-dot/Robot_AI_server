@@ -119,7 +119,7 @@ async def chat_audio(request: Request):
                     else:
                         reply_text = "Server AI đang quá tải, tao chưa nghe kịp. Mày nói lại sau vài giây xem."
                 elif "429" in err_str:
-                    reply_text = "u là chời, Hết lượt dùng miễn phí hôm nay rồi đại ca Việt ơi, mai thử lại đại ca nhé."
+                    reply_text = "mua gói vip pro giùm tao cái, không có tiền mua thì tao đi ngủ, mai quay lại tìm tao, ok."
                     break
                 else:
                     reply_text = "Có lỗi kết nối rồi, mày nói lại lần nữa xem."
