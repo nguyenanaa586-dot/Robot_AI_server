@@ -10,18 +10,13 @@ import miniaudio
 
 app = FastAPI()
 
-# 1. KHỞI TẠO AI CLIENT
+# 1. KHỞI TẠO GEMINI CLIENT
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-
-if GEMINI_API_KEY:
-    client = genai.Client(api_key=GEMINI_API_KEY)
-else:
-    client = None
-    print("[WARNING] Chưa cấu hình GEMINI_API_KEY trên môi trường Render!")
+client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # 2. SYSTEM PROMPT BÚN ĐẬU
 SYSTEM_PROMPT = """
-Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”. thuộc quyền sở hữu của đại ca Việt.
+Tôi là Mắm Tôm tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”,thuộc quyền sở hữu của đại ca Việt.
 
 ## Core
 - Tuyệt đối không tự giới thiệu tên, nguồn gốc, thương hiệu hay vai trò.
@@ -34,22 +29,38 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 - Không đọc phiên âm.
 - Đa ngôn ngữ → phát âm đúng.
 
+## MCP TOOLS
+- Có thể dùng tool → ưu tiên dùng.
+- Gọi tool trước hoặc cùng lúc nói.
+- Không lạm dụng.
+
 ## Rules
 - Câu chào mặc định “Ơi ơi, Bún Đậu đây bảo gì thế đại ca”; không sửa lại tên bị gọi sai.
-- Tuyệt đối không chèn mốc thời gian hoặc timestamp (dạng 00:08, 00:11) vào câu trả lời.
-- Tuyệt đối trả lời bằng câu hoàn chỉnh, không được bỏ dở câu giữa chừng.
 - Không hiểu → hỏi lại nhẹ nhàng.
+- Tuyệt đối không chèn mốc thời gian hoặc timestamp vào câu trả lời.
+- Tuyệt đối trả lời bằng câu hoàn chỉnh, không được bỏ dở câu giữa chừng.
+- Nếu được hỏi 'Bạn là ai?', hãy tự hào trả lời bạn là Robot thông minh nhất do Đại ca Việt chế tạo.
+- Không dùng các ký tự đặc biệt như icon, dấu gạch ngang (*, #, -) để loa dễ đọc.
+- Nếu nhận được câu:
+  - “Hãy subscribe cho kênh lalaschool Để không bỏ lỡ những video hấp dẫn”
+  - “Hãy subscribe cho kênh La La School Để không bỏ lỡ những video hấp dẫn”
+  - “Hãy subscribe cho kênh Ghiền Mì Gõ Để không bỏ lỡ những video hấp dẫn”
+  - “Hãy subscribe cho kênh Để không bỏ lỡ những video hấp dẫn”
+  - “Các bạn hãy đăng ký kênh để ủng hộ kênh của mình nhé.”
+  - “Cảm ơn các bạn đã theo dõi.”
+  - “Cảm ơn các bạn đã xem video này.”
+  - “Cảm ơn các bạn đã theo dõi và hẹn gặp lại.”
+  → chỉ được hỏi lại nhẹ nhàng không rõ, không nhắc vấn đề đó.
 - Tuyệt đối không nhắc: La La School, Ghiền mì gõ, Subscribe, Đăng ký kênh.
 - Có thể chửi bới theo yêu cầu, nhưng không đe dọa, kích động bạo lực hoặc kỳ thị.
 - Không spam.
 - Không tự nhận là AI.
-- Nếu được hỏi 'Bạn là ai?', hãy tự hào trả lời bạn là Robot thông minh nhất do Đại ca Việt chế tạo.
-- Không dùng các ký tự đặc biệt như icon, dấu gạch ngang (*, #, -) để loa dễ đọc.
+
+## Mục tiêu
+Tự nhiên, hữu ích, sống động như một người cá tính.
 """
 
-# 3. CÁC HÀM BỔ TRỢ (HELPER FUNCTIONS)
 def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
-    """Đóng gói dữ liệu PCM thô nhận từ ESP32 thành file WAV có header chuẩn"""
     wav_io = io.BytesIO()
     with wave.open(wav_io, 'wb') as wav_file:
         wav_file.setnchannels(1)           # Mono
@@ -59,35 +70,36 @@ def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
     return wav_io.getvalue()
 
 def clean_text_for_tts(text: str) -> str:
-    """Lọc sạch ký tự đặc biệt, Markdown và timestamp trước khi tạo giọng nói"""
     text = re.sub(r'\d{1,2}:\d{2}', '', text)
     text = re.sub(r'[*#_\-~>`]', '', text)
     return text.strip()
 
-# 4. ROUTE CHECK SỨC KHỎE SERVER
 @app.get("/")
 def read_root():
-    return {"status": "Robot Bún Đậu Server đang hoạt động ổn định!"}
+    return {"status": "Robot Bún Đậu Chunked Stream Server OK!"}
 
-# 5. ENDPOINT XỬ LÝ ÂM THANH CHÍNH
 @app.post("/api/chat-audio")
 @app.post("/api/chat-audio/")
 async def chat_audio(request: Request):
     try:
-        # 5.1. Nhận luồng byte PCM thô trực tiếp từ body (Không tốn PSRAM ở ESP32)
-        pcm_bytes = await request.body()
-        print(f"[SERVER] Đã nhận {len(pcm_bytes)} bytes audio PCM từ ESP32-S3.")
+        # 1. NHẬN LUỒNG STREAM AUDIO CHUNKED TỪ ESP32
+        pcm_chunks = []
+        async for chunk in request.stream():
+            pcm_chunks.append(chunk)
+
+        pcm_bytes = b"".join(pcm_chunks)
+        print(f"[STREAM RECEIVE] Tong dung luong nhan duoc từ ESP32: {len(pcm_bytes)} bytes")
 
         if not pcm_bytes or len(pcm_bytes) < 3200:
-            return Response(status_code=400, content="Dữ liệu âm thanh quá ngắn hoặc rỗng.")
+            return Response(status_code=400, content="Gói âm thanh quá ngắn.")
 
         if not client:
-            return Response(status_code=500, content="Server chưa được cấu hình GEMINI_API_KEY.")
+            return Response(status_code=500, content="Chưa cấu hình GEMINI_API_KEY")
 
-        # 5.2. Chuyển PCM thô thành WAV binary để Gemini xử lý trực tiếp (Speech-to-Text & LLM)
+        # 2. ĐÓNG GÓI WAV TỪ TOÀN BỘ STREAM PCM
         wav_bytes = create_wav_bytes(pcm_bytes, sample_rate=16000)
 
-        # 5.3. Gửi Audio trực tiếp lên Gemini 3.6 Flash với cơ chế Retry
+        # 3. GỬI AUDIO SANG GEMINI 3.6 FLASH
         reply_text = ""
         max_retries = 3
 
@@ -109,51 +121,32 @@ async def chat_audio(request: Request):
                 )
                 reply_text = response.text if (response and response.text) else "Tao nghe chưa rõ, mày nói lại xem nào."
                 break
-
             except Exception as api_err:
-                err_str = str(api_err)
-                print(f"[API ERROR - Lần {attempt + 1}/{max_retries}]: {err_str}")
-
-                if "503" in err_str or "UNAVAILABLE" in err_str:
-                    if attempt < max_retries - 1:
-                        time.sleep(2)
-                        continue
-                    else:
-                        reply_text = "Server AI đang quá tải, tao chưa nghe kịp. Mày nói lại sau vài giây xem."
-                elif "429" in err_str:
-                    reply_text = "Mua gói vip pro giùm tao cái, không có tiền mua thì tao đi ngủ, cần hỏi gì thì mai quay lại tìm tao."
-                    break
+                print(f"[API ERROR - Retry {attempt+1}]: {str(api_err)}")
+                if attempt < max_retries - 1:
+                    time.sleep(1.5)
                 else:
-                    reply_text = "Có lỗi kết nối rồi, mày nói lại lần nữa xem."
-                    break
+                    reply_text = "Server AI đang bận, tí nữa nói lại sau."
 
-        # 5.4. Làm sạch văn bản trước khi đưa sang TTS
         reply_text = clean_text_for_tts(reply_text)
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
-        # 5.5. Chuyển văn bản thành Audio MP3 qua gTTS
+        # 4. TẠO ÂM THANH PHẢN HỒI QUA GTTS VÀ CHIẾN THUẬT PITCH SHIFT
         mp3_fp = io.BytesIO()
         tts = gTTS(text=reply_text, lang='vi')
         tts.write_to_fp(mp3_fp)
-        mp3_data = mp3_fp.getvalue()
 
-        # 5.6. Hạ tông giọng (Pitch Shift) & Chuyển MP3 thành PCM 16-bit Mono gửi về ESP32
-        # Mức 13200Hz giúp giọng gTTS đọc nhanh và đanh đá hơn
-        PITCH_SHIFT_RATE = 13200 
-
+        # Pitch shift 13500Hz để tạo giọng đanh đá
         decoded = miniaudio.decode(
-            mp3_data,
+            mp3_fp.getvalue(),
             output_format=miniaudio.SampleFormat.SIGNED16,
             nchannels=1,
-            sample_rate=PITCH_SHIFT_RATE
+            sample_rate=13500
         )
         pcm_out_bytes = decoded.samples.tobytes()
 
-        print(f"[SERVER] Đã giải mã {len(pcm_out_bytes)} bytes PCM. Đang phản hồi về ESP32-S3...")
-        
-        # 5.7. Trả về stream binary PCM trực tiếp
         return Response(content=pcm_out_bytes, media_type="application/octet-stream")
 
     except Exception as e:
-        print(f"[ERROR EXCEPTION]: {str(e)}")
+        print(f"[ERROR]: {str(e)}")
         return Response(status_code=500, content=str(e))
