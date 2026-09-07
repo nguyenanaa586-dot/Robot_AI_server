@@ -192,15 +192,11 @@ async def chat_audio(request: Request):
         pcm_out_bytes = decoded.samples.tobytes()
 
         # ĐÓNG GÓI THÀNH FILE WAV CHUẨN HEADER ĐỂ ESP32 PHÁT RA LOA NGAY
-        wav_out_bytes = create_wav_bytes(pcm_out_bytes, sample_rate=13500)
-            
-            print(f"[TTS SUCCESS] Da tao xong file WAV ({len(wav_out_bytes)} bytes)")
-            return Response(content=wav_out_bytes, media_type="audio/wav", headers=CUSTOM_HEADERS)
+        wav_out_bytes = create_wav_bytes(pcm_out_bytes, sample_rate=13500) 
+    
+    print(f"[TTS SUCCESS] Đã tạo xong file WAV ép pitch ({len(wav_out_bytes)} bytes)")
+    return Response(content=wav_out_bytes, media_type="audio/wav", headers=CUSTOM_HEADERS)
 
-        except Exception as tts_err:
-            print(f"[TTS ERROR]: {str(tts_err)}")
-            return Response(status_code=500, content=f"TTS Error: {str(tts_err)}", headers=CUSTOM_HEADERS)
-
-    except Exception as e:
-        print(f"[SERVER ERROR]: {str(e)}")
-        return Response(status_code=500, content=str(e), headers=CUSTOM_HEADERS)
+except Exception as tts_err:
+    print(f"[TTS ERROR]: {str(tts_err)}")
+    return Response(status_code=500, content=f"TTS Error: {str(tts_err)}", headers=CUSTOM_HEADERS)
