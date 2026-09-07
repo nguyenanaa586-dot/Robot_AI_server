@@ -96,6 +96,11 @@ def read_root():
 @app.post("/api/chat-audio/")
 async def chat_audio(request: Request):
     global CURRENT_KEY_INDEX
+
+    # Ép đóng kết nối sau mỗi response để tránh treo Socket ESP32
+    CUSTOM_HEADERS = {"Connection": "close"}
+
+    
     try:
         # 1. NHẬN LUỒNG STREAM AUDIO CHUNKED TỪ ESP32
         pcm_chunks = []
@@ -182,8 +187,14 @@ async def chat_audio(request: Request):
 
         # ĐÓNG GÓI THÀNH FILE WAV CHUẨN HEADER ĐỂ ESP32 PHÁT RA LOA NGAY
         wav_out_bytes = create_wav_bytes(pcm_out_bytes, sample_rate=13500)
-        return Response(content=wav_out_bytes, media_type="audio/wav")
+            
+            print(f"[TTS SUCCESS] Da tao xong file WAV ({len(wav_out_bytes)} bytes)")
+            return Response(content=wav_out_bytes, media_type="audio/wav", headers=CUSTOM_HEADERS)
+
+        except Exception as tts_err:
+            print(f"[TTS ERROR]: {str(tts_err)}")
+            return Response(status_code=500, content=f"TTS Error: {str(tts_err)}", headers=CUSTOM_HEADERS)
 
     except Exception as e:
-        print(f"[ERROR]: {str(e)}")
-        return Response(status_code=500, content=str(e))
+        print(f"[SERVER ERROR]: {str(e)}")
+        return Response(status_code=500, content=str(e), headers=CUSTOM_HEADERS)
