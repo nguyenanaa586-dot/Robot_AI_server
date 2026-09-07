@@ -145,7 +145,7 @@ async def chat_audio(request: Request):
 
         # Nếu quét cả 3 model đều thất bại
         if not success or not reply_text:
-            reply_text = "Server Google đang nghẽn mạng rồi đại ca ơi, nói lại phát nữa xem nào."
+            reply_text = "Hết lượt dùng miễn phí rồi mày, xì tiền ra mua gói vip pro giùm tao đi, không thì tao đi ngủ, mai gặp lại mày."
 
         # CLEAN TEXT VÀ IN RA LOG SERVER (DÒNG CẦN BỔ SUNG)
         reply_text = clean_text_for_tts(reply_text)
