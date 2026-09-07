@@ -99,35 +99,55 @@ async def chat_audio(request: Request):
         # 2. ĐÓNG GÓI WAV TỪ TOÀN BỘ STREAM PCM
         wav_bytes = create_wav_bytes(pcm_bytes, sample_rate=16000)
 
-        # 3. GỬI AUDIO SANG GEMINI 3.6 FLASH
+        # 3. GỬI AUDIO SANG GEMINI CÓ CƠ CHẾ FALLBACK (3.6 -> 2.5 -> 1.5)
         reply_text = ""
-        max_retries = 3
+        MODELS_TO_TRY = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+        success = False
 
-        for attempt in range(max_retries):
-            try:
-                response = client.models.generate_content(
-                    model='gemini-3.6-flash',
-                    contents=[
-                        SYSTEM_PROMPT,
-                        genai.types.Part.from_bytes(
-                            data=wav_bytes,
-                            mime_type="audio/wav"
-                        )
-                    ],
-                    config=genai.types.GenerateContentConfig(
-                        max_output_tokens=300,
-                        temperature=0.7
-                    )
-                )
-                reply_text = response.text if (response and response.text) else "Tao nghe chưa rõ, mày nói lại xem nào."
+        for model_name in MODELS_TO_TRY:
+            if success:
                 break
-            except Exception as api_err:
-                print(f"[API ERROR - Retry {attempt+1}]: {str(api_err)}")
-                if attempt < max_retries - 1:
-                    time.sleep(1.5)
-                else:
-                    reply_text = "Server AI đang bận, tí nữa nói lại sau."
+            
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    print(f"[API CALL] Đang gọi Gemini model: {model_name} (Lần {attempt+1})...")
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[
+                            SYSTEM_PROMPT,
+                            genai.types.Part.from_bytes(
+                                data=wav_bytes,
+                                mime_type="audio/wav"
+                            )
+                        ],
+                        config=genai.types.GenerateContentConfig(
+                            max_output_tokens=300,
+                            temperature=0.7
+                        )
+                    )
+                    
+                    if response and response.text:
+                        reply_text = response.text
+                        success = True
+                        print(f"[SUCCESS] Đã nhận phản hồi thành công từ model: {model_name}")
+                        break
+                except Exception as api_err:
+                    err_str = str(api_err)
+                    print(f"[API ERROR - {model_name} - Retry {attempt+1}]: {err_str}")
+                    
+                    if "503" in err_str or "UNAVAILABLE" in err_str:
+                        wait_time = (2 ** attempt) + 0.5
+                        print(f"-> Model {model_name} bị quá tải (503), chờ {wait_time}s...")
+                        time.sleep(wait_time)
+                    else:
+                        time.sleep(1)
 
+        # Nếu quét cả 3 model đều thất bại
+        if not success or not reply_text:
+            reply_text = "Server Google đang nghẽn mạng rồi đại ca ơi, nói lại phát nữa xem nào."
+
+        # CLEAN TEXT VÀ IN RA LOG SERVER (DÒNG CẦN BỔ SUNG)
         reply_text = clean_text_for_tts(reply_text)
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
