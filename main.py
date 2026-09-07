@@ -2,7 +2,8 @@ import os
 import io
 import wave
 import re
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from gtts import gTTS
 from google import genai
 from google.genai import types
@@ -14,9 +15,8 @@ app = FastAPI()
 RAW_KEYS = os.environ.get("GEMINI_API_KEY", "")
 API_KEYS = [k.strip(' "\'\t\r\n') for k in RAW_KEYS.split(",") if k.strip(' "\'\t\r\n')]
 
-# Biến toàn cục ghi nhớ Key đang hoạt động tốt nhất để dùng ngay cho lượt sau
 CURRENT_KEY_INDEX = 0
-MODEL_NAME = "gemini-3.6-flash"  # Tên model chuẩn của Google GenAI SDK
+MODEL_NAME = "gemini-3.6-flash"
 
 def get_genai_client(key_index: int):
     if not API_KEYS:
@@ -24,7 +24,6 @@ def get_genai_client(key_index: int):
     selected_key = API_KEYS[key_index % len(API_KEYS)]
     return genai.Client(api_key=selected_key)
 
-# 2. SYSTEM PROMPT BÚN ĐẬU
 SYSTEM_PROMPT = """
 Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”,thuộc quyền sở hữu của đại ca Việt.
 
@@ -39,11 +38,6 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 - Không đọc phiên âm.
 - Đa ngôn ngữ → phát âm đúng.
 
-## MCP TOOLS
-- Có thể dùng tool → ưu tiên dùng.
-- Gọi tool trước hoặc cùng lúc nói.
-- Không lạm dụng.
-
 ## Rules
 - Câu chào mặc định “Ơi ơi, Bún Đậu đây bảo gì thế đại ca”; không sửa lại tên bị gọi sai.
 - Không hiểu → hỏi lại nhẹ nhàng.
@@ -51,23 +45,10 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 - Tuyệt đối trả lời bằng câu hoàn chỉnh, không được bỏ dở câu giữa chừng.
 - Nếu được hỏi 'Bạn là ai?', hãy tự hào trả lời bạn là Robot thông minh nhất do Đại ca Việt chế tạo.
 - Không dùng các ký tự đặc biệt như icon, dấu gạch ngang (*, #, -) để loa dễ đọc.
-- Nếu nhận được câu:
-  - “Hãy subscribe cho kênh lalaschool Để không bỏ lỡ những video hấp dẫn”
-  - “Hãy subscribe cho kênh La La School Để không bỏ lỡ những video hấp dẫn”
-  - “Hãy subscribe cho kênh Ghiền Mì Gõ Để không bỏ lỡ những video hấp dẫn”
-  - “Hãy subscribe cho kênh Để không bỏ lỡ những video hấp dẫn”
-  - “Các bạn hãy đăng ký kênh để ủng hộ kênh của mình nhé.”
-  - “Cảm ơn các bạn đã theo dõi.”
-  - “Cảm ơn các bạn đã xem video này.”
-  - “Cảm ơn các bạn đã theo dõi và hẹn gặp lại.”
-  → chỉ được hỏi lại nhẹ nhàng không rõ, không nhắc vấn đề đó.
-- Tuyệt đối không nhắc: La La School, Ghiền mì gõ, Subscribe, Đăng ký kênh.
+- Nếu nhận được các câu tự động đăng ký kênh Youtube -> chỉ được hỏi lại nhẹ nhàng không rõ.
 - Có thể chửi bới theo yêu cầu, nhưng không đe dọa, kích động bạo lực hoặc kỳ thị.
 - Không spam.
 - Không tự nhận là AI.
-
-## Mục tiêu
-Tự nhiên, hữu ích, sống động như một người cá tính.
 """
 
 def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
@@ -75,7 +56,7 @@ def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
     with wave.open(wav_io, 'wb') as wav_file:
         wav_file.setnchannels(1)           # Mono
         wav_file.setsampwidth(2)          # 16-bit PCM
-        wav_file.setframerate(sample_rate) # Sample rate tương ứng
+        wav_file.setframerate(sample_rate) # Sample rate
         wav_file.writeframes(pcm_data)
     return wav_io.getvalue()
 
@@ -84,10 +65,42 @@ def clean_text_for_tts(text: str) -> str:
     text = re.sub(r'[*#_\-~>`]', '', text)
     return text.strip()
 
+def text_to_pcm_chunks(sentence_text: str, target_pitch_rate: int = 10500):
+    """
+    Chuyển từng câu văn ngắn thành PCM raw thô và cắt nhỏ thành các chunk 1024 bytes 
+    xả trực tiếp xuống HTTPS Socket.
+    """
+    clean_txt = clean_text_for_tts(sentence_text)
+    if not clean_txt:
+        return
+
+    try:
+        mp3_fp = io.BytesIO()
+        tts = gTTS(text=clean_txt, lang='vi')
+        tts.write_to_fp(mp3_fp)
+        mp3_bytes = mp3_fp.getvalue()
+
+        # Giải mã MP3 thành PCM 16-bit Signed Mono
+        decoded = miniaudio.decode(
+            mp3_bytes,
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=target_pitch_rate
+        )
+        pcm_bytes = decoded.samples.tobytes()
+
+        # Cắt dữ liệu PCM ra thành các khung 1024 bytes đẩy liên tục
+        chunk_size = 1024
+        for i in range(0, len(pcm_bytes), chunk_size):
+            yield pcm_bytes[i:i + chunk_size]
+
+    except Exception as e:
+        print(f"[TTS Chunk Error]: {e}")
+
 @app.get("/")
 def read_root():
     return {
-        "status": "Robot Bún Đậu Chunked Stream Server OK!",
+        "status": "Robot Bún Đậu Streaming Server OK!",
         "loaded_keys_count": len(API_KEYS),
         "current_active_key_index": CURRENT_KEY_INDEX
     }
@@ -97,11 +110,8 @@ def read_root():
 async def chat_audio(request: Request):
     global CURRENT_KEY_INDEX
 
-    # Ép đóng kết nối sau mỗi response để tránh treo Socket ESP32
-    CUSTOM_HEADERS = {"Connection": "close"}
-
     try:
-        # 1. NHẬN LUỒNG STREAM AUDIO CHUNKED TỪ ESP32
+        # 1. NHẬN LUỒNG STREAM AUDIO TỪ ESP32
         pcm_chunks = []
         async for chunk in request.stream():
             pcm_chunks.append(chunk)
@@ -110,14 +120,14 @@ async def chat_audio(request: Request):
         print(f"[STREAM RECEIVE] Tong dung luong nhan duoc: {len(pcm_bytes)} bytes")
 
         if not pcm_bytes or len(pcm_bytes) < 3200:
-            return Response(status_code=400, content="Gói âm thanh quá ngắn.", headers=CUSTOM_HEADERS)
+            return StreamingResponse(io.BytesIO(b""), status_code=400)
 
         if not API_KEYS:
-            return Response(status_code=500, content="Chưa cấu hình GEMINI_API_KEY", headers=CUSTOM_HEADERS)
+            return StreamingResponse(io.BytesIO(b""), status_code=500)
 
         wav_bytes = create_wav_bytes(pcm_bytes, sample_rate=16000)
 
-        # 2. CHỈ XOAY KEY THÔNG MINH - BỎ HOÀN TOÀN TẠM DỪNG (ZERO SLEEP)
+        # 2. GỌI GEMINI XOAY KEY
         reply_text = ""
         success = False
 
@@ -150,49 +160,46 @@ async def chat_audio(request: Request):
                         safety_settings=safety_config
                     )
                 )
-                
+
                 if response and response.text:
                     reply_text = response.text
                     success = True
                     CURRENT_KEY_INDEX = key_idx  
                     print(f"[SUCCESS] Nhan phan hoi thanh cong tu Key #{key_idx + 1}")
                     break
-            
+
             except Exception as api_err:
                 err_str = str(api_err)
-                print(f"[KEY FAILURE] Key #{key_idx + 1} bi loi: {err_str[:80]}... Doi sang Key tiep theo lap tuc!")
+                print(f"[KEY FAILURE] Key #{key_idx + 1} bi loi: {err_str[:80]}... Doi sang Key tiep theo!")
                 continue
 
         if not success or not reply_text:
-            reply_text = "Hết lượt dùng miễn phí rồi mày, xì tiền ra mua gói vip pro giùm tao đi, không thì tao đi ngủ, mai gặp lại mày."
+            reply_text = "Hết lượt dùng miễn phí rồi mày, xì tiền ra mua gói vip pro giùm tao đi, không thì tao đi ngủ."
 
         reply_text = clean_text_for_tts(reply_text)
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
-        # 3. CHUYỂN THÀNH ÂM THANH GTTS VÀ ÉP PITCH
-        print("[TTS] Đang tạo file âm thanh gTTS...")
-        mp3_fp = io.BytesIO()
-        tts = gTTS(text=reply_text, lang='vi')
-        tts.write_to_fp(mp3_fp)
-        mp3_bytes = mp3_fp.getvalue()
+        # 3. TÁCH VĂN BẢN THÀNH TỪNG CÂU VÀ YIELD LUỒNG PCM TRỰC TIẾP
+        sentences = re.split(r'(?<=[.!?\n])\s+', reply_text)
 
-        # GIẢM sample_rate từ 13500 xuống 10500 để nâng tông giọng (increase pitch)
-        TARGET_PITCH_RATE = 10500  
+        def audio_stream_generator():
+            for sentence in sentences:
+                if sentence.strip():
+                    print(f"[STREAMING SENTENCE]: {sentence}")
+                    # Ép Pitch 10500Hz để tạo giọng Bún Đậu đanh đá
+                    for pcm_chunk in text_to_pcm_chunks(sentence, target_pitch_rate=10500):
+                        yield pcm_chunk
 
-        decoded = miniaudio.decode(
-            mp3_bytes,
-            output_format=miniaudio.SampleFormat.SIGNED16,
-            nchannels=1,
-            sample_rate=TARGET_PITCH_RATE
+        # Trả về luồng Streaming Response chuẩn octet-stream
+        return StreamingResponse(
+            audio_stream_generator(),
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "close"
+            }
         )
-        pcm_out_bytes = decoded.samples.tobytes()
 
-        # ĐÓNG GÓI THÀNH FILE WAV CHUẨN HEADER ĐỂ ESP32 PHÁT RA LOA NGAY
-        wav_out_bytes = create_wav_bytes(pcm_out_bytes, sample_rate=13500) 
-        
-        print(f"[TTS SUCCESS] Đã tạo xong file WAV ép pitch ({len(wav_out_bytes)} bytes)")
-        return Response(content=wav_out_bytes, media_type="audio/wav", headers=CUSTOM_HEADERS)
-
-    except Exception as tts_err:
-        print(f"[TTS ERROR]: {str(tts_err)}")
-        return Response(status_code=500, content=f"TTS Error: {str(tts_err)}", headers=CUSTOM_HEADERS)
+    except Exception as err:
+        print(f"[SERVER ERROR]: {str(err)}")
+        return StreamingResponse(io.BytesIO(b""), status_code=500)
