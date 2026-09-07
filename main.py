@@ -2,25 +2,24 @@ import os
 import io
 import wave
 import re
+import time
 from fastapi import FastAPI, Request, Response
-from gtts import gTTS  # <-- Đã đổi từ import edge_tts sang gTTS
+from gtts import gTTS
 from google import genai
 import miniaudio
 
 app = FastAPI()
 
-# Khởi tạo Gemini Client từ API Key môi trường
+# 1. KHỞI TẠO AI CLIENT
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 if GEMINI_API_KEY:
     client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     client = None
-    print("[WARNING] Chưa cấu hình GEMINI_API_KEY trên Render!")
+    print("[WARNING] Chưa cấu hình GEMINI_API_KEY trên môi trường Render!")
 
-VOICE_VIETNAMESE = "vi-VN-HoaiMyNeural"
-
-# PROMPT HỆ THỐNG DÀNH CHO BÚN ĐẬU
+# 2. SYSTEM PROMPT BÚN ĐẬU
 SYSTEM_PROMPT = """
 Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”. thuộc quyền sở hữu của đại ca Việt.
 
@@ -48,44 +47,47 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 - Không dùng các ký tự đặc biệt như icon, dấu gạch ngang (*, #, -) để loa dễ đọc.
 """
 
+# 3. CÁC HÀM BỔ TRỢ (HELPER FUNCTIONS)
 def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
-    """Đóng gói PCM thô thành chuẩn WAV có header"""
+    """Đóng gói dữ liệu PCM thô nhận từ ESP32 thành file WAV có header chuẩn"""
     wav_io = io.BytesIO()
     with wave.open(wav_io, 'wb') as wav_file:
         wav_file.setnchannels(1)           # Mono
-        wav_file.setsampwidth(2)          # 16-bit
+        wav_file.setsampwidth(2)          # 16-bit PCM
         wav_file.setframerate(sample_rate) # 16kHz
         wav_file.writeframes(pcm_data)
     return wav_io.getvalue()
 
 def clean_text_for_tts(text: str) -> str:
-    """Lọc sạch các ký tự đặc biệt, markdown và timestamp để loa đọc mượt nhất"""
-    text = re.sub(r'\d{1,2}:\d{2}', '', text)  # Xóa mốc thời gian dạng 00:08, 00:11
+    """Lọc sạch ký tự đặc biệt, Markdown và timestamp trước khi tạo giọng nói"""
+    text = re.sub(r'\d{1,2}:\d{2}', '', text)
     text = re.sub(r'[*#_\-~>`]', '', text)
     return text.strip()
 
+# 4. ROUTE CHECK SỨC KHỎE SERVER
 @app.get("/")
 def read_root():
-    return {"status": "Robot Bún Đậu Server đang chạy ổn định!"}
+    return {"status": "Robot Bún Đậu Server đang hoạt động ổn định!"}
 
+# 5. ENDPOINT XỬ LÝ ÂM THANH CHÍNH
 @app.post("/api/chat-audio")
 @app.post("/api/chat-audio/")
 async def chat_audio(request: Request):
     try:
-        # 1. Nhận luồng byte PCM thô từ ESP32-S3
+        # 5.1. Nhận luồng byte PCM thô trực tiếp từ body (Không tốn PSRAM ở ESP32)
         pcm_bytes = await request.body()
-        print(f"[SERVER] Đã nhận {len(pcm_bytes)} bytes audio từ ESP32-S3.")
+        print(f"[SERVER] Đã nhận {len(pcm_bytes)} bytes audio PCM từ ESP32-S3.")
 
         if not pcm_bytes or len(pcm_bytes) < 3200:
-            return Response(status_code=400, content="Dữ liệu âm thanh quá ngắn.")
+            return Response(status_code=400, content="Dữ liệu âm thanh quá ngắn hoặc rỗng.")
 
         if not client:
-            return Response(status_code=500, content="Server chưa cấu hình GEMINI_API_KEY.")
+            return Response(status_code=500, content="Server chưa được cấu hình GEMINI_API_KEY.")
 
-        # 2. Tạo WAV Header cho khối âm thanh PCM
+        # 5.2. Chuyển PCM thô thành WAV binary để Gemini xử lý trực tiếp (Speech-to-Text & LLM)
         wav_bytes = create_wav_bytes(pcm_bytes, sample_rate=16000)
 
-        # 3. Gửi Audio tới Gemini 3.6 Flash với luật Bún Đậu
+        # 5.3. Gửi Audio trực tiếp lên Gemini 3.6 Flash với cơ chế Retry
         reply_text = ""
         max_retries = 3
 
@@ -101,7 +103,7 @@ async def chat_audio(request: Request):
                         )
                     ],
                     config=genai.types.GenerateContentConfig(
-                        max_output_tokens=300,  # Cho phép xuất tối đa 300 tokens (tránh cụt câu)
+                        max_output_tokens=300,
                         temperature=0.7
                     )
                 )
@@ -114,31 +116,30 @@ async def chat_audio(request: Request):
 
                 if "503" in err_str or "UNAVAILABLE" in err_str:
                     if attempt < max_retries - 1:
-                        time.sleep(2)  # Đợi 2 giây rồi tự động thử lại
+                        time.sleep(2)
                         continue
                     else:
                         reply_text = "Server AI đang quá tải, tao chưa nghe kịp. Mày nói lại sau vài giây xem."
                 elif "429" in err_str:
-                    reply_text = "mua gói vip pro giùm tao cái, không có tiền mua thì tao đi ngủ, cần hỏi gì thì mai quay lại tìm tao."
+                    reply_text = "Mua gói vip pro giùm tao cái, không có tiền mua thì tao đi ngủ, cần hỏi gì thì mai quay lại tìm tao."
                     break
                 else:
                     reply_text = "Có lỗi kết nối rồi, mày nói lại lần nữa xem."
                     break
-                    
-        # Làm sạch văn bản loại bỏ icon / markdown trước khi đưa qua TTS
+
+        # 5.4. Làm sạch văn bản trước khi đưa sang TTS
         reply_text = clean_text_for_tts(reply_text)
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
-        # 4. Chuyển văn bản thành giọng Nữ miền Bắc (gTTS)
+        # 5.5. Chuyển văn bản thành Audio MP3 qua gTTS
         mp3_fp = io.BytesIO()
         tts = gTTS(text=reply_text, lang='vi')
         tts.write_to_fp(mp3_fp)
         mp3_data = mp3_fp.getvalue()
 
-        # 5. CHỈNH TÔNG GIỌNG (PITCH SHIFT)
-        # Giá trị mặc định là 16000. 
-        # Giảm số này xuống (14000 - 14400) làm cho giọng Google cao hơn, chua hơn, đanh đá đúng style video TikTok.
-        PITCH_SHIFT_RATE = 13500 
+        # 5.6. Hạ tông giọng (Pitch Shift) & Chuyển MP3 thành PCM 16-bit Mono gửi về ESP32
+        # Mức 13200Hz giúp giọng gTTS đọc nhanh và đanh đá hơn
+        PITCH_SHIFT_RATE = 13200 
 
         decoded = miniaudio.decode(
             mp3_data,
@@ -148,25 +149,11 @@ async def chat_audio(request: Request):
         )
         pcm_out_bytes = decoded.samples.tobytes()
 
-        print(f"[SERVER] Đã xuất {len(pcm_out_bytes)} bytes PCM. Đang gửi về ESP32-S3...")
+        print(f"[SERVER] Đã giải mã {len(pcm_out_bytes)} bytes PCM. Đang phản hồi về ESP32-S3...")
+        
+        # 5.7. Trả về stream binary PCM trực tiếp
         return Response(content=pcm_out_bytes, media_type="application/octet-stream")
 
     except Exception as e:
-        print(f"[ERROR]: {str(e)}")
-        return Response(status_code=500, content=str(e))
-
-        # 5. Giải mã MP3 -> PCM 16kHz 16-bit Mono gửi về ESP32-S3
-        decoded = miniaudio.decode(
-            bytes(mp3_data),
-            output_format=miniaudio.SampleFormat.SIGNED16,
-            nchannels=1,
-            sample_rate=16000
-        )
-        pcm_out_bytes = decoded.samples.tobytes()
-
-        print(f"[SERVER] Đã xuất {len(pcm_out_bytes)} bytes PCM. Đang gửi về ESP32-S3...")
-        return Response(content=pcm_out_bytes, media_type="application/octet-stream")
-
-    except Exception as e:
-        print(f"[ERROR]: {str(e)}")
+        print(f"[ERROR EXCEPTION]: {str(e)}")
         return Response(status_code=500, content=str(e))
