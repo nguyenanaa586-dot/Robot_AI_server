@@ -181,7 +181,7 @@ async def chat_audio(request: Request):
             mp3_fp.getvalue(),
             output_format=miniaudio.SampleFormat.SIGNED16,
             nchannels=1,
-            sample_rate=13500
+            sample_rate=10500
         )
         pcm_out_bytes = decoded.samples.tobytes()
 
