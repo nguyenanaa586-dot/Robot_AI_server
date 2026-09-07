@@ -101,7 +101,7 @@ async def chat_audio(request: Request):
 
         # 3. GỬI AUDIO SANG GEMINI CÓ CƠ CHẾ FALLBACK (3.6 -> 2.5 -> 1.5)
         reply_text = ""
-        MODELS_TO_TRY = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+        MODELS_TO_TRY = ["gemini-3.6-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
         success = False
 
         for model_name in MODELS_TO_TRY:
@@ -122,7 +122,7 @@ async def chat_audio(request: Request):
                             )
                         ],
                         config=genai.types.GenerateContentConfig(
-                            max_output_tokens=300,
+                            max_output_tokens=1000,
                             temperature=0.7
                         )
                     )
