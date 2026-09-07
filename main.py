@@ -173,15 +173,21 @@ async def chat_audio(request: Request):
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
         # 3. CHUYỂN THÀNH ÂM THANH GTTS
-        mp3_fp = io.BytesIO()
+        print("[TTS] Đang tạo file âm thanh gTTS...")
+        
         tts = gTTS(text=reply_text, lang='vi')
+        mp3_fp = io.BytesIO()
         tts.write_to_fp(mp3_fp)
+        mp3_bytes = mp3_fp.getvalue()
 
+        # GIẢM sample_rate từ 13500 xuống 11000 để nâng tông giọng (increase pitch)
+    TARGET_PITCH_RATE = 10500  # Chỉnh con số này để thay đổi tông giọng Bún Đậu
+    
         decoded = miniaudio.decode(
-            mp3_fp.getvalue(),
+            mp3_bytes,
             output_format=miniaudio.SampleFormat.SIGNED16,
             nchannels=1,
-            sample_rate=10500
+            sample_rate=TARGET_PITCH_RATE
         )
         pcm_out_bytes = decoded.samples.tobytes()
 
