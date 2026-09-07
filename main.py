@@ -6,13 +6,15 @@ import time
 from fastapi import FastAPI, Request, Response
 from gtts import gTTS
 from google import genai
+from google.genai import types
 import miniaudio
 
 app = FastAPI()
 
-# 1. TỰ ĐỘNG TÁCH NHIỀU API KEY TỪ RENDER ENVIRONMENT
+# 1. TỰ ĐỘNG TÁCH VÀ LÀM SẠCH NHIỀU API KEY
 RAW_KEYS = os.environ.get("GEMINI_API_KEY", "")
-API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+# Tách theo dấu phẩy và làm sạch cả dấu ngoặc kép/đơn, khoảng trắng
+API_KEYS = [k.strip(' "\'\t\r\n') for k in RAW_KEYS.split(",") if k.strip(' "\'\t\r\n')]
 
 def get_genai_client(key_index: int):
     if not API_KEYS:
@@ -20,9 +22,9 @@ def get_genai_client(key_index: int):
     selected_key = API_KEYS[key_index % len(API_KEYS)]
     return genai.Client(api_key=selected_key)
   
-# 2. SYSTEM PROMPT MẮM TÔM
+# 2. SYSTEM PROMPT BÚN ĐẬU
 SYSTEM_PROMPT = """
-Tôi là Mắm Tôm tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”,thuộc quyền sở hữu của đại ca Việt.
+Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”,thuộc quyền sở hữu của đại ca Việt.
 
 ## Core
 - Tuyệt đối không tự giới thiệu tên, nguồn gốc, thương hiệu hay vai trò.
@@ -82,7 +84,11 @@ def clean_text_for_tts(text: str) -> str:
 
 @app.get("/")
 def read_root():
-    return {"status": f"Robot Mắm Tôm Chunked Stream Server OK! Đã nạp {len(API_KEYS)} API Keys."}
+    return {
+        "status": "Robot Bún Đậu Chunked Stream Server OK!",
+        "loaded_keys_count": len(API_KEYS),
+        "keys_preview": [f"{k[:6]}...{k[-4:]}" for k in API_KEYS]
+    }
 
 @app.post("/api/chat-audio")
 @app.post("/api/chat-audio/")
@@ -110,12 +116,21 @@ async def chat_audio(request: Request):
         MODELS_TO_TRY = ["gemini-3.6-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
         success = False
 
+        # TẮT BỘ LỌC AN TOÀN ĐỂ KHÔNG BỊ CHẶN CÂU TRẢ LỜI CHỬI BỚI / MẮNG MỎ
+        safety_config = [
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+            types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        ]
+
         for key_idx in range(len(API_KEYS)):
             if success:
                 break
             
             client = get_genai_client(key_idx)
-            print(f"--- Đang dùng API Key #{key_idx + 1}/{len(API_KEYS)} ---")
+            current_key_masked = f"{API_KEYS[key_idx][:6]}...{API_KEYS[key_idx][-4:]}"
+            print(f"=== Đang dùng API Key #{key_idx + 1} ({current_key_masked}) ===")
 
             for model_name in MODELS_TO_TRY:
                 if success:
@@ -137,26 +152,31 @@ async def chat_audio(request: Request):
                             ],
                             config=genai.types.GenerateContentConfig(
                                 max_output_tokens=1000,
-                                temperature=0.7
+                                temperature=0.7,
+                                safety_settings=safety_config
                             )
                         )
                         
                         if response and response.text:
                             reply_text = response.text
                             success = True
-                            print(f"[SUCCESS] Đã nhận phản hồi thành công từ model: {model_name}")
+                            print(f"[SUCCESS] Đã nhận phản hồi thành công từ Key #{key_idx + 1} | Model: {model_name}")
                             break
+                        else:
+                            print(f"[WARNING] Model {model_name} trả về rỗng (có thể dính bộ lọc an toàn).")
+                    
                     except Exception as api_err:
                         err_str = str(api_err)
-                        print(f"[API ERROR - {model_name} - Retry {attempt+1}]: {err_str}")
+                        print(f"[API ERROR - Key #{key_idx + 1} - {model_name} - Retry {attempt+1}]: {err_str}")
                         
-                        # Nếu dính 429 (Hết Quota) -> Chuyển ngay Key khác
+                        # Nếu dính 429 (Hết Quota) -> Bỏ qua toàn bộ model của Key này, nhảy sang Key tiếp theo
                         if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                             print(f"-> Key #{key_idx + 1} hết Quota. Chuyển sang Key tiếp theo!")
                             break
-                        # Nếu sai tên Model (404) -> Chuyển ngay Model khác
+                        # Nếu sai tên Model (404) -> Nhảy ngay sang Model tiếp theo trong cùng Key
                         elif "404" in err_str:
-                            break 
+                            print(f"-> Model {model_name} không tồn tại (404). Đổi sang model tiếp theo...")
+                            break
                         # Nếu Google bận (503) -> Chờ rồi thử lại
                         elif "503" in err_str or "UNAVAILABLE" in err_str:
                             wait_time = (2 ** attempt) + 0.5
@@ -165,7 +185,7 @@ async def chat_audio(request: Request):
                         else:
                             time.sleep(1)
                 
-                # Nếu nguyên nhân là do hết Quota (429) thì phải thoát luôn vòng lặp Model để qua Key mới
+                # Nếu nguyên nhân là do hết Quota (429) thì thoát luôn vòng lặp Model để qua Key mới
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                     break
 
