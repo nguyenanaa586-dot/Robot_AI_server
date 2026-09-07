@@ -2,7 +2,6 @@ import os
 import io
 import wave
 import re
-import time
 from fastapi import FastAPI, Request, Response
 from gtts import gTTS
 from google import genai
@@ -13,8 +12,11 @@ app = FastAPI()
 
 # 1. TỰ ĐỘNG TÁCH VÀ LÀM SẠCH NHIỀU API KEY
 RAW_KEYS = os.environ.get("GEMINI_API_KEY", "")
-# Tách theo dấu phẩy và làm sạch cả dấu ngoặc kép/đơn, khoảng trắng
 API_KEYS = [k.strip(' "\'\t\r\n') for k in RAW_KEYS.split(",") if k.strip(' "\'\t\r\n')]
+
+# Biến toàn cục ghi nhớ Key đang hoạt động tốt nhất để dùng ngay cho lượt sau
+CURRENT_KEY_INDEX = 0
+MODEL_NAME = "gemini-3.6-flash"  # Model cố định hỗ trợ Audio mượt và ổn định nhất
 
 def get_genai_client(key_index: int):
     if not API_KEYS:
@@ -73,7 +75,7 @@ def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
     with wave.open(wav_io, 'wb') as wav_file:
         wav_file.setnchannels(1)           # Mono
         wav_file.setsampwidth(2)          # 16-bit PCM
-        wav_file.setframerate(sample_rate) # 16kHz
+        wav_file.setframerate(sample_rate) # Sample rate tương ứng
         wav_file.writeframes(pcm_data)
     return wav_io.getvalue()
 
@@ -87,12 +89,13 @@ def read_root():
     return {
         "status": "Robot Bún Đậu Chunked Stream Server OK!",
         "loaded_keys_count": len(API_KEYS),
-        "keys_preview": [f"{k[:6]}...{k[-4:]}" for k in API_KEYS]
+        "current_active_key_index": CURRENT_KEY_INDEX
     }
 
 @app.post("/api/chat-audio")
 @app.post("/api/chat-audio/")
 async def chat_audio(request: Request):
+    global CURRENT_KEY_INDEX
     try:
         # 1. NHẬN LUỒNG STREAM AUDIO CHUNKED TỪ ESP32
         pcm_chunks = []
@@ -100,7 +103,7 @@ async def chat_audio(request: Request):
             pcm_chunks.append(chunk)
 
         pcm_bytes = b"".join(pcm_chunks)
-        print(f"[STREAM RECEIVE] Tong dung luong nhan duoc từ ESP32: {len(pcm_bytes)} bytes")
+        print(f"[STREAM RECEIVE] Tong dung luong nhan duoc: {len(pcm_bytes)} bytes")
 
         if not pcm_bytes or len(pcm_bytes) < 3200:
             return Response(status_code=400, content="Gói âm thanh quá ngắn.")
@@ -108,15 +111,12 @@ async def chat_audio(request: Request):
         if not API_KEYS:
             return Response(status_code=500, content="Chưa cấu hình GEMINI_API_KEY")
 
-        # 2. ĐÓNG GÓI WAV TỪ TOÀN BỘ STREAM PCM
         wav_bytes = create_wav_bytes(pcm_bytes, sample_rate=16000)
 
-        # 3. GỬI AUDIO SANG GEMINI CÓ CƠ CHẾ FALLBACK VÀ XOAY KEY
+        # 2. CHỈ XOAY KEY THÔNG MINH - BỎ HOÀN TOÀN TẠM DỪNG (ZERO SLEEP)
         reply_text = ""
-        MODELS_TO_TRY = ["gemini-3.6-flash", "gemini-2.0-flash", "gemini-2.0-flash-lite"]
         success = False
 
-        # TẮT BỘ LỌC AN TOÀN ĐỂ KHÔNG BỊ CHẶN CÂU TRẢ LỜI CHỬI BỚI / MẮNG MỎ
         safety_config = [
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
@@ -124,85 +124,54 @@ async def chat_audio(request: Request):
             types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
         ]
 
-        for key_idx in range(len(API_KEYS)):
-            if success:
-                break
-            
+        total_keys = len(API_KEYS)
+        for step in range(total_keys):
+            key_idx = (CURRENT_KEY_INDEX + step) % total_keys
             client = get_genai_client(key_idx)
-            current_key_masked = f"{API_KEYS[key_idx][:6]}...{API_KEYS[key_idx][-4:]}"
-            print(f"=== Đang dùng API Key #{key_idx + 1} ({current_key_masked}) ===")
 
-            for model_name in MODELS_TO_TRY:
-                if success:
-                    break
-                
-                max_retries = 2
-                err_str = ""
-                for attempt in range(max_retries):
-                    try:
-                        print(f"[API CALL] Đang gọi Gemini model: {model_name} (Lần {attempt+1})...")
-                        response = client.models.generate_content(
-                            model=model_name,
-                            contents=[
-                                SYSTEM_PROMPT,
-                                genai.types.Part.from_bytes(
-                                    data=wav_bytes,
-                                    mime_type="audio/wav"
-                                )
-                            ],
-                            config=genai.types.GenerateContentConfig(
-                                max_output_tokens=1000,
-                                temperature=0.7,
-                                safety_settings=safety_config
-                            )
+            try:
+                print(f"[FAST CALL] Dang goi Key #{key_idx + 1}...")
+                response = client.models.generate_content(
+                    model=MODEL_NAME,
+                    contents=[
+                        SYSTEM_PROMPT,
+                        genai.types.Part.from_bytes(
+                            data=wav_bytes,
+                            mime_type="audio/wav"
                         )
-                        
-                        if response and response.text:
-                            reply_text = response.text
-                            success = True
-                            print(f"[SUCCESS] Đã nhận phản hồi thành công từ Key #{key_idx + 1} | Model: {model_name}")
-                            break
-                        else:
-                            print(f"[WARNING] Model {model_name} trả về rỗng (có thể dính bộ lọc an toàn).")
-                    
-                    except Exception as api_err:
-                        err_str = str(api_err)
-                        print(f"[API ERROR - Key #{key_idx + 1} - {model_name} - Retry {attempt+1}]: {err_str}")
-                        
-                        # Nếu dính 429 (Hết Quota) -> Bỏ qua toàn bộ model của Key này, nhảy sang Key tiếp theo
-                        if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                            print(f"-> Key #{key_idx + 1} hết Quota. Chuyển sang Key tiếp theo!")
-                            break
-                        # Nếu sai tên Model (404) -> Nhảy ngay sang Model tiếp theo trong cùng Key
-                        elif "404" in err_str:
-                            print(f"-> Model {model_name} không tồn tại (404). Đổi sang model tiếp theo...")
-                            break
-                        # Nếu Google bận (503) -> Chờ rồi thử lại
-                        elif "503" in err_str or "UNAVAILABLE" in err_str:
-                            wait_time = (2 ** attempt) + 0.5
-                            print(f"-> Model {model_name} bị quá tải (503), chờ {wait_time}s...")
-                            time.sleep(wait_time)
-                        else:
-                            time.sleep(1)
+                    ],
+                    config=genai.types.GenerateContentConfig(
+                        max_output_tokens=1000,
+                        temperature=0.7,
+                        safety_settings=safety_config
+                    )
+                )
                 
-                # Nếu nguyên nhân là do hết Quota (429) thì thoát luôn vòng lặp Model để qua Key mới
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                if response and response.text:
+                    reply_text = response.text
+                    success = True
+                    # GHI NHỚ KEY SỐNG NÀY ĐỂ LẦN SAU VÀO THẲNG MÀ KHÔNG CẦN THỬ KEY CŨ NỮA
+                    CURRENT_KEY_INDEX = key_idx  
+                    print(f"[SUCCESS] Nhan phan hoi thanh cong tu Key #{key_idx + 1}")
                     break
+            
+            except Exception as api_err:
+                err_str = str(api_err)
+                print(f"[KEY FAILURE] Key #{key_idx + 1} bi loi (Quota/Blocked/Expired): {err_str[:80]}... Doi sang Key tiep theo lap tuc!")
+                # Bỏ qua ngay lập tức, chuyển sang Key tiếp theo trong 0.001 giây (Không sleep)
+                continue
 
-        # Nếu quét sạch các API Key và Model mà vẫn xịt
         if not success or not reply_text:
             reply_text = "Hết lượt dùng miễn phí rồi mày, xì tiền ra mua gói vip pro giùm tao đi, không thì tao đi ngủ, mai gặp lại mày."
 
-        # CLEAN TEXT VÀ IN RA LOG SERVER
         reply_text = clean_text_for_tts(reply_text)
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
-        # 4. TẠO ÂM THANH PHẢN HỒI QUA GTTS VÀ CHIẾN THUẬT PITCH SHIFT
+        # 3. CHUYỂN THÀNH ÂM THANH GTTS
         mp3_fp = io.BytesIO()
         tts = gTTS(text=reply_text, lang='vi')
         tts.write_to_fp(mp3_fp)
 
-        # Pitch shift 13500Hz để tạo giọng đanh đá
         decoded = miniaudio.decode(
             mp3_fp.getvalue(),
             output_format=miniaudio.SampleFormat.SIGNED16,
@@ -211,7 +180,9 @@ async def chat_audio(request: Request):
         )
         pcm_out_bytes = decoded.samples.tobytes()
 
-        return Response(content=pcm_out_bytes, media_type="application/octet-stream")
+        # ĐÓNG GÓI THÀNH FILE WAV CHUẨN HEADER ĐỂ ESP32 PHÁT RA LOA NGAY
+        wav_out_bytes = create_wav_bytes(pcm_out_bytes, sample_rate=13500)
+        return Response(content=wav_out_bytes, media_type="audio/wav")
 
     except Exception as e:
         print(f"[ERROR]: {str(e)}")
