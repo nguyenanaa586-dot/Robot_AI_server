@@ -65,10 +65,10 @@ def clean_text_for_tts(text: str) -> str:
     text = re.sub(r'[*#_\-~>`]', '', text)
     return text.strip()
 
-def text_to_pcm_chunks(sentence_text: str, target_pitch_rate: int = 10500):
+def text_to_pcm_chunks(sentence_text: str, target_sample_rate: int = 16000):
     """
-    Chuyển từng câu văn ngắn thành PCM raw thô và cắt nhỏ thành các chunk 1024 bytes 
-    xả trực tiếp xuống HTTPS Socket.
+    Chuyển từng câu văn ngắn thành PCM raw thô chuẩn 16000Hz (hoặc 24000Hz)
+    để ESP32 giải mã mịn, không rè tiếng và ném thẳng xuống Socket HTTPS.
     """
     clean_txt = clean_text_for_tts(sentence_text)
     if not clean_txt:
@@ -80,16 +80,16 @@ def text_to_pcm_chunks(sentence_text: str, target_pitch_rate: int = 10500):
         tts.write_to_fp(mp3_fp)
         mp3_bytes = mp3_fp.getvalue()
 
-        # Giải mã MP3 thành PCM 16-bit Signed Mono
+        # Decode MP3 gốc sang chuẩn PCM 16-bit Mono 16000Hz (Tần số tiêu chuẩn cho ESP32 I2S)
         decoded = miniaudio.decode(
             mp3_bytes,
             output_format=miniaudio.SampleFormat.SIGNED16,
             nchannels=1,
-            sample_rate=target_pitch_rate
+            sample_rate=target_sample_rate
         )
         pcm_bytes = decoded.samples.tobytes()
 
-        # Cắt dữ liệu PCM ra thành các khung 1024 bytes đẩy liên tục
+        # Cắt nhỏ thành các chunk 1024 bytes đẩy liên tục giúp phát ngay lập tức
         chunk_size = 1024
         for i in range(0, len(pcm_bytes), chunk_size):
             yield pcm_bytes[i:i + chunk_size]
@@ -179,18 +179,18 @@ async def chat_audio(request: Request):
         reply_text = clean_text_for_tts(reply_text)
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
-        # 3. TÁCH VĂN BẢN THÀNH TỪNG CÂU VÀ YIELD LUỒNG PCM TRỰC TIẾP
+        # 3. TÁCH VĂN BẢN THÀNH TỪNG CÂU VÀ YIELD LUỒNG PCM TRỰC TIẾP CHUẨN 16KHZ
         sentences = re.split(r'(?<=[.!?\n])\s+', reply_text)
 
         def audio_stream_generator():
             for sentence in sentences:
                 if sentence.strip():
                     print(f"[STREAMING SENTENCE]: {sentence}")
-                    # Ép Pitch 10500Hz để tạo giọng Bún Đậu đanh đá
-                    for pcm_chunk in text_to_pcm_chunks(sentence, target_pitch_rate=10500):
+                    # Xuất PCM chuẩn 16000Hz (Tránh hiện tượng méo tiếng do resample sai)
+                    for pcm_chunk in text_to_pcm_chunks(sentence, target_sample_rate=16000):
                         yield pcm_chunk
 
-        # Trả về luồng Streaming Response chuẩn octet-stream
+        # Trả về luồng Streaming Response
         return StreamingResponse(
             audio_stream_generator(),
             media_type="application/octet-stream",
