@@ -16,14 +16,14 @@ API_KEYS = [k.strip(' "\'\t\r\n') for k in RAW_KEYS.split(",") if k.strip(' "\'\
 
 # Biến toàn cục ghi nhớ Key đang hoạt động tốt nhất để dùng ngay cho lượt sau
 CURRENT_KEY_INDEX = 0
-MODEL_NAME = "gemini-3.6-flash"  # Model cố định hỗ trợ Audio mượt và ổn định nhất
+MODEL_NAME = "gemini-3.6-flash"  # Tên model chuẩn của Google GenAI SDK
 
 def get_genai_client(key_index: int):
     if not API_KEYS:
         return None
     selected_key = API_KEYS[key_index % len(API_KEYS)]
     return genai.Client(api_key=selected_key)
-  
+
 # 2. SYSTEM PROMPT BÚN ĐẬU
 SYSTEM_PROMPT = """
 Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”,thuộc quyền sở hữu của đại ca Việt.
@@ -100,7 +100,6 @@ async def chat_audio(request: Request):
     # Ép đóng kết nối sau mỗi response để tránh treo Socket ESP32
     CUSTOM_HEADERS = {"Connection": "close"}
 
-    
     try:
         # 1. NHẬN LUỒNG STREAM AUDIO CHUNKED TỪ ESP32
         pcm_chunks = []
@@ -111,10 +110,10 @@ async def chat_audio(request: Request):
         print(f"[STREAM RECEIVE] Tong dung luong nhan duoc: {len(pcm_bytes)} bytes")
 
         if not pcm_bytes or len(pcm_bytes) < 3200:
-            return Response(status_code=400, content="Gói âm thanh quá ngắn.")
+            return Response(status_code=400, content="Gói âm thanh quá ngắn.", headers=CUSTOM_HEADERS)
 
         if not API_KEYS:
-            return Response(status_code=500, content="Chưa cấu hình GEMINI_API_KEY")
+            return Response(status_code=500, content="Chưa cấu hình GEMINI_API_KEY", headers=CUSTOM_HEADERS)
 
         wav_bytes = create_wav_bytes(pcm_bytes, sample_rate=16000)
 
@@ -155,15 +154,13 @@ async def chat_audio(request: Request):
                 if response and response.text:
                     reply_text = response.text
                     success = True
-                    # GHI NHỚ KEY SỐNG NÀY ĐỂ LẦN SAU VÀO THẲNG MÀ KHÔNG CẦN THỬ KEY CŨ NỮA
                     CURRENT_KEY_INDEX = key_idx  
                     print(f"[SUCCESS] Nhan phan hoi thanh cong tu Key #{key_idx + 1}")
                     break
             
             except Exception as api_err:
                 err_str = str(api_err)
-                print(f"[KEY FAILURE] Key #{key_idx + 1} bi loi (Quota/Blocked/Expired): {err_str[:80]}... Doi sang Key tiep theo lap tuc!")
-                # Bỏ qua ngay lập tức, chuyển sang Key tiếp theo trong 0.001 giây (Không sleep)
+                print(f"[KEY FAILURE] Key #{key_idx + 1} bi loi: {err_str[:80]}... Doi sang Key tiep theo lap tuc!")
                 continue
 
         if not success or not reply_text:
@@ -172,17 +169,16 @@ async def chat_audio(request: Request):
         reply_text = clean_text_for_tts(reply_text)
         print(f"[BÚN ĐẬU RESPOND]: {reply_text}")
 
-        # 3. CHUYỂN THÀNH ÂM THANH GTTS
+        # 3. CHUYỂN THÀNH ÂM THANH GTTS VÀ ÉP PITCH
         print("[TTS] Đang tạo file âm thanh gTTS...")
-        
-        tts = gTTS(text=reply_text, lang='vi')
         mp3_fp = io.BytesIO()
+        tts = gTTS(text=reply_text, lang='vi')
         tts.write_to_fp(mp3_fp)
         mp3_bytes = mp3_fp.getvalue()
 
-        # GIẢM sample_rate từ 13500 xuống 11000 để nâng tông giọng (increase pitch)
-    TARGET_PITCH_RATE = 10500  # Chỉnh con số này để thay đổi tông giọng Bún Đậu
-    
+        # GIẢM sample_rate từ 13500 xuống 10500 để nâng tông giọng (increase pitch)
+        TARGET_PITCH_RATE = 10500  
+
         decoded = miniaudio.decode(
             mp3_bytes,
             output_format=miniaudio.SampleFormat.SIGNED16,
@@ -193,10 +189,10 @@ async def chat_audio(request: Request):
 
         # ĐÓNG GÓI THÀNH FILE WAV CHUẨN HEADER ĐỂ ESP32 PHÁT RA LOA NGAY
         wav_out_bytes = create_wav_bytes(pcm_out_bytes, sample_rate=13500) 
-    
-    print(f"[TTS SUCCESS] Đã tạo xong file WAV ép pitch ({len(wav_out_bytes)} bytes)")
-    return Response(content=wav_out_bytes, media_type="audio/wav", headers=CUSTOM_HEADERS)
+        
+        print(f"[TTS SUCCESS] Đã tạo xong file WAV ép pitch ({len(wav_out_bytes)} bytes)")
+        return Response(content=wav_out_bytes, media_type="audio/wav", headers=CUSTOM_HEADERS)
 
-except Exception as tts_err:
-    print(f"[TTS ERROR]: {str(tts_err)}")
-    return Response(status_code=500, content=f"TTS Error: {str(tts_err)}", headers=CUSTOM_HEADERS)
+    except Exception as tts_err:
+        print(f"[TTS ERROR]: {str(tts_err)}")
+        return Response(status_code=500, content=f"TTS Error: {str(tts_err)}", headers=CUSTOM_HEADERS)
