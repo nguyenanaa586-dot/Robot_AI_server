@@ -16,7 +16,7 @@ RAW_KEYS = os.environ.get("GEMINI_API_KEY", "")
 API_KEYS = [k.strip(' "\'\t\r\n') for k in RAW_KEYS.split(",") if k.strip(' "\'\t\r\n')]
 
 CURRENT_KEY_INDEX = 0
-MODEL_NAME = "gemini-2.5-flash" # Chú ý: Dùng 2.5-flash hoặc 1.5-flash, gemini-3.6-flash chưa tồn tại
+MODEL_NAME = "gemini-3.6-flash" # Chú ý: Dùng 2.5-flash hoặc 1.5-flash, gemini-3.6-flash chưa tồn tại
 
 def get_genai_client(key_index: int):
     if not API_KEYS:
