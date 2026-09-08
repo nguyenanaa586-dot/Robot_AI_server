@@ -265,13 +265,16 @@ async def chat_audio(request: Request):
           buffer_text += text
           yield from process_buffer(force_flush=False)
 
-      # Nhận liên tục các chunk tiếp theo từ Gemini
+      # Nhận liên tục các chunk tiếp theo từ Gemini (Đã bọc try-except chống nổ server khi ngắt mạng)
       if gemini_stream:
-        for chunk in gemini_stream:
-          text = safe_get_chunk_text(chunk)
-          if text:
-            buffer_text += text
-            yield from process_buffer(force_flush=False)
+        try:
+          for chunk in gemini_stream:
+            text = safe_get_chunk_text(chunk)
+            if text:
+              buffer_text += text
+              yield from process_buffer(force_flush=False)
+        except Exception as stream_err:
+          print(f"[STREAM INTERRUPTED] Luồng Gemini bị ngắt kết nối: {stream_err}")
 
       # Đẩy phần chữ còn lại trong buffer đi TTS
       yield from process_buffer(force_flush=True)
