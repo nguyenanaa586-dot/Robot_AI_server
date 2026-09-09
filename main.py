@@ -20,11 +20,11 @@ API_KEYS = [
 ]
 
 CURRENT_KEY_INDEX = 0
-MODEL_NAME = "gemini-3.6-flash"
+MODEL_NAME = "gemini-2.5-flash"  # Sử dụng model hỗ trợ chuẩn Stable
 
 
 def get_genai_client(key_index: int):
-    """Hàm lấy Client Gemini theo chỉ số Key (Dùng để xoay vòng Key khi bị giới hạn)"""
+    """Hàm lấy Client Gemini theo chỉ số Key"""
     if not API_KEYS:
         return None
     selected_key = API_KEYS[key_index % len(API_KEYS)]
@@ -62,7 +62,7 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 # 2. CÁC HÀM BỔ TRỢ XỬ LÝ ÂM THANH VÀ TEXT
 # ==============================================================================
 def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
-    """Đóng gói dữ liệu PCM thô thành file WAV hoàn chỉnh gửi cho Gemini nhận diện"""
+    """Đóng gói dữ liệu PCM thô thành file WAV hoàn chỉnh"""
     wav_io = io.BytesIO()
     with wave.open(wav_io, "wb") as wav_file:
         wav_file.setnchannels(1)  # Mono
@@ -73,14 +73,14 @@ def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
 
 
 def clean_text_for_tts(text: str) -> str:
-    """Làm sạch văn bản trước khi đưa vào bộ đọc TTS (Lược bỏ ký tự đặc biệt)"""
+    """Làm sạch văn bản trước khi đưa vào bộ đọc TTS"""
     text = re.sub(r"\d{1,2}:\d{2}", "", text)
     text = re.sub(r"[*#_\-~>`]", "", text)
     return text.strip()
 
 
 def safe_get_chunk_text(chunk) -> str:
-    """Lấy văn bản từ chunk Gemini an toàn, chống crash khi dính Safety Filter"""
+    """Lấy văn bản từ chunk Gemini an toàn"""
     try:
         return chunk.text or ""
     except Exception:
@@ -90,26 +90,20 @@ def safe_get_chunk_text(chunk) -> str:
 async def text_to_pcm_chunks_edge(
     sentence_text: str, websocket: WebSocket, target_sample_rate: int = 16000
 ):
-    """
-    Chuyển văn bản thành PCM 16000Hz Mono 16-bit bằng Edge-TTS (Microsoft)
-    và bắn trực tiếp từng gói Binary 2048 bytes xuống ESP32 qua WebSocket.
-    """
+    """Chuyển văn bản thành PCM và gửi xuống ESP32"""
     clean_txt = clean_text_for_tts(sentence_text)
     if not clean_txt:
         return
 
     try:
-        # Sử dụng voice tiếng Việt Hoài Mỹ của Microsoft
         communicate = edge_tts.Communicate(clean_txt, voice="vi-VN-HoaiMyNeural")
         mp3_bytes = b""
 
-        # Đọc luồng âm thanh MP3 từ Microsoft Edge TTS
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 mp3_bytes += chunk["data"]
 
         if mp3_bytes:
-            # Giải mã MP3 sang PCM thô 16000Hz 16-bit Mono cho ESP32
             decoded = miniaudio.decode(
                 mp3_bytes,
                 output_format=miniaudio.SampleFormat.SIGNED16,
@@ -118,19 +112,17 @@ async def text_to_pcm_chunks_edge(
             )
             pcm_bytes = decoded.samples.tobytes()
 
-            # Bắn từng block 2048 bytes xuống ESP32
             chunk_size = 2048
             for i in range(0, len(pcm_bytes), chunk_size):
                 await websocket.send_bytes(pcm_bytes[i : i + chunk_size])
-                # Tránh nghẽn event loop, cho phép async gửi mượt mà
                 await asyncio.sleep(0.0005)
 
     except Exception as e:
-        print(f"[EDGE-TTS Error]: {e}")
+        print(f"[EDGE-TTS Error]: {e}", flush=True)
 
 
 # ==============================================================================
-# 3. WEBSOCKET ENDPOINT CHÍNH (GIAO TIẾP VỚI ESP32)
+# 3. WEBSOCKET ENDPOINT CHÍNH
 # ==============================================================================
 @app.get("/")
 def read_root():
@@ -145,17 +137,20 @@ def read_root():
 async def websocket_chat(websocket: WebSocket):
     global CURRENT_KEY_INDEX
 
-    # Chấp nhận kết nối từ ESP32
     await websocket.accept()
-    print("\n[WEBSOCKET] ESP32 đã kết nối thành công!")
+    print("\n[WEBSOCKET] ESP32 đã kết nối thành công!", flush=True)
 
-    # Bộ đệm tích lũy dữ liệu âm thanh từ Micro ESP32 gửi lên
     pcm_buffer = bytearray()
 
     try:
         while True:
-            # Chờ nhận tin nhắn từ ESP32 (Có thể là Binary Audio hoặc Text JSON)
+            # Nhận tin nhắn từ ASGI Server
             message = await websocket.receive()
+
+            # BẮT BUỘC: Kiểm tra nếu socket báo đóng từ client/proxy
+            if message.get("type") == "websocket.disconnect":
+                print("[WEBSOCKET] ESP32 đã gửi tín hiệu ngắt kết nối.", flush=True)
+                break
 
             # A. NẾU NHẬN ÂM THANH TỪ MICRO ESP32 (DẠNG BINARY)
             if "bytes" in message and message["bytes"]:
@@ -165,28 +160,24 @@ async def websocket_chat(websocket: WebSocket):
             elif "text" in message and message["text"]:
                 msg_text = message["text"].strip()
 
-                # Tín hiệu 1: Người dùng nhấn nút bắt đầu nói
                 if msg_text == '{"event":"start_speech"}':
                     pcm_buffer.clear()
-                    print("[WEBSOCKET] -> ESP32 Bắt đầu ghi âm...")
+                    print("[WEBSOCKET] -> ESP32 Bắt đầu ghi âm...", flush=True)
 
-                # Tín hiệu 2: Người dùng thả nút dừng nói -> Tiến hành xử lý AI
                 elif msg_text == '{"event":"end_speech"}':
                     print(
-                        f"[WEBSOCKET] -> ESP32 Dừng ghi âm. Dung lượng PCM: {len(pcm_buffer)} bytes"
+                        f"[WEBSOCKET] -> ESP32 Dừng ghi âm. Dung lượng PCM: {len(pcm_buffer)} bytes",
+                        flush=True,
                     )
 
-                    # Nếu âm thanh quá ngắn (< 0.1s), bỏ qua
                     if len(pcm_buffer) < 3200:
-                        print("[WEBSOCKET] Âm thanh quá ngắn, bỏ qua.")
+                        print("[WEBSOCKET] Âm thanh quá ngắn, bỏ qua.", flush=True)
                         pcm_buffer.clear()
                         continue
 
-                    # Tạo file WAV từ PCM buffer
                     wav_bytes = create_wav_bytes(bytes(pcm_buffer), sample_rate=16000)
-                    pcm_buffer.clear()  # Xóa buffer âm thanh đầu vào
+                    pcm_buffer.clear()
 
-                    # Cấu hình Safety cho Gemini
                     safety_config = [
                         types.SafetySetting(
                             category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
@@ -206,20 +197,25 @@ async def websocket_chat(websocket: WebSocket):
                         ),
                     ]
 
-                    # GỌI GEMINI VÀ XOAY VÒNG KEY TỰ ĐỘNG
                     total_keys = len(API_KEYS)
                     gemini_stream = None
-                    first_text_chunk = None
 
+                    if total_keys == 0:
+                        print("[GEMINI ERROR] Không có GEMINI_API_KEY nào được cài đặt!", flush=True)
+                        continue
+
+                    # SỬ DỤNG CLIENT BẤT ĐỒNG BỘ (client.aio) ĐỂ KHÔNG BỊ KHÓA EVENT LOOP
                     for step in range(total_keys):
                         key_idx = (CURRENT_KEY_INDEX + step) % total_keys
                         client = get_genai_client(key_idx)
 
                         try:
                             print(
-                                f"[GEMINI] Đang gọi Key #{key_idx + 1} (Stream)..."
+                                f"[GEMINI] Đang gọi Key #{key_idx + 1} (Async Stream)...",
+                                flush=True,
                             )
-                            stream_response = client.models.generate_content_stream(
+                            # Sử dụng client.aio thay vì client.models trực tiếp
+                            gemini_stream = await client.aio.models.generate_content_stream(
                                 model=MODEL_NAME,
                                 contents=[
                                     SYSTEM_PROMPT,
@@ -233,103 +229,70 @@ async def websocket_chat(websocket: WebSocket):
                                     safety_settings=safety_config,
                                 ),
                             )
-
-                            gemini_iterator = iter(stream_response)
-                            first_text_chunk = next(gemini_iterator)
-                            gemini_stream = gemini_iterator
                             CURRENT_KEY_INDEX = key_idx
-                            print(f"[GEMINI] Thành công với Key #{key_idx + 1}")
+                            print(f"[GEMINI] Thành công với Key #{key_idx + 1}", flush=True)
                             break
 
-                        except StopIteration:
-                            break
                         except Exception as api_err:
                             print(
-                                f"[GEMINI] Key #{key_idx + 1} lỗi: {str(api_err)[:60]}... Đổi key!"
+                                f"[GEMINI] Key #{key_idx + 1} lỗi: {str(api_err)[:60]}... Đổi key!",
+                                flush=True,
                             )
                             continue
 
-                    # BẮT ĐẦU ĐỌC LUỒNG CHỮ TỪ GEMINI -> CHUYỂN TTS -> BẮN BẬT LOA ESP32
+                    if not gemini_stream:
+                        print("[GEMINI] Tất cả API Keys đều thất bại!", flush=True)
+                        continue
+
+                    # ĐỌC LUỒNG CHỮ BẤT ĐỒNG BỘ TỪ GEMINI
                     buffer_text = ""
                     delimiters = [".", "!", "?", "\n", ",", ";"]
-                    is_first_sentence = True
 
-                    async def process_and_send_sentence(
-                        sentence: str, label="RESPOND"
-                    ):
-                        """Hàm phụ trợ ép câu sang âm thanh và bắn xuống WebSocket"""
+                    async def process_and_send_sentence(sentence: str, label="RESPOND"):
                         if clean_text_for_tts(sentence):
-                            print(f"[BÚN ĐẬU {label}]: {sentence.strip()}")
+                            print(f"[BÚN ĐẬU {label}]: {sentence.strip()}", flush=True)
                             await text_to_pcm_chunks_edge(
                                 sentence, websocket, target_sample_rate=16000
                             )
 
-                    # Đưa chunk đầu tiên thu được vào bộ đệm
-                    if first_text_chunk:
-                        txt = safe_get_chunk_text(first_text_chunk)
-                        if txt:
+                    try:
+                        async for chunk in gemini_stream:
+                            txt = safe_get_chunk_text(chunk)
+                            if not txt:
+                                continue
                             buffer_text += txt
 
-                    # Đọc tiếp các chunk tiếp theo
-                    if gemini_stream:
-                        try:
-                            for chunk in gemini_stream:
-                                txt = safe_get_chunk_text(chunk)
-                                if not txt:
-                                    continue
-                                buffer_text += txt
+                            while True:
+                                min_idx = len(buffer_text)
+                                matched_delim = None
+                                for d in delimiters:
+                                    idx = buffer_text.find(d)
+                                    if idx != -1 and idx < min_idx:
+                                        min_idx = idx
+                                        matched_delim = d
 
-                                # Fast First Chunk: Ưu tiên cắt nhanh câu đầu tiên để loa phát liền
-                                if (
-                                    is_first_sentence
-                                    and len(buffer_text) >= 15
-                                ):
-                                    space_idx = buffer_text.rfind(" ", 0, 25)
-                                    if space_idx != -1:
-                                        sent = buffer_text[:space_idx]
-                                        buffer_text = buffer_text[space_idx:]
-                                        is_first_sentence = False
-                                        await process_and_send_sentence(
-                                            sent, label="FAST FIRST"
-                                        )
-
-                                # Cắt các câu tiếp theo dựa trên dấu ngắt câu
-                                while True:
-                                    min_idx = len(buffer_text)
-                                    matched_delim = None
-                                    for d in delimiters:
-                                        idx = buffer_text.find(d)
-                                        if idx != -1 and idx < min_idx:
-                                            min_idx = idx
-                                            matched_delim = d
-
-                                    if min_idx < len(buffer_text):
-                                        if (
-                                            matched_delim in [",", ";"]
-                                            and min_idx < 12
-                                        ):
-                                            break
-                                        sent = buffer_text[: min_idx + 1]
-                                        buffer_text = buffer_text[min_idx + 1 :]
-                                        is_first_sentence = False
-                                        await process_and_send_sentence(sent)
-                                    else:
+                                if min_idx < len(buffer_text):
+                                    if (
+                                        matched_delim in [",", ";"]
+                                        and min_idx < 12
+                                    ):
                                         break
-                        except Exception as stream_err:
-                            print(f"[STREAM ERROR] Lỗi luồng Gemini: {stream_err}")
+                                    sent = buffer_text[: min_idx + 1]
+                                    buffer_text = buffer_text[min_idx + 1 :]
+                                    await process_and_send_sentence(sent)
+                                else:
+                                    break
+                    except Exception as stream_err:
+                        print(f"[STREAM ERROR] Lỗi luồng Gemini: {stream_err}", flush=True)
 
-                    # Xử lý đoạn text còn dư lại ở cuối luồng
                     if buffer_text.strip():
-                        await process_and_send_sentence(
-                            buffer_text, label="LAST"
-                        )
+                        await process_and_send_sentence(buffer_text, label="LAST")
                         buffer_text = ""
 
-                    # Báo hiệu cho ESP32 biết Server đã gửi xong toàn bộ câu nói
                     await websocket.send_text('{"event":"tts_done"}')
-                    print("[WEBSOCKET] -> Hoàn tất truyền âm thanh xuống ESP32.\n")
+                    print("[WEBSOCKET] -> Hoàn tất truyền âm thanh xuống ESP32.\n", flush=True)
 
     except WebSocketDisconnect:
-        print("[WEBSOCKET] ESP32 đã ngắt kết nối.")
+        print("[WEBSOCKET] ESP32 đã ngắt kết nối chủ động.", flush=True)
     except Exception as e:
-        print(f"[WEBSOCKET ERROR]: {e}")
+        print(f"[WEBSOCKET ERROR]: {e}", flush=True)
