@@ -1,6 +1,6 @@
 fastapi
 uvicorn
+websockets
 google-genai
-gtts
+edge-tts
 miniaudio
-python-multipart
