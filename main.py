@@ -20,7 +20,7 @@ API_KEYS = [
 ]
 
 CURRENT_KEY_INDEX = 0
-MODEL_NAME = "gemini-2.5-flash"  # Sử dụng model hỗ trợ chuẩn Stable
+MODEL_NAME = "gemini-3.6-flash"  # Sử dụng model hỗ trợ chuẩn Stable
 
 
 def get_genai_client(key_index: int):
@@ -144,8 +144,12 @@ async def websocket_chat(websocket: WebSocket):
 
     try:
         while True:
+            try:
             # Nhận tin nhắn từ ASGI Server
-            message = await websocket.receive()
+                message = await websocket.receive()
+            except RuntimeError:
+                print("[WEBSOCKET] ESP32 đã ngắt kết nối (Socket Closed).", flush=True)
+                break
 
             # BẮT BUỘC: Kiểm tra nếu socket báo đóng từ client/proxy
             if message.get("type") == "websocket.disconnect":
