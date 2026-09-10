@@ -90,32 +90,43 @@ def safe_get_chunk_text(chunk) -> str:
 async def text_to_pcm_chunks_edge(
     sentence_text: str, websocket: WebSocket, target_sample_rate: int = 16000
 ):
-    """Chuyển văn bản thành PCM và gửi xuống ESP32"""
+    """Chuyển văn bản thành PCM và gửi xuống ESP32 (Đã sửa lỗi No audio was received)"""
     clean_txt = clean_text_for_tts(sentence_text)
-    if not clean_txt:
+
+    # ĐIỀU CHỈNH 1: Bỏ qua nếu văn bản không chứa bất kỳ chữ cái/chữ số nào để tránh làm Edge-TTS báo lỗi
+    if not clean_txt or not re.search(r"\w", clean_txt):
         return
 
     try:
-        communicate = edge_tts.Communicate(clean_txt, voice="vi-VN-HoaiMyNeural")
+        communicate = edge_tts.Communicate(clean_txt, voice="vi-VN-NamMinhNeural")
         mp3_bytes = b""
 
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 mp3_bytes += chunk["data"]
 
-        if mp3_bytes:
+        # ĐIỀU CHỈNH 2: Kiểm tra nếu không nhận được dữ liệu MP3 từ Edge-TTS
+        if not mp3_bytes:
+            print(f"[EDGE-TTS Warning]: Khong nhan duoc audio cho cau: '{clean_txt}'", flush=True)
+            return
+
+        # ĐIỀU CHỈNH 3: Chạy giải mã miniaudio trong Thread riêng để không làm nghẽn Event Loop
+        def decode_mp3():
             decoded = miniaudio.decode(
                 mp3_bytes,
                 output_format=miniaudio.SampleFormat.SIGNED16,
                 nchannels=1,
                 sample_rate=target_sample_rate,
             )
-            pcm_bytes = decoded.samples.tobytes()
+            return decoded.samples.tobytes()
 
-            chunk_size = 2048
-            for i in range(0, len(pcm_bytes), chunk_size):
-                await websocket.send_bytes(pcm_bytes[i : i + chunk_size])
-                await asyncio.sleep(0.0005)
+        pcm_bytes = await asyncio.to_thread(decode_mp3)
+
+        # ĐIỀU CHỈNH 4: Chia gói 1024 bytes vừa đệm ESP32 và nghỉ 1ms giữa các gói giúp âm thanh mượt
+        chunk_size = 1024
+        for i in range(0, len(pcm_bytes), chunk_size):
+            await websocket.send_bytes(pcm_bytes[i : i + chunk_size])
+            await asyncio.sleep(0.001)
 
     except Exception as e:
         print(f"[EDGE-TTS Error]: {e}", flush=True)
@@ -145,7 +156,7 @@ async def websocket_chat(websocket: WebSocket):
     try:
         while True:
             try:
-            # Nhận tin nhắn từ ASGI Server
+                # Nhận tin nhắn từ ASGI Server
                 message = await websocket.receive()
             except RuntimeError:
                 print("[WEBSOCKET] ESP32 đã ngắt kết nối (Socket Closed).", flush=True)
