@@ -98,7 +98,7 @@ async def text_to_pcm_chunks_edge(
         return
 
     try:
-        communicate = edge_tts.Communicate(clean_txt, voice="vi-VN-NamMinhNeural")
+        communicate = edge_tts.Communicate(clean_txt, voice="vi-VN-HoaiMyNeural")
         mp3_bytes = b""
 
         async for chunk in communicate.stream():
