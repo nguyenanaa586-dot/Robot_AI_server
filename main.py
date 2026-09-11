@@ -21,7 +21,7 @@ API_KEYS = [
 
 CURRENT_KEY_INDEX = 0
 
-# TỐI ƯU 1: Nên dùng gemini-2.0-flash để có độ trễ tạo phản hồi thấp nhất
+# ĐÃ SỬA: Thay "gemini-3.6-flash" thành "gemini-2.0-flash" (hoặc "gemini-2.5-flash")
 MODEL_NAME = "gemini-3.6-flash" 
 
 # TỐI ƯU 2: Cấu hình giọng đọc Edge-TTS
@@ -248,7 +248,7 @@ async def websocket_chat(websocket: WebSocket):
                                     ),
                                 ],
                                 config=genai.types.GenerateContentConfig(
-                                    system_instruction=SYSTEM_PROMPT,  # <-- ĐƯA VÀO ĐÂY
+                                    system_instruction=SYSTEM_PROMPT,
                                     max_output_tokens=300,
                                     temperature=0.7,
                                     safety_settings=safety_config,
