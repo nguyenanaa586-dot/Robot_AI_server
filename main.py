@@ -22,7 +22,7 @@ API_KEYS = [
 CURRENT_KEY_INDEX = 0
 
 # TỐI ƯU 1: Nên dùng gemini-2.0-flash để có độ trễ tạo phản hồi thấp nhất
-MODEL_NAME = "gemini-2.0-flash" 
+MODEL_NAME = "gemini-3.6-flash" 
 
 # TỐI ƯU 2: Cấu hình giọng đọc Edge-TTS
 TTS_VOICE = "vi-VN-HoaiMyNeural"
