@@ -241,12 +241,12 @@ async def websocket_chat(websocket: WebSocket):
                             gemini_stream = await client.aio.models.generate_content_stream(
                                 model=MODEL_NAME,
                                 contents=[
-                                    SYSTEM_PROMPT,
                                     genai.types.Part.from_bytes(
                                         data=wav_bytes, mime_type="audio/wav"
                                     ),
                                 ],
                                 config=genai.types.GenerateContentConfig(
+                                    system_instruction=SYSTEM_PROMPT,  # <-- ĐƯA VÀO ĐÂY
                                     max_output_tokens=300,
                                     temperature=0.7,
                                     safety_settings=safety_config,
