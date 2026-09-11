@@ -26,7 +26,7 @@ MODEL_NAME = "gemini-3.6-flash"
 
 # TỐI ƯU 2: Cấu hình giọng đọc & tốc độ Edge-TTS
 TTS_VOICE = "vi-VN-HoaiMyNeural"
-TTS_RATE = "+15%"  # Tăng tốc độ đọc lên 15% để phản hồi nhanh và tự nhiên hơn
+TTS_RATE = "+10%"  # Tăng tốc độ đọc lên 15% để phản hồi nhanh và tự nhiên hơn
 
 def get_genai_client(key_index: int):
     """Hàm lấy Client Gemini theo chỉ số Key"""
@@ -244,7 +244,7 @@ async def websocket_chat(websocket: WebSocket):
                                 ],
                                 config=genai.types.GenerateContentConfig(
                                     # TỐI ƯU 5: Giảm token đầu ra tối đa 200 để ép Gemini trả lời nhanh hơn
-                                    max_output_tokens=200,
+                                    max_output_tokens=1000,
                                     temperature=0.7,
                                     safety_settings=safety_config,
                                 ),
