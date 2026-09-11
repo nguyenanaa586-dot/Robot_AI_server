@@ -12,7 +12,7 @@ import miniaudio
 app = FastAPI()
 
 # ==============================================================================
-# 1. CẤU HÌNH API KEY VÀ MODEL GEMINI (TỐI ƯU TỐC ĐỘ)
+# 1. CẤU HÌNH API KEY VÀ MODEL GEMINI
 # ==============================================================================
 RAW_KEYS = os.environ.get("GEMINI_API_KEY", "")
 API_KEYS = [
@@ -21,12 +21,12 @@ API_KEYS = [
 
 CURRENT_KEY_INDEX = 0
 
-# TỐI ƯU 1: Sử dụng model Gemini 2.0 Flash để latency (độ trễ) phản hồi cực nhanh (~300-500ms)
-MODEL_NAME = "gemini-3.6-flash" 
+# TỐI ƯU 1: Nên dùng gemini-2.0-flash để có độ trễ tạo phản hồi thấp nhất
+MODEL_NAME = "gemini-2.0-flash" 
 
-# TỐI ƯU 2: Cấu hình giọng đọc & tốc độ Edge-TTS
+# TỐI ƯU 2: Cấu hình giọng đọc Edge-TTS
 TTS_VOICE = "vi-VN-HoaiMyNeural"
-TTS_RATE = "+10%"  # Tăng tốc độ đọc lên 15% để phản hồi nhanh và tự nhiên hơn
+TTS_RATE = "+10%"  # Tăng tốc độ đọc lên 10% giúp giọng tự nhiên và nhanh hơn
 
 def get_genai_client(key_index: int):
     """Hàm lấy Client Gemini theo chỉ số Key"""
@@ -78,10 +78,11 @@ def create_wav_bytes(pcm_data: bytes, sample_rate: int = 16000) -> bytes:
 
 
 def clean_text_for_tts(text: str) -> str:
-    """Làm sạch văn bản trước khi đưa vào bộ đọc TTS"""
+    """Làm sạch văn bản và loại bỏ dấu ngắt thừa ở đầu/cuối để tránh lỗi Edge-TTS"""
     text = re.sub(r"\d{1,2}:\d{2}", "", text)
     text = re.sub(r"[*#_\-~>`]", "", text)
-    return text.strip()
+    # Loại bỏ các ký tự phân cách nằm dư thừa ở đầu và cuối chuỗi
+    return text.strip(" ,;:-_\n\r\t")
 
 
 def safe_get_chunk_text(chunk) -> str:
@@ -95,14 +96,13 @@ def safe_get_chunk_text(chunk) -> str:
 async def text_to_pcm_chunks_edge(
     sentence_text: str, websocket: WebSocket, target_sample_rate: int = 16000
 ):
-    """Chuyển văn bản thành PCM và stream trực tiếp xuống ESP32"""
+    """Chuyển văn bản thành PCM và stream theo nhịp 25ms tránh tràn RAM ESP32"""
     clean_txt = clean_text_for_tts(sentence_text)
 
     if not clean_txt or not re.search(r"\w", clean_txt):
         return
 
     try:
-        # TỐI ƯU 3: Áp dụng tham số rate để ép Edge-TTS sinh file audio nhanh hơn
         communicate = edge_tts.Communicate(clean_txt, voice=TTS_VOICE, rate=TTS_RATE)
         mp3_bytes = b""
 
@@ -126,11 +126,16 @@ async def text_to_pcm_chunks_edge(
 
         pcm_bytes = await asyncio.to_thread(decode_mp3)
 
-        # Gửi dữ liệu PCM xuống ESP32 theo từng chunk 1024 bytes
+        if not pcm_bytes:
+            return
+
+        # PACING TỐI ƯU: 1024 bytes = 32ms thời lượng phát loa.
+        # Nghỉ 25ms giữa các gói giúp không làm tràn đệm RingBuffer của ESP32.
         chunk_size = 1024
         for i in range(0, len(pcm_bytes), chunk_size):
-            await websocket.send_bytes(pcm_bytes[i : i + chunk_size])
-            await asyncio.sleep(0.001)
+            chunk = pcm_bytes[i : i + chunk_size]
+            await websocket.send_bytes(chunk)
+            await asyncio.sleep(0.025)
 
     except Exception as e:
         print(f"[EDGE-TTS Error]: {e}", flush=True)
@@ -190,7 +195,6 @@ async def websocket_chat(websocket: WebSocket):
                     if len(pcm_buffer) < 3200:
                         print("[WEBSOCKET] Âm thanh quá ngắn, bỏ qua.", flush=True)
                         pcm_buffer.clear()
-                        # TỐI ƯU 4: Báo tts_done ngay để ESP32 về IDLE, không bị kẹt ở THINKING
                         await websocket.send_text('{"event":"tts_done"}')
                         continue
 
@@ -243,8 +247,7 @@ async def websocket_chat(websocket: WebSocket):
                                     ),
                                 ],
                                 config=genai.types.GenerateContentConfig(
-                                    # TỐI ƯU 5: Giảm token đầu ra tối đa 200 để ép Gemini trả lời nhanh hơn
-                                    max_output_tokens=1000,
+                                    max_output_tokens=300,
                                     temperature=0.7,
                                     safety_settings=safety_config,
                                 ),
@@ -260,62 +263,44 @@ async def websocket_chat(websocket: WebSocket):
                             )
                             continue
 
-                    # TỐI ƯU 6: Nếu tất cả Keys thất bại, gửi thông báo lỗi "503" lập tức xuống ESP32
                     if not gemini_stream:
                         print("[GEMINI] Tất cả API Keys đều thất bại!", flush=True)
                         await websocket.send_text('{"event":"error", "message":"503 Service Unavailable"}')
                         continue
 
-                    # ĐỌC LUỒNG VĂN BẢN VÀ NGẮT CÂU LINH HOẠT
-                    buffer_text = ""
-                    delimiters = [".", "!", "?", "\n", ",", ";"]
-
-                    async def process_and_send_sentence(sentence: str, label="RESPOND"):
-                        if clean_text_for_tts(sentence):
-                            print(f"[BÚN ĐẬU {label}]: {sentence.strip()}", flush=True)
-                            await text_to_pcm_chunks_edge(
-                                sentence, websocket, target_sample_rate=16000
-                            )
+                    # ==========================================================
+                    # LUỒNG XỬ LÝ MỚI: ĐỢI GEMINI TRẢ LỜI XONG MỚI GỬI AUDIO DOWN
+                    # ==========================================================
+                    full_response_text = ""
 
                     try:
+                        # 1. Thu thập toàn bộ văn bản phản hồi từ Gemini
                         async for chunk in gemini_stream:
                             txt = safe_get_chunk_text(chunk)
-                            if not txt:
-                                continue
-                            buffer_text += txt
+                            if txt:
+                                full_response_text += txt
 
-                            # Thuật toán ngắt câu để truyền audio ngay lập tức
-                            while True:
-                                min_idx = len(buffer_text)
-                                matched_delim = None
-                                for d in delimiters:
-                                    idx = buffer_text.find(d)
-                                    if idx != -1 and idx < min_idx:
-                                        min_idx = idx
-                                        matched_delim = d
+                        cleaned_text = clean_text_for_tts(full_response_text)
 
-                                if min_idx < len(buffer_text):
-                                    # TỐI ƯU 7: Ngắt câu ngay ở dấu phẩy nếu cụm từ đã dài trên 8 ký tự
-                                    if (
-                                        matched_delim in [",", ";"]
-                                        and min_idx < 8
-                                    ):
-                                        break
-                                    sent = buffer_text[: min_idx + 1]
-                                    buffer_text = buffer_text[min_idx + 1 :]
-                                    await process_and_send_sentence(sent)
-                                else:
-                                    break
+                        if cleaned_text:
+                            print(f"[BÚN ĐẬU RESPOND]: {cleaned_text}", flush=True)
+
+                            # 2. Tách văn bản thành các câu hoàn chỉnh dựa trên dấu ngắt câu
+                            sentences = re.split(r"(?<=[.?!;\n])\s+", cleaned_text)
+
+                            # 3. Chuyển từng câu thành audio và truyền nối tiếp xuống ESP32
+                            for sent in sentences:
+                                clean_sent = clean_text_for_tts(sent)
+                                if clean_sent:
+                                    await text_to_pcm_chunks_edge(
+                                        clean_sent, websocket, target_sample_rate=16000
+                                    )
+
                     except Exception as stream_err:
                         print(f"[STREAM ERROR] Lỗi luồng Gemini: {stream_err}", flush=True)
                         await websocket.send_text('{"event":"error", "message":"Stream failed"}')
 
-                    # Xử lý đoạn chữ còn sót lại ở cuối
-                    if buffer_text.strip():
-                        await process_and_send_sentence(buffer_text, label="LAST")
-                        buffer_text = ""
-
-                    # Báo hoàn tất cho ESP32
+                    # 4. Gửi tín hiệu hoàn tất để ESP32 chuyển sang trạng thái sẵn sàng (IDLE)
                     await websocket.send_text('{"event":"tts_done"}')
                     print("[WEBSOCKET] -> Hoàn tất truyền âm thanh xuống ESP32.\n", flush=True)
 
