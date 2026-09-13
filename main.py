@@ -40,8 +40,14 @@ MODEL_NAME = "gemini-3.6-flash"
 # Current Edge-TTS Vietnamese standard voice.
 # Change this one line when we deliberately choose another supported voice/provider.
 TTS_VOICE = os.environ.get("TTS_VOICE", "vi-VN-HoaiMyNeural")
-TTS_RATE = "+10%"
-TTS_VOLUME = "+0%"
+TTS_FALLBACK_VOICES = [
+    v.strip()
+    for v in os.environ.get("TTS_FALLBACK_VOICES", "vi-VN-NamMinhNeural").split(",")
+    if v.strip() and v.strip() != TTS_VOICE
+]
+TTS_RATE = os.environ.get("TTS_RATE", "+10%")
+TTS_VOLUME = os.environ.get("TTS_VOLUME", "+0%")
+TTS_TIMEOUT_SECONDS = 20
 
 PCM_SAMPLE_RATE = 16000
 PCM_CHANNELS = 1
@@ -197,14 +203,14 @@ async def send_event(websocket: WebSocket, event: str, message: Optional[str] = 
     await websocket.send_text(json.dumps(payload, ensure_ascii=False))
 
 
-async def synthesize_text_to_pcm(text: str, target_sample_rate: int = PCM_SAMPLE_RATE) -> Optional[bytes]:
+async def synthesize_text_to_pcm(text: str, voice: str, target_sample_rate: int = PCM_SAMPLE_RATE) -> Optional[bytes]:
     clean_txt = clean_text_for_tts(text)
     if not clean_txt or not re.search(r"\w", clean_txt):
         return b""
 
     communicate = edge_tts.Communicate(
         clean_txt,
-        voice=TTS_VOICE,
+        voice=voice,
         rate=TTS_RATE,
         volume=TTS_VOLUME,
     )
@@ -246,27 +252,52 @@ async def stream_pcm_realtime(websocket: WebSocket, pcm_bytes: bytes) -> None:
             await asyncio.sleep(delay)
 
 
-async def synthesize_whole_response_with_retry(text: str) -> Optional[bytes]:
-    """One TTS job for the whole response: prevents gaps between sentences."""
+async def synthesize_whole_response_with_retry(text: str) -> tuple[Optional[bytes], Optional[str]]:
+    """
+    TTS cho toàn bộ response trong một job để tránh khoảng nghỉ giữa các câu.
+    Khi Edge-TTS không trả audio, thử lại cùng voice một lần, sau đó chuyển sang
+    fallback voice. Điều này xử lý tốt hơn lỗi NoAudioReceived mang tính tạm thời.
+    """
     clean_txt = clean_text_for_tts(text)
-    for attempt in range(1, 4):
-        try:
-            print(f"[TTS] Toan bo phan hoi, lan thu {attempt}: {clean_txt!r}", flush=True)
-            pcm_bytes = await synthesize_text_to_pcm(clean_txt)
-            if pcm_bytes is None:
+    if not clean_txt:
+        return b"", None
+
+    voices = [TTS_VOICE] + TTS_FALLBACK_VOICES
+
+    for voice_index, voice in enumerate(voices):
+        for attempt in range(1, 3):
+            try:
+                print(
+                    f"[TTS] Voice={voice} | lan thu {attempt}/{2}: {clean_txt!r}",
+                    flush=True,
+                )
+                pcm_bytes = await asyncio.wait_for(
+                    synthesize_text_to_pcm(clean_txt, voice),
+                    timeout=TTS_TIMEOUT_SECONDS,
+                )
+                if pcm_bytes:
+                    print(
+                        f"[TTS] Thanh cong | voice={voice} | PCM={len(pcm_bytes)} bytes",
+                        flush=True,
+                    )
+                    return pcm_bytes, voice
                 raise RuntimeError("Edge-TTS khong tra ve audio")
-            if not pcm_bytes:
-                raise RuntimeError("PCM rong sau khi decode")
+            except Exception as exc:
+                print(
+                    f"[EDGE-TTS Error] voice={voice} | lan {attempt}: {exc}",
+                    flush=True,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(0.8)
+
+        if voice_index < len(voices) - 1:
+            next_voice = voices[voice_index + 1]
             print(
-                f"[TTS] Hoan tat tao PCM: {len(pcm_bytes)} bytes | voice={TTS_VOICE}",
+                f"[TTS] Chuyen fallback voice: {next_voice}",
                 flush=True,
             )
-            return pcm_bytes
-        except Exception as exc:
-            print(f"[EDGE-TTS Error] Lan {attempt}: {exc}", flush=True)
-            if attempt < 3:
-                await asyncio.sleep(0.4 * attempt)
-    return None
+
+    return None, None
 
 
 # ==============================================================================
@@ -280,6 +311,7 @@ def read_root():
         "current_active_key": CURRENT_KEY_INDEX + 1 if API_KEYS else None,
         "key_status": key_status_summary(),
         "tts_voice": TTS_VOICE,
+        "tts_fallback_voices": TTS_FALLBACK_VOICES,
         "pcm_format": "PCM16 16kHz mono",
     }
 
@@ -554,7 +586,7 @@ async def websocket_chat(websocket: WebSocket):
                 print(f"[BUN DAU] {cleaned_text}", flush=True)
                 await send_event(websocket, "tts_start")
 
-                pcm_bytes = await synthesize_whole_response_with_retry(cleaned_text)
+                pcm_bytes, used_voice = await synthesize_whole_response_with_retry(cleaned_text)
                 if pcm_bytes is None:
                     print("[TTS] Khong tao duoc audio sau 3 lan thu.", flush=True)
                     await send_event(websocket, "tts_error", "Edge-TTS failed")
@@ -563,7 +595,7 @@ async def websocket_chat(websocket: WebSocket):
                 await stream_pcm_realtime(websocket, pcm_bytes)
                 await send_event(websocket, "tts_done")
                 print(
-                    f"[WEBSOCKET] Da gui xong TTS | PCM={len(pcm_bytes)} bytes | voice={TTS_VOICE}",
+                    f"[WEBSOCKET] Da gui xong TTS | PCM={len(pcm_bytes)} bytes | voice={used_voice}",
                     flush=True,
                 )
 
