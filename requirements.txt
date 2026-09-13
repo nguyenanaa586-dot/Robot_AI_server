@@ -2,5 +2,4 @@ fastapi
 uvicorn
 websockets
 google-genai
-edge-tts==7.2.8
-miniaudio
+azure-cognitiveservices-speech==1.51.2
