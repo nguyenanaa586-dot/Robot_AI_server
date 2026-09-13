@@ -7,8 +7,7 @@ import time
 import wave
 from typing import Optional
 
-import edge_tts
-import miniaudio
+import azure.cognitiveservices.speech as speechsdk
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
@@ -37,17 +36,19 @@ KEY_FAILURE_REASON = [None] * len(API_KEYS)
 
 MODEL_NAME = "gemini-3.6-flash"
 
-# Current Edge-TTS Vietnamese standard voice.
-# Change this one line when we deliberately choose another supported voice/provider.
-TTS_VOICE = os.environ.get("TTS_VOICE", "vi-VN-HoaiMyNeural")
-TTS_FALLBACK_VOICES = [
-    v.strip()
-    for v in os.environ.get("TTS_FALLBACK_VOICES", "vi-VN-NamMinhNeural").split(",")
-    if v.strip() and v.strip() != TTS_VOICE
-]
-TTS_RATE = os.environ.get("TTS_RATE", "+10%")
-TTS_VOLUME = os.environ.get("TTS_VOLUME", "+0%")
-TTS_TIMEOUT_SECONDS = 20
+# Azure Speech TTS (official Speech SDK).
+# MAI-Voice-2-Flash is currently published by Microsoft for Vietnamese as:
+# vi-VN-Linh:MAI-Voice-2-Flash
+# It is optimized for low-latency, expressive voice-agent scenarios.
+AZURE_SPEECH_KEY = os.environ.get("AZURE_SPEECH_KEY", "").strip()
+AZURE_SPEECH_REGION = os.environ.get("AZURE_SPEECH_REGION", "").strip()
+AZURE_TTS_VOICE = os.environ.get(
+    "AZURE_TTS_VOICE",
+    "vi-VN-Linh:MAI-Voice-2-Flash",
+).strip()
+AZURE_TTS_FALLBACK_VOICE = os.environ.get("AZURE_TTS_FALLBACK_VOICE", "").strip()
+AZURE_TTS_RATE = os.environ.get("AZURE_TTS_RATE", "+5%")
+AZURE_TTS_TIMEOUT_SECONDS = 30
 
 PCM_SAMPLE_RATE = 16000
 PCM_CHANNELS = 1
@@ -203,37 +204,85 @@ async def send_event(websocket: WebSocket, event: str, message: Optional[str] = 
     await websocket.send_text(json.dumps(payload, ensure_ascii=False))
 
 
-async def synthesize_text_to_pcm(text: str, voice: str, target_sample_rate: int = PCM_SAMPLE_RATE) -> Optional[bytes]:
+def _escape_ssml_text(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
+def _build_ssml(text: str, voice: str) -> str:
+    # Microsoft Speech SDK accepts the MAI voice through SSML.
+    # Keep the SSML minimal: do not assume an emotion/style that may not be
+    # published for the Vietnamese Linh voice.
+    safe_text = _escape_ssml_text(text)
+    safe_rate = AZURE_TTS_RATE.strip()
+    return (
+        '<speak version="1.0" '
+        'xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xml:lang="vi-VN">'
+        f'<voice name="{_escape_ssml_text(voice)}">'
+        f'<prosody rate="{_escape_ssml_text(safe_rate)}">{safe_text}</prosody>'
+        '</voice></speak>'
+    )
+
+
+def _synthesize_azure_sync(text: str, voice: str) -> bytes:
+    if not AZURE_SPEECH_KEY or not AZURE_SPEECH_REGION:
+        raise RuntimeError("Thieu AZURE_SPEECH_KEY hoac AZURE_SPEECH_REGION")
+
+    speech_config = speechsdk.SpeechConfig(
+        subscription=AZURE_SPEECH_KEY,
+        region=AZURE_SPEECH_REGION,
+    )
+    speech_config.speech_synthesis_voice_name = voice
+    speech_config.set_speech_synthesis_output_format(
+        speechsdk.SpeechSynthesisOutputFormat.Raw16Khz16BitMonoPcm
+    )
+
+    synthesizer = speechsdk.SpeechSynthesizer(
+        speech_config=speech_config,
+        audio_config=None,
+    )
+
+    try:
+        result = synthesizer.speak_ssml_async(_build_ssml(text, voice)).get()
+
+        if result.reason == speechsdk.ResultReason.SynthesizingAudioCompleted:
+            audio = bytes(result.audio_data or b"")
+            if audio:
+                return audio
+            raise RuntimeError("Azure Speech hoan tat nhung khong tra audio")
+
+        if result.reason == speechsdk.ResultReason.Canceled:
+            details = result.cancellation_details
+            if details is not None:
+                raise RuntimeError(
+                    f"Azure Speech canceled | reason={details.reason} | "
+                    f"error_code={details.error_code} | details={details.error_details}"
+                )
+            raise RuntimeError("Azure Speech canceled")
+
+        raise RuntimeError(f"Azure Speech synthesis reason={result.reason}")
+    finally:
+        try:
+            synthesizer.stop_speaking_async().get()
+        except Exception:
+            pass
+
+
+async def synthesize_text_to_pcm(text: str, voice: str) -> Optional[bytes]:
     clean_txt = clean_text_for_tts(text)
     if not clean_txt or not re.search(r"\w", clean_txt):
         return b""
 
-    communicate = edge_tts.Communicate(
-        clean_txt,
-        voice=voice,
-        rate=TTS_RATE,
-        volume=TTS_VOLUME,
+    return await asyncio.wait_for(
+        asyncio.to_thread(_synthesize_azure_sync, clean_txt, voice),
+        timeout=AZURE_TTS_TIMEOUT_SECONDS,
     )
-
-    mp3_buffer = bytearray()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            mp3_buffer.extend(chunk["data"])
-
-    if not mp3_buffer:
-        return None
-
-    def decode_audio() -> bytes:
-        decoded = miniaudio.decode(
-            bytes(mp3_buffer),
-            output_format=miniaudio.SampleFormat.SIGNED16,
-            nchannels=PCM_CHANNELS,
-            sample_rate=target_sample_rate,
-        )
-        return decoded.samples.tobytes()
-
-    pcm_bytes = await asyncio.to_thread(decode_audio)
-    return pcm_bytes or None
 
 
 async def stream_pcm_realtime(websocket: WebSocket, pcm_bytes: bytes) -> None:
@@ -252,51 +301,50 @@ async def stream_pcm_realtime(websocket: WebSocket, pcm_bytes: bytes) -> None:
             await asyncio.sleep(delay)
 
 
-async def synthesize_whole_response_with_retry(text: str) -> tuple[Optional[bytes], Optional[str]]:
-    """
-    TTS cho toàn bộ response trong một job để tránh khoảng nghỉ giữa các câu.
-    Khi Edge-TTS không trả audio, thử lại cùng voice một lần, sau đó chuyển sang
-    fallback voice. Điều này xử lý tốt hơn lỗi NoAudioReceived mang tính tạm thời.
+async def synthesize_whole_response(text: str) -> tuple[Optional[bytes], Optional[str]]:
+    """Synthesize the entire reply in one Azure Speech job.
+
+    Primary voice is the Vietnamese MAI-Voice-2-Flash Linh voice. An optional
+    fallback Azure voice can be supplied through AZURE_TTS_FALLBACK_VOICE.
+    The output is raw PCM 16 kHz / 16-bit / mono, matching the ESP speaker path.
     """
     clean_txt = clean_text_for_tts(text)
     if not clean_txt:
         return b"", None
 
-    voices = [TTS_VOICE] + TTS_FALLBACK_VOICES
+    voices = [AZURE_TTS_VOICE]
+    if AZURE_TTS_FALLBACK_VOICE and AZURE_TTS_FALLBACK_VOICE != AZURE_TTS_VOICE:
+        voices.append(AZURE_TTS_FALLBACK_VOICE)
 
+    last_error = None
     for voice_index, voice in enumerate(voices):
-        for attempt in range(1, 3):
-            try:
-                print(
-                    f"[TTS] Voice={voice} | lan thu {attempt}/{2}: {clean_txt!r}",
-                    flush=True,
-                )
-                pcm_bytes = await asyncio.wait_for(
-                    synthesize_text_to_pcm(clean_txt, voice),
-                    timeout=TTS_TIMEOUT_SECONDS,
-                )
-                if pcm_bytes:
-                    print(
-                        f"[TTS] Thanh cong | voice={voice} | PCM={len(pcm_bytes)} bytes",
-                        flush=True,
-                    )
-                    return pcm_bytes, voice
-                raise RuntimeError("Edge-TTS khong tra ve audio")
-            except Exception as exc:
-                print(
-                    f"[EDGE-TTS Error] voice={voice} | lan {attempt}: {exc}",
-                    flush=True,
-                )
-                if attempt < 2:
-                    await asyncio.sleep(0.8)
-
-        if voice_index < len(voices) - 1:
-            next_voice = voices[voice_index + 1]
+        try:
             print(
-                f"[TTS] Chuyen fallback voice: {next_voice}",
+                f"[AZURE TTS] Voice={voice} | dang tao audio...",
+                flush=True,
+            )
+            pcm_bytes = await synthesize_text_to_pcm(clean_txt, voice)
+            if pcm_bytes:
+                print(
+                    f"[AZURE TTS] Thanh cong | voice={voice} | PCM={len(pcm_bytes)} bytes",
+                    flush=True,
+                )
+                return pcm_bytes, voice
+            last_error = "Azure Speech khong tra ve audio"
+        except Exception as exc:
+            last_error = str(exc)
+            print(
+                f"[AZURE TTS Error] voice={voice}: {last_error[:350]}",
                 flush=True,
             )
 
+        if voice_index < len(voices) - 1:
+            print(
+                f"[AZURE TTS] Chuyen fallback voice: {voices[voice_index + 1]}",
+                flush=True,
+            )
+
+    print(f"[AZURE TTS] That bai: {last_error}", flush=True)
     return None, None
 
 
@@ -310,8 +358,10 @@ def read_root():
         "loaded_keys_count": len(API_KEYS),
         "current_active_key": CURRENT_KEY_INDEX + 1 if API_KEYS else None,
         "key_status": key_status_summary(),
-        "tts_voice": TTS_VOICE,
-        "tts_fallback_voices": TTS_FALLBACK_VOICES,
+        "tts_provider": "Azure Speech",
+        "tts_voice": AZURE_TTS_VOICE,
+        "tts_fallback_voice": AZURE_TTS_FALLBACK_VOICE or None,
+        "azure_speech_configured": bool(AZURE_SPEECH_KEY and AZURE_SPEECH_REGION),
         "pcm_format": "PCM16 16kHz mono",
     }
 
@@ -586,10 +636,9 @@ async def websocket_chat(websocket: WebSocket):
                 print(f"[BUN DAU] {cleaned_text}", flush=True)
                 await send_event(websocket, "tts_start")
 
-                pcm_bytes, used_voice = await synthesize_whole_response_with_retry(cleaned_text)
+                pcm_bytes, used_voice = await synthesize_whole_response(cleaned_text)
                 if pcm_bytes is None:
-                    print("[TTS] Khong tao duoc audio sau 3 lan thu.", flush=True)
-                    await send_event(websocket, "tts_error", "Edge-TTS failed")
+                    await send_event(websocket, "tts_error", "Azure Speech TTS failed")
                     continue
 
                 await stream_pcm_realtime(websocket, pcm_bytes)
