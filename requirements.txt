@@ -2,6 +2,7 @@
 fastapi
 uvicorn[standard]
 google-genai
+llama-cpp-python==0.3.16
 vieneu
 soxr
 numpy
