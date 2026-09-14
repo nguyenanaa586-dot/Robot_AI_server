@@ -1,8 +1,7 @@
+--extra-index-url https://pnnbao97.github.io/llama-cpp-python-v0.3.16/cpu/
 fastapi
-uvicorn
-websockets
+uvicorn[standard]
 google-genai
-numpy
+vieneu
 soxr
-vieneu==3.2.4
-llama-cpp-python==0.3.16
+numpy
