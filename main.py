@@ -140,7 +140,7 @@ def load_vieneu_once() -> None:
 
     from vieneu import Vieneu
 
-    print("[TTS] Dang tai VieNeu-TTS v2 Turbo local...", flush=True)
+    print("[TTS] Dang khoi tao VieNeu-TTS v2 Turbo local...", flush=True)
     vieneu_tts = Vieneu(
         mode="turbo",
         backbone_repo=VIENEU_REPO,
@@ -204,10 +204,17 @@ async def stream_vieneu_tts_to_esp(websocket: WebSocket, text: str) -> int:
         first_audio = True
         next_deadline = asyncio.get_running_loop().time()
 
-        while True:
+        _END = object()
+
+        def next_or_end(gen):
             try:
-                audio_chunk = await asyncio.to_thread(next, generator)
+                return next(gen)
             except StopIteration:
+                return _END
+
+        while True:
+            audio_chunk = await asyncio.to_thread(next_or_end, generator)
+            if audio_chunk is _END:
                 break
 
             pcm16 = float_audio_to_pcm16_16k(audio_chunk)
