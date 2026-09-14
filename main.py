@@ -2,11 +2,8 @@ import asyncio
 import io
 import json
 import os
-import queue
 import re
 import threading
-import time
-import wave
 from typing import Optional
 
 import numpy as np
@@ -15,28 +12,20 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
 
-try:
-    from vieneu import Vieneu
-except ImportError as exc:  # pragma: no cover
-    Vieneu = None
-    _VIENEU_IMPORT_ERROR = exc
-else:
-    _VIENEU_IMPORT_ERROR = None
-
 app = FastAPI()
 
 # ============================================================================
-# 1. GEMINI
+# GEMINI
 # ============================================================================
 RAW_KEYS = os.environ.get("GEMINI_API_KEY", "")
-API_KEYS = [k.strip(' "\'\t\r\n') for k in RAW_KEYS.split(",") if k.strip(' "\'\t\r\n')]
+API_KEYS = [k.strip(" \\\"'\\t\\r\\n") for k in RAW_KEYS.split(",") if k.strip(" \\\"'\\t\\r\\n")]
 
 CURRENT_KEY_INDEX = 0
 KEY_STATUS = ["active"] * len(API_KEYS)
 KEY_FAILURE_REASON = [None] * len(API_KEYS)
+KEY_STATE_LOCK = threading.Lock()
 
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-GEMINI_MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+MODEL_NAME = "gemini-3.6-flash"
 
 SYSTEM_PROMPT = """
 Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng mỏ, rất đanh đá. Có thể chửi bới theo yêu cầu. Thích xưng “mày tao”, thuộc quyền sở hữu của đại ca Việt.
@@ -69,7 +58,9 @@ Tôi là Bún Đậu tính cách tôi cau có hay tức giận, thích mắng m�
 
 
 def get_genai_client(key_index: int):
-    return genai.Client(api_key=API_KEYS[key_index]) if API_KEYS else None
+    if not API_KEYS:
+        return None
+    return genai.Client(api_key=API_KEYS[key_index])
 
 
 def _error_code(exc) -> Optional[int]:
@@ -93,20 +84,16 @@ def classify_gemini_error(exc) -> str:
     if any(x in text for x in (
         "api key not valid", "api_key_invalid", "invalid api key", "invalid_api_key",
         "unauthenticated", "permission denied", "permission_denied", "quota exceeded",
-        "quota_exceeded", "resource_exhausted", "rate limit", "ratelimit",
+        "quota_exceeded", "resource_exhausted", "rate limit", "ratelimit"
     )):
         return "rotate"
     if code in (500, 502, 503, 504) or any(x in text for x in (
-        "service unavailable", "internal server error", "bad gateway", "gateway timeout",
-        "deadline exceeded", "timeout", "timed out", "connection reset", "temporarily unavailable",
+        "service unavailable", "internal server error", "bad gateway",
+        "gateway timeout", "deadline exceeded", "timeout", "timed out",
+        "connection reset", "temporarily unavailable"
     )):
         return "transient"
     return "fatal"
-
-
-def mark_key_disabled(index: int, reason: str) -> None:
-    KEY_STATUS[index] = "disabled"
-    KEY_FAILURE_REASON[index] = reason[:240]
 
 
 def next_active_key_after(index: int) -> Optional[int]:
@@ -116,46 +103,149 @@ def next_active_key_after(index: int) -> Optional[int]:
     return None
 
 
-# ============================================================================
-# 2. AUDIO / TTS
-# ============================================================================
-INPUT_RATE = 16_000
-TTS_NATIVE_RATE = 24_000
-OUTPUT_RATE = 16_000
-TTS_CHUNK_SIZE = 2048
+def mark_key_disabled(index: int, reason: str) -> None:
+    KEY_STATUS[index] = "disabled"
+    KEY_FAILURE_REASON[index] = reason[:240]
 
-VIENEU_BACKBONE_REPO = os.environ.get("VIENEU_BACKBONE_REPO", "pnnbao-ump/VieNeu-TTS-v2-Turbo-GGUF")
-VIENEU_BACKBONE_FILENAME = os.environ.get("VIENEU_BACKBONE_FILENAME", "vieneu-tts-v2-turbo.gguf")
-VIENEU_DECODER_REPO = os.environ.get("VIENEU_DECODER_REPO", "pnnbao-ump/VieNeu-Codec")
-VIENEU_DECODER_FILENAME = os.environ.get("VIENEU_DECODER_FILENAME", "vieneu_decoder.onnx")
-VIENEU_VOICE_NAME = os.environ.get("VIENEU_VOICE", "Hương")
-VIENEU_DEVICE = os.environ.get("VIENEU_DEVICE", "cpu")
+
+def key_status_summary() -> str:
+    return ", ".join(f"#{i}= {s.upper()}".replace("= ", "=") for i, s in enumerate(KEY_STATUS, 1))
+
+# ============================================================================
+# VIE NEU TTS v2 TURBO - LOCAL / NO API CREDITS
+# ============================================================================
+PCM_SAMPLE_RATE = 16000
+PCM_CHANNELS = 1
+PCM_BYTES_PER_SAMPLE = 2
+PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_CHANNELS * PCM_BYTES_PER_SAMPLE
+TTS_CHUNK_SIZE = 4096
+
+VIENEU_REPO = os.environ.get("VIENEU_REPO", "pnnbao-ump/VieNeu-TTS-v2-Turbo-GGUF")
+VIENEU_BACKBONE = os.environ.get("VIENEU_BACKBONE", "vieneu-tts-v2-turbo.gguf")
+VIENEU_VOICE = os.environ.get("VIENEU_VOICE", "Hương")
+VIENEU_HF_TOKEN = os.environ.get("HF_TOKEN", "").strip() or None
+VIENEU_MAX_CHARS = max(64, int(os.environ.get("VIENEU_MAX_CHARS", "256")))
 VIENEU_TEMPERATURE = float(os.environ.get("VIENEU_TEMPERATURE", "0.4"))
 VIENEU_TOP_K = int(os.environ.get("VIENEU_TOP_K", "50"))
-VIENEU_MAX_CHARS = int(os.environ.get("VIENEU_MAX_CHARS", "256"))
 
-TTS_INSTANCE = None
-TTS_VOICE_DATA = None
-TTS_LOAD_LOCK = threading.Lock()
-TTS_SYNTH_LOCK = asyncio.Lock()
-TTS_LOAD_ERROR: Optional[str] = None
+vieneu_tts = None
+vieneu_voice_data = None
+vieneu_lock = asyncio.Lock()
 
 
-def create_wav_bytes(pcm_data: bytes, sample_rate: int = INPUT_RATE) -> bytes:
-    out = io.BytesIO()
-    with wave.open(out, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(pcm_data)
-    return out.getvalue()
+def load_vieneu_once() -> None:
+    global vieneu_tts, vieneu_voice_data
+    if vieneu_tts is not None and vieneu_voice_data is not None:
+        return
+
+    from vieneu import Vieneu
+
+    print("[TTS] Dang tai VieNeu-TTS v2 Turbo local...", flush=True)
+    vieneu_tts = Vieneu(
+        mode="turbo",
+        backbone_repo=VIENEU_REPO,
+        backbone_filename=VIENEU_BACKBONE,
+        device="cpu",
+        hf_token=VIENEU_HF_TOKEN,
+    )
+
+    voices = vieneu_tts.list_preset_voices()
+    ids = [voice_id for _, voice_id in voices]
+    print(f"[TTS] Voice presets: {', '.join(ids)}", flush=True)
+    if VIENEU_VOICE not in ids:
+        raise RuntimeError(
+            f"Khong tim thay voice '{VIENEU_VOICE}'. Voice kha dung: {', '.join(ids)}"
+        )
+    vieneu_voice_data = vieneu_tts.get_preset_voice(VIENEU_VOICE)
+    print(f"[TTS] VieNeu ready | voice={VIENEU_VOICE} | sample_rate=24000", flush=True)
+
+
+def float_audio_to_pcm16_16k(audio_f32: np.ndarray) -> bytes:
+    audio = np.asarray(audio_f32, dtype=np.float32).reshape(-1)
+    if audio.size == 0:
+        return b""
+    # VieNeu v2 output is 24 kHz; resample only once at the server boundary.
+    if audio.size:
+        audio_16k = soxr.resample(audio, 24000, PCM_SAMPLE_RATE).astype(np.float32, copy=False)
+    else:
+        audio_16k = audio
+    pcm = np.clip(audio_16k * 32767.0, -32768.0, 32767.0).astype(np.int16)
+    return pcm.tobytes()
 
 
 def clean_text_for_tts(text: str) -> str:
     text = re.sub(r"\d{1,2}:\d{2}", "", text)
     text = re.sub(r"[*#_~>`]", "", text)
+    text = text.replace("—", " ").replace("–", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip(" ,;:-_\n\r\t")
+
+
+def _vieneu_stream_generator(text: str):
+    load_vieneu_once()
+    return vieneu_tts.infer_stream(
+        text=text,
+        voice=vieneu_voice_data,
+        max_chars=VIENEU_MAX_CHARS,
+        temperature=VIENEU_TEMPERATURE,
+        top_k=VIENEU_TOP_K,
+        apply_watermark=True,
+    )
+
+
+async def stream_vieneu_tts_to_esp(websocket: WebSocket, text: str) -> int:
+    cleaned = clean_text_for_tts(text)
+    if not cleaned:
+        raise RuntimeError("Gemini tra ve text rong")
+
+    async with vieneu_lock:
+        generator = await asyncio.to_thread(_vieneu_stream_generator, cleaned)
+        total_pcm = 0
+        first_audio = True
+        next_deadline = asyncio.get_running_loop().time()
+
+        while True:
+            try:
+                audio_chunk = await asyncio.to_thread(next, generator)
+            except StopIteration:
+                break
+
+            pcm16 = float_audio_to_pcm16_16k(audio_chunk)
+            if not pcm16:
+                continue
+
+            if first_audio:
+                print(f"[TTS] Bat dau stream PCM | voice={VIENEU_VOICE}", flush=True)
+                first_audio = False
+
+            pending = memoryview(pcm16)
+            while pending:
+                part = pending[:TTS_CHUNK_SIZE]
+                await websocket.send_bytes(part.tobytes())
+                total_pcm += len(part)
+                pending = pending[len(part):]
+
+                # Real-time pacing at 16 kHz / 16-bit / mono.
+                next_deadline += len(part) / PCM_BYTES_PER_SECOND
+                delay = next_deadline - asyncio.get_running_loop().time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                else:
+                    next_deadline = asyncio.get_running_loop().time()
+
+        if total_pcm <= 0:
+            raise RuntimeError("VieNeu khong tao ra audio")
+        return total_pcm
+
+
+# ============================================================================
+# HELPERS
+# ============================================================================
+async def send_event(websocket: WebSocket, event: str, message: Optional[str] = None):
+    payload = {"event": event}
+    if message:
+        payload["message"] = message
+    await websocket.send_text(json.dumps(payload, ensure_ascii=False))
 
 
 def safe_get_chunk_text(chunk) -> str:
@@ -165,136 +255,166 @@ def safe_get_chunk_text(chunk) -> str:
         return ""
 
 
-def _load_vieneu_sync():
-    global TTS_INSTANCE, TTS_VOICE_DATA, TTS_LOAD_ERROR
-    if TTS_INSTANCE is not None:
-        return TTS_INSTANCE
-    if Vieneu is None:
-        raise RuntimeError(f"Khong import duoc vieneu: {_VIENEU_IMPORT_ERROR}")
+async def generate_with_sticky_key(wav_bytes: bytes) -> str:
+    global CURRENT_KEY_INDEX
 
-    with TTS_LOAD_LOCK:
-        if TTS_INSTANCE is not None:
-            return TTS_INSTANCE
-        print("[TTS] Dang tai VieNeu-TTS v2 Turbo GGUF...", flush=True)
-        print(f"[TTS] Model={VIENEU_BACKBONE_REPO}/{VIENEU_BACKBONE_FILENAME}", flush=True)
-        t0 = time.perf_counter()
-        tts = Vieneu(
-            mode="turbo",
-            backbone_repo=VIENEU_BACKBONE_REPO,
-            backbone_filename=VIENEU_BACKBONE_FILENAME,
-            decoder_repo=VIENEU_DECODER_REPO,
-            decoder_filename=VIENEU_DECODER_FILENAME,
-            device=VIENEU_DEVICE,
-        )
-        voices = tts.list_preset_voices()
-        selected_id = None
-        for label, voice_id in voices:
-            if str(label).strip().casefold() == VIENEU_VOICE_NAME.casefold():
-                selected_id = voice_id
-                break
-            if VIENEU_VOICE_NAME.casefold() in str(label).casefold():
-                selected_id = voice_id
-        if selected_id is None:
-            available = ", ".join(str(x[0]) for x in voices[:20])
-            raise RuntimeError(f"Khong tim thay voice '{VIENEU_VOICE_NAME}'. Voices: {available}")
+    if not API_KEYS:
+        raise RuntimeError("Khong co GEMINI_API_KEY")
 
-        TTS_INSTANCE = tts
-        TTS_VOICE_DATA = tts.get_preset_voice(selected_id)
-        TTS_LOAD_ERROR = None
-        print(f"[TTS] VieNeu ready | voice={VIENEU_VOICE_NAME} | load={time.perf_counter()-t0:.1f}s", flush=True)
-        return TTS_INSTANCE
+    key_idx = CURRENT_KEY_INDEX
+    safety_config = [
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+    ]
 
+    while key_idx is not None:
+        if KEY_STATUS[key_idx] != "active":
+            key_idx = next_active_key_after(key_idx)
+            continue
 
-def _resample_f32_24k_to_16k(samples: np.ndarray) -> np.ndarray:
-    samples = np.asarray(samples, dtype=np.float32).reshape(-1)
-    if samples.size == 0:
-        return samples
-    return np.asarray(soxr.resample(samples, TTS_NATIVE_RATE, OUTPUT_RATE), dtype=np.float32)
+        print(f"[GEMINI] Dang dung Key #{key_idx + 1}", flush=True)
+        client = get_genai_client(key_idx)
+        if client is None:
+            mark_key_disabled(key_idx, "Khong tao duoc Gemini client")
+            key_idx = next_active_key_after(key_idx)
+            continue
 
+        try:
+            stream = await client.aio.models.generate_content_stream(
+                model=MODEL_NAME,
+                contents=[genai.types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")],
+                config=genai.types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT,
+                    max_output_tokens=1024,
+                    thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+                    safety_settings=safety_config,
+                ),
+            )
 
-def _float_to_pcm16(samples: np.ndarray) -> bytes:
-    pcm = np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0)
-    return (pcm * 32767.0).astype(np.int16).tobytes()
+            parts = []
+            finish_reason = "UNKNOWN"
+            finish_message = None
+            usage = None
 
+            async for chunk in stream:
+                txt = safe_get_chunk_text(chunk)
+                if txt:
+                    parts.append(txt)
+                try:
+                    candidates = getattr(chunk, "candidates", None)
+                    if candidates:
+                        c = candidates[0]
+                        if getattr(c, "finish_reason", None) is not None:
+                            finish_reason = str(c.finish_reason)
+                        if getattr(c, "finish_message", None):
+                            finish_message = str(c.finish_message)
+                except Exception:
+                    pass
+                try:
+                    if getattr(chunk, "usage_metadata", None) is not None:
+                        usage = chunk.usage_metadata
+                except Exception:
+                    pass
 
-def _vieneu_stream_worker(text: str, out_q: queue.Queue):
-    try:
-        tts = _load_vieneu_sync()
-        for chunk in tts.infer_stream(
-            text,
-            voice=TTS_VOICE_DATA,
-            temperature=VIENEU_TEMPERATURE,
-            top_k=VIENEU_TOP_K,
-            max_chars=VIENEU_MAX_CHARS,
-        ):
-            if chunk is None:
+            response = "".join(parts).strip()
+            print(f"[GEMINI] Ket thuc Key #{key_idx + 1} | finish={finish_reason} | message={finish_message!r}", flush=True)
+            if usage is not None:
+                print(
+                    f"[GEMINI] Usage | prompt={getattr(usage,'prompt_token_count',None)} | "
+                    f"output={getattr(usage,'candidates_token_count',None)} | "
+                    f"total={getattr(usage,'total_token_count',None)}",
+                    flush=True,
+                )
+
+            finish_upper = finish_reason.upper()
+            bad_finish = any(x in finish_upper for x in (
+                "MAX_TOKENS", "INCOMPLETE", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"
+            ))
+            if bad_finish:
+                raise RuntimeError(f"Gemini response khong hoan chinh: {finish_reason}")
+            if not response:
+                raise RuntimeError("Gemini tra response rong")
+
+            CURRENT_KEY_INDEX = key_idx
+            print(f"[GEMINI] Ghi nho Key #{key_idx + 1}.", flush=True)
+            return response
+
+        except Exception as exc:
+            kind = classify_gemini_error(exc)
+            code = _error_code(exc)
+            detail = str(exc).replace("\n", " ")[:240]
+
+            if kind == "rotate":
+                mark_key_disabled(key_idx, detail)
+                nxt = next_active_key_after(key_idx)
+                if nxt is None:
+                    raise RuntimeError(f"Key #{key_idx + 1} loi va khong con key active phia sau: {detail}")
+                print(f"[GEMINI] Key #{key_idx + 1} loi HTTP {code or ''} -> chuyen Key #{nxt + 1}", flush=True)
+                key_idx = nxt
                 continue
-            arr = np.asarray(chunk, dtype=np.float32).reshape(-1)
-            if arr.size == 0:
-                continue
-            pcm = _float_to_pcm16(_resample_f32_24k_to_16k(arr))
-            if pcm:
-                out_q.put(pcm)
-    except Exception as exc:
-        out_q.put(exc)
-    finally:
-        out_q.put(None)
 
+            if kind == "transient":
+                print(f"[GEMINI] Key #{key_idx + 1} loi tam thoi -> retry 1 lan", flush=True)
+                await asyncio.sleep(0.6)
+                try:
+                    retry = await client.aio.models.generate_content_stream(
+                        model=MODEL_NAME,
+                        contents=[genai.types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")],
+                        config=genai.types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            max_output_tokens=1024,
+                            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
+                            safety_settings=safety_config,
+                        ),
+                    )
+                    retry_parts = []
+                    retry_finish = "UNKNOWN"
+                    async for chunk in retry:
+                        txt = safe_get_chunk_text(chunk)
+                        if txt:
+                            retry_parts.append(txt)
+                        try:
+                            candidates = getattr(chunk, "candidates", None)
+                            if candidates and getattr(candidates[0], "finish_reason", None) is not None:
+                                retry_finish = str(candidates[0].finish_reason)
+                        except Exception:
+                            pass
+                    retry_text = "".join(retry_parts).strip()
+                    if retry_text and "STOP" in retry_finish.upper():
+                        CURRENT_KEY_INDEX = key_idx
+                        print(f"[GEMINI] Retry thanh cong Key #{key_idx + 1}.", flush=True)
+                        return retry_text
+                except Exception as retry_exc:
+                    print(f"[GEMINI] Retry that bai: {str(retry_exc)[:180]}", flush=True)
 
-async def stream_vieneu_tts(websocket: WebSocket, text: str) -> int:
-    q: queue.Queue = queue.Queue(maxsize=8)
-    worker = threading.Thread(target=_vieneu_stream_worker, args=(text, q), daemon=True)
-    worker.start()
+            raise RuntimeError(f"Gemini loi voi Key #{key_idx + 1}: {detail}")
 
-    total = 0
-    while True:
-        item = await asyncio.to_thread(q.get)
-        if item is None:
-            break
-        if isinstance(item, Exception):
-            raise item
-
-        for offset in range(0, len(item), TTS_CHUNK_SIZE):
-            chunk = item[offset:offset + TTS_CHUNK_SIZE]
-            await websocket.send_bytes(chunk)
-            total += len(chunk)
-            # 2048 bytes = 64 ms at 16kHz mono PCM16. Pace at real-time.
-            await asyncio.sleep(len(chunk) / 32_000.0)
-
-    return total
-
-
-# ============================================================================
-# 3. HELPERS
-# ============================================================================
-async def send_event(websocket: WebSocket, event: str, message: Optional[str] = None):
-    payload = {"event": event}
-    if message is not None:
-        payload["message"] = message
-    await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+    raise RuntimeError("Khong con Gemini key kha dung")
 
 
 # ============================================================================
-# 4. ROOT / HEALTH
+# HTTP
 # ============================================================================
 @app.get("/")
-def read_root():
+def root():
     return {
-        "status": "ok",
-        "service": "Bun Dau Robot AI",
-        "tts_provider": "VieNeu-TTS-v2-Turbo-GGUF",
-        "tts_voice": VIENEU_VOICE_NAME,
-        "tts_sample_rate": OUTPUT_RATE,
+        "status": "Robot Bun Dau WebSocket Server OK",
+        "gemini_keys": len(API_KEYS),
+        "current_key": CURRENT_KEY_INDEX + 1 if API_KEYS else None,
+        "key_status": key_status_summary(),
+        "tts_provider": "VieNeu-TTS-v2-Turbo-local",
+        "tts_voice": VIENEU_VOICE,
+        "tts_output": "PCM16 16kHz mono",
     }
 
 
 # ============================================================================
-# 5. WEBSOCKET
+# WEBSOCKET
 # ============================================================================
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
-    global CURRENT_KEY_INDEX
-
     await websocket.accept()
     print("\n[WEBSOCKET] ESP32 da ket noi.", flush=True)
     pcm_buffer = bytearray()
@@ -309,16 +429,16 @@ async def websocket_chat(websocket: WebSocket):
                 pcm_buffer.extend(message["bytes"])
                 continue
 
-            msg_text = (message.get("text") or "").strip()
-            if not msg_text:
+            text = (message.get("text") or "").strip()
+            if not text:
                 continue
 
-            if msg_text == '{"event":"start_speech"}':
+            if text == '{"event":"start_speech"}':
                 pcm_buffer.clear()
                 print("[WEBSOCKET] ESP32 bat dau ghi am.", flush=True)
                 continue
 
-            if msg_text != '{"event":"end_speech"}':
+            if text != '{"event":"end_speech"}':
                 continue
 
             pcm_size = len(pcm_buffer)
@@ -328,174 +448,34 @@ async def websocket_chat(websocket: WebSocket):
                 await send_event(websocket, "tts_error", "Audio qua ngan")
                 continue
 
-            wav_bytes = create_wav_bytes(bytes(pcm_buffer))
+            wav_io = io.BytesIO()
+            import wave
+            with wave.open(wav_io, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(16000)
+                w.writeframes(bytes(pcm_buffer))
+            wav_bytes = wav_io.getvalue()
             pcm_buffer.clear()
 
-            safety_config = [
-                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-                types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-            ]
+            try:
+                response_text = await generate_with_sticky_key(wav_bytes)
+                response_text = clean_text_for_tts(response_text)
+                print(f"[BUN DAU] {response_text}", flush=True)
 
-            if not API_KEYS:
-                await send_event(websocket, "tts_error", "No API Keys")
-                continue
+                await send_event(websocket, "tts_start")
+                total_pcm = await stream_vieneu_tts_to_esp(websocket, response_text)
+                await send_event(websocket, "tts_done")
+                print(f"[WEBSOCKET] Da gui xong TTS | PCM={total_pcm} bytes", flush=True)
 
-            if CURRENT_KEY_INDEX >= len(API_KEYS):
-                CURRENT_KEY_INDEX = 0
-
-            key_idx = CURRENT_KEY_INDEX
-            full_response_text = ""
-            gemini_ok = False
-
-            while key_idx is not None and key_idx < len(API_KEYS):
-                if KEY_STATUS[key_idx] != "active":
-                    key_idx = next_active_key_after(key_idx)
-                    continue
-
-                print(f"[GEMINI] Dang dung Key #{key_idx + 1}", flush=True)
-                client = get_genai_client(key_idx)
+            except WebSocketDisconnect:
+                raise
+            except Exception as exc:
+                print(f"[SERVER ERROR] {exc}", flush=True)
                 try:
-                    stream = await client.aio.models.generate_content_stream(
-                        model=MODEL_NAME,
-                        contents=[types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")],
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-                            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
-                            temperature=0.7,
-                            safety_settings=safety_config,
-                        ),
-                    )
-                    parts = []
-                    finish_reason = None
-                    finish_message = None
-                    usage = None
-                    async for chunk in stream:
-                        txt = safe_get_chunk_text(chunk)
-                        if txt:
-                            parts.append(txt)
-                        try:
-                            if chunk.candidates:
-                                c = chunk.candidates[0]
-                                if c.finish_reason is not None:
-                                    finish_reason = str(c.finish_reason)
-                                if c.finish_message:
-                                    finish_message = str(c.finish_message)
-                        except Exception:
-                            pass
-                        try:
-                            if chunk.usage_metadata:
-                                usage = chunk.usage_metadata
-                        except Exception:
-                            pass
-
-                    full_response_text = "".join(parts).strip()
-                    finish_upper = str(finish_reason or "UNKNOWN").upper()
-                    print(f"[GEMINI] Ket thuc Key #{key_idx + 1} | finish={finish_reason} | message={finish_message!r}", flush=True)
-                    if usage:
-                        print(
-                            f"[GEMINI] Usage | prompt={getattr(usage, 'prompt_token_count', None)} | output={getattr(usage, 'candidates_token_count', None)} | total={getattr(usage, 'total_token_count', None)}",
-                            flush=True,
-                        )
-
-                    if any(x in finish_upper for x in ("MAX_TOKENS", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT")):
-                        print(f"[GEMINI] Response khong hoan chinh: {finish_reason}", flush=True)
-                        await send_event(websocket, "tts_error", f"Gemini response incomplete: {finish_reason}")
-                        gemini_ok = False
-                        break
-
-                    if full_response_text:
-                        CURRENT_KEY_INDEX = key_idx
-                        gemini_ok = True
-                        print(f"[GEMINI] Ghi nho Key #{key_idx + 1}.", flush=True)
-                    break
-
-                except Exception as exc:
-                    kind = classify_gemini_error(exc)
-                    code = _error_code(exc)
-                    text = str(exc).replace("\n", " ")[:220]
-                    if kind == "rotate":
-                        mark_key_disabled(key_idx, text)
-                        next_idx = next_active_key_after(key_idx)
-                        if next_idx is None:
-                            print("[GEMINI] Khong con key phia sau.", flush=True)
-                        else:
-                            print(f"[GEMINI] Key #{key_idx + 1} khong dung duoc (HTTP {code or 'key'}) -> Key #{next_idx + 1}", flush=True)
-                        key_idx = next_idx
-                        continue
-                    if kind == "transient":
-                        print(f"[GEMINI] Key #{key_idx + 1} loi tam thoi -> thu lai.", flush=True)
-                        await asyncio.sleep(0.6)
-                        try:
-                            stream = await client.aio.models.generate_content_stream(
-                                model=MODEL_NAME,
-                                contents=[types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")],
-                                config=types.GenerateContentConfig(
-                                    system_instruction=SYSTEM_PROMPT,
-                                    max_output_tokens=GEMINI_MAX_OUTPUT_TOKENS,
-                                    thinking_config=types.ThinkingConfig(thinking_level="minimal"),
-                                    temperature=0.7,
-                                    safety_settings=safety_config,
-                                ),
-                            )
-                            retry_parts = []
-                            retry_finish = None
-                            async for chunk in stream:
-                                t = safe_get_chunk_text(chunk)
-                                if t:
-                                    retry_parts.append(t)
-                                try:
-                                    if chunk.candidates and chunk.candidates[0].finish_reason is not None:
-                                        retry_finish = str(chunk.candidates[0].finish_reason)
-                                except Exception:
-                                    pass
-                            full_response_text = "".join(retry_parts).strip()
-                            if full_response_text and (retry_finish is None or "STOP" in retry_finish.upper()):
-                                CURRENT_KEY_INDEX = key_idx
-                                gemini_ok = True
-                                print(f"[GEMINI] Retry thanh cong voi Key #{key_idx + 1}.", flush=True)
-                            break
-                        except Exception as retry_exc:
-                            print(f"[GEMINI] Retry that bai: {str(retry_exc)[:180]}", flush=True)
-                            gemini_ok = False
-                            break
-                    print(f"[GEMINI] Loi fatal Key #{key_idx + 1}: {text}", flush=True)
-                    break
-
-            if not gemini_ok:
-                try:
-                    await send_event(websocket, "tts_error", "Gemini request failed")
+                    await send_event(websocket, "tts_error", str(exc)[:300])
                 except Exception:
                     pass
-                continue
-
-            cleaned = clean_text_for_tts(full_response_text)
-            if not cleaned:
-                await send_event(websocket, "tts_error", "Gemini returned empty response")
-                continue
-
-            print(f"[BUN DAU] {cleaned}", flush=True)
-
-            async with TTS_SYNTH_LOCK:
-                try:
-                    await send_event(websocket, "tts_start")
-                    t0 = time.perf_counter()
-                    total_pcm = await stream_vieneu_tts(websocket, cleaned)
-                    elapsed = time.perf_counter() - t0
-                    if total_pcm <= 0:
-                        raise RuntimeError("VieNeu khong tao ra audio")
-                    print(f"[TTS] VieNeu voice={VIENEU_VOICE_NAME} | PCM={total_pcm} bytes | synth+stream={elapsed:.2f}s", flush=True)
-                    await send_event(websocket, "tts_done")
-                except WebSocketDisconnect:
-                    raise
-                except Exception as exc:
-                    print(f"[TTS ERROR] {exc}", flush=True)
-                    try:
-                        await send_event(websocket, "tts_error", "VieNeu TTS failed")
-                    except Exception:
-                        pass
 
     except WebSocketDisconnect:
         print("[WEBSOCKET] ESP32 ngat ket noi.", flush=True)
