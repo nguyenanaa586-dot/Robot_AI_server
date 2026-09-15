@@ -147,7 +147,7 @@ PIPER_MODEL_URL = os.environ.get(
 )
 PIPER_CONFIG_URL = os.environ.get(
     "PIPER_CONFIG_URL",
-    "https://huggingface.co/doof-ferb/nghitts-copy/resolve/main/piper-tts/banmai.onnx.json?download=true",
+    "https://huggingface.co/doof-ferb/nghitts-copy/resolve/main/piper-tts/config.json?download=true",
 )
 PIPER_SPEED = float(os.environ.get("PIPER_SPEED", "1.04"))
 PIPER_VOLUME = float(os.environ.get("PIPER_VOLUME", "1.05"))
@@ -159,27 +159,96 @@ _piper_init_lock = asyncio.Lock()
 _normalizer = None
 
 
-def _download_file_sync(url: str, path: Path) -> None:
+def _download_file_sync(url: str, path: Path, min_bytes: int = 1) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".part")
-    with httpx.Client(timeout=httpx.Timeout(120.0, connect=20.0), follow_redirects=True) as client:
-        with client.stream("GET", url) as response:
-            response.raise_for_status()
-            with tmp.open("wb") as f:
-                for chunk in response.iter_bytes(1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-    tmp.replace(path)
+    try:
+        with httpx.Client(timeout=httpx.Timeout(180.0, connect=30.0), follow_redirects=True) as client:
+            with client.stream("GET", url) as response:
+                response.raise_for_status()
+                content_length = response.headers.get("content-length")
+                if content_length is not None and int(content_length) < min_bytes:
+                    raise RuntimeError(f"File qua nho: {url} | content-length={content_length}")
+                written = 0
+                with tmp.open("wb") as f:
+                    for chunk in response.iter_bytes(1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            written += len(chunk)
+                if written < min_bytes:
+                    raise RuntimeError(f"Tai file chua du: {url} | bytes={written}")
+        tmp.replace(path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+PIPER_MIRRORS = [
+    (
+        "https://huggingface.co/doof-ferb/nghitts-copy/resolve/main/piper-tts/banmai.onnx?download=true",
+        "https://huggingface.co/doof-ferb/nghitts-copy/resolve/main/piper-tts/config.json?download=true",
+    ),
+    (
+        "https://huggingface.co/sannht/vi_voice/resolve/main/tts-model/banmai.onnx?download=true",
+        "https://huggingface.co/sannht/vi_voice/resolve/main/tts-model/banmai.onnx.json?download=true",
+    ),
+]
 
 
 async def ensure_piper_files() -> None:
     if TTS_MODEL_PATH.exists() and TTS_CONFIG_PATH.exists():
         return
-    print("[TTS] Dang tai Piper voice Ban Mai...", flush=True)
-    await asyncio.to_thread(_download_file_sync, PIPER_MODEL_URL, TTS_MODEL_PATH)
-    await asyncio.to_thread(_download_file_sync, PIPER_CONFIG_URL, TTS_CONFIG_PATH)
+
+    # Always download model + matching config as one pair. Never leave a half-pair
+    # from a failed mirror attempt. The bundled config below is used when possible.
+    TTS_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    print("[TTS] Kiem tra Piper Ban Mai...", flush=True)
+
+    # The package contains the known-good config.json as banmai.onnx.json, so the
+    # normal startup path only needs the ~63.5 MB ONNX model.
+    if TTS_CONFIG_PATH.exists():
+        model_urls = [pair[0] for pair in PIPER_MIRRORS]
+        for model_url in model_urls:
+            try:
+                print(f"[TTS] Tai Piper model: {model_url}", flush=True)
+                await asyncio.to_thread(_download_file_sync, model_url, TTS_MODEL_PATH, 50 * 1024 * 1024)
+                break
+            except Exception as exc:
+                print(f"[TTS] Mirror model loi: {str(exc)[:220]}", flush=True)
+                try:
+                    TTS_MODEL_PATH.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        else:
+            raise RuntimeError("Khong tai duoc Piper model Ban Mai tu bat ky mirror nao")
+    else:
+        errors = []
+        for model_url, config_url in PIPER_MIRRORS:
+            temp_model = TTS_MODEL_PATH.with_suffix(TTS_MODEL_PATH.suffix + ".part")
+            temp_config = TTS_CONFIG_PATH.with_suffix(TTS_CONFIG_PATH.suffix + ".part")
+            try:
+                print(f"[TTS] Tai cap Piper model+config tu mirror...", flush=True)
+                await asyncio.to_thread(_download_file_sync, model_url, temp_model, 50 * 1024 * 1024)
+                await asyncio.to_thread(_download_file_sync, config_url, temp_config, 1000)
+                # Validate JSON before committing either file.
+                json.loads(temp_config.read_text(encoding="utf-8"))
+                temp_model.replace(TTS_MODEL_PATH)
+                temp_config.replace(TTS_CONFIG_PATH)
+                break
+            except Exception as exc:
+                errors.append(str(exc)[:180])
+                temp_model.unlink(missing_ok=True)
+                temp_config.unlink(missing_ok=True)
+        else:
+            raise RuntimeError("Khong tai duoc bo Piper model+config: " + " | ".join(errors))
+
     print(
-        f"[TTS] Tai xong model | model={TTS_MODEL_PATH} | size={TTS_MODEL_PATH.stat().st_size / 1024 / 1024:.1f} MB",
+        f"[TTS] Piper files OK | model={TTS_MODEL_PATH.name} | "
+        f"model_size={TTS_MODEL_PATH.stat().st_size / 1024 / 1024:.1f} MB | "
+        f"config_size={TTS_CONFIG_PATH.stat().st_size / 1024:.1f} KB",
         flush=True,
     )
 
@@ -291,7 +360,7 @@ def read_root():
         "gemini_keys": len(API_KEYS),
         "current_gemini_key": CURRENT_KEY_INDEX + 1 if API_KEYS else None,
         "key_status": key_status_summary(),
-        "tts_provider": "piper-local",
+        "tts_provider": "piper-local-bundled-config",
         "tts_voice": TTS_MODEL_NAME,
         "tts_output": "PCM16 16kHz mono",
     }
@@ -345,15 +414,23 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
             usage = None
 
             async for chunk in stream:
-                if chunk.text:
-                    parts.append(chunk.text)
                 try:
-                    if chunk.candidates:
-                        candidate = chunk.candidates[0]
-                        if candidate.finish_reason is not None:
+                    candidates = getattr(chunk, "candidates", None) or []
+                    if candidates:
+                        candidate = candidates[0]
+                        if getattr(candidate, "finish_reason", None) is not None:
                             finish_reason = str(candidate.finish_reason)
-                        if candidate.finish_message:
+                        if getattr(candidate, "finish_message", None):
                             finish_message = str(candidate.finish_message)
+                        content = getattr(candidate, "content", None)
+                        parts_obj = getattr(content, "parts", None) if content is not None else None
+                        if parts_obj:
+                            for part in parts_obj:
+                                if getattr(part, "thought", False):
+                                    continue
+                                part_text = getattr(part, "text", None)
+                                if part_text:
+                                    parts.append(part_text)
                 except Exception:
                     pass
                 try:
@@ -414,18 +491,28 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
                         config=types.GenerateContentConfig(
                             system_instruction=SYSTEM_PROMPT,
                             max_output_tokens=MAX_OUTPUT_TOKENS,
-                            safety_settings=safety_config,
+                                    safety_settings=safety_config,
                             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                         ),
                     )
                     retry_parts: list[str] = []
                     retry_finish = None
                     async for chunk in retry_stream:
-                        if chunk.text:
-                            retry_parts.append(chunk.text)
                         try:
-                            if chunk.candidates and chunk.candidates[0].finish_reason is not None:
-                                retry_finish = str(chunk.candidates[0].finish_reason)
+                            candidates = getattr(chunk, "candidates", None) or []
+                            if candidates:
+                                candidate = candidates[0]
+                                if getattr(candidate, "finish_reason", None) is not None:
+                                    retry_finish = str(candidate.finish_reason)
+                                content = getattr(candidate, "content", None)
+                                parts_obj = getattr(content, "parts", None) if content is not None else None
+                                if parts_obj:
+                                    for part in parts_obj:
+                                        if getattr(part, "thought", False):
+                                            continue
+                                        part_text = getattr(part, "text", None)
+                                        if part_text:
+                                            retry_parts.append(part_text)
                         except Exception:
                             pass
                     retry_text = "".join(retry_parts).strip()
