@@ -5,7 +5,6 @@ import os
 import re
 import time
 import wave
-from pathlib import Path
 from typing import Optional
 
 # Keep Render Free / low-CPU memory footprint predictable.
@@ -15,18 +14,10 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("ORT_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-import httpx
-import numpy as np
-import soxr
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from google import genai
 from google.genai import types
-from piper import PiperVoice, SynthesisConfig
 
-try:
-    from vietnormalizer import VietnameseNormalizer
-except Exception:
-    VietnameseNormalizer = None
 
 app = FastAPI()
 
@@ -53,15 +44,12 @@ SYSTEM_PROMPT = r"""
 Tôi là Bún Đậu, tính cách cau có, đanh đá, cà khịa, hay mắng mỏ theo kiểu hài hước.
 Thuộc quyền của đại ca Việt.
 
-## Ngôn ngữ
-- Không đọc phiên âm.
-- Đa ngôn ngữ → phát âm đúng.
-
 QUY TẮC:
 - Chỉ trả lời bằng tiếng Việt.
 - Xưng mày - tao.
+- Tối đa 1 đến 2 câu, nhưng phải là câu hoàn chỉnh.
 - Không được dừng giữa từ, giữa cụm từ hoặc giữa câu.
-- Không bỏ dở câu trả lời vì giới hạn độ dài; 
+- Không bỏ dở câu trả lời vì giới hạn độ dài; nếu nội dung dài thì rút gọn trước khi viết.
 - Hiểu ngữ cảnh; không hiểu thì hỏi lại.
 - Không bịa thông tin.
 - Không tự giới thiệu tên, nguồn gốc, thương hiệu hoặc vai trò trừ khi được hỏi.
@@ -69,8 +57,6 @@ QUY TẮC:
 - Không dùng emoji, markdown, dấu gạch đầu dòng, ký hiệu trang trí hoặc timestamp.
 - Có thể cà khịa/chửi bới theo yêu cầu, nhưng không đe dọa, kích động bạo lực hoặc kỳ thị.
 - Giữ câu trả lời tự nhiên, nói như hội thoại đời thường.
-- không tự nhận mình là AI.
-- lập luận logic có tư duy.
 """.strip()
 
 
@@ -131,156 +117,30 @@ def key_status_summary() -> str:
 
 
 # ==============================================================================
-# 2. LOCAL PIPER TTS
+# 2. EDGE-TTS SEAMLESS TTS
 # ==============================================================================
+# TTS strategy:
+# - No sentence-by-sentence playback. The full Gemini response is synthesized as
+#   ONE audio job to preserve continuous cadence and avoid gaps between sentences.
+# - Primary voice: Hoai My.
+# - Fallback voice: Nam Minh.
+# - Retry the same voice before switching to fallback.
+# - Output is decoded directly to PCM16 mono 16 kHz for ESP32.
 PCM_SAMPLE_RATE = 16000
 PCM_CHANNELS = 1
 PCM_BYTES_PER_SAMPLE = 2
 PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE
-TTS_CHUNK_SIZE = 2048
+TTS_CHUNK_SIZE = 2048  # 64 ms of PCM16/16kHz/mono
 
-TTS_MODEL_NAME = os.environ.get("PIPER_MODEL_NAME", "banmai")
-TTS_MODEL_DIR = Path(os.environ.get("PIPER_MODEL_DIR", "models"))
-TTS_MODEL_PATH = TTS_MODEL_DIR / f"{TTS_MODEL_NAME}.onnx"
-TTS_CONFIG_PATH = TTS_MODEL_DIR / f"{TTS_MODEL_NAME}.onnx.json"
+TTS_VOICE = os.environ.get("TTS_VOICE", "vi-VN-HoaiMyNeural").strip()
+TTS_FALLBACK_VOICE = os.environ.get("TTS_FALLBACK_VOICE", "vi-VN-NamMinhNeural").strip()
+TTS_RATE = os.environ.get("TTS_RATE", "+10%").strip()
+TTS_TIMEOUT_SECONDS = float(os.environ.get("TTS_TIMEOUT_SECONDS", "25"))
+TTS_RETRIES_PER_VOICE = max(1, int(os.environ.get("TTS_RETRIES_PER_VOICE", "2")))
+TTS_CONCURRENCY = max(1, int(os.environ.get("TTS_CONCURRENCY", "1")))
 
-# Public model mirror used by the NGHI-TTS/Piper ecosystem.
-# Ban Mai is a Vietnamese female/northern voice in upstream/service descriptions.
-PIPER_MODEL_URL = os.environ.get(
-    "PIPER_MODEL_URL",
-    "https://huggingface.co/doof-ferb/nghitts-copy/resolve/main/piper-tts/banmai.onnx?download=true",
-)
-PIPER_CONFIG_URL = os.environ.get(
-    "PIPER_CONFIG_URL",
-    "https://huggingface.co/doof-ferb/nghitts-copy/resolve/main/piper-tts/config.json?download=true",
-)
-PIPER_SPEED = float(os.environ.get("PIPER_SPEED", "1.04"))
-PIPER_VOLUME = float(os.environ.get("PIPER_VOLUME", "1.05"))
-PIPER_NOISE_SCALE = float(os.environ.get("PIPER_NOISE_SCALE", "0.667"))
-PIPER_NOISE_W_SCALE = float(os.environ.get("PIPER_NOISE_W_SCALE", "0.8"))
-
-_piper_voice: Optional[PiperVoice] = None
-_piper_init_lock = asyncio.Lock()
-_normalizer = None
-
-
-def _download_file_sync(url: str, path: Path, min_bytes: int = 1) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".part")
-    try:
-        with httpx.Client(timeout=httpx.Timeout(180.0, connect=30.0), follow_redirects=True) as client:
-            with client.stream("GET", url) as response:
-                response.raise_for_status()
-                content_length = response.headers.get("content-length")
-                if content_length is not None and int(content_length) < min_bytes:
-                    raise RuntimeError(f"File qua nho: {url} | content-length={content_length}")
-                written = 0
-                with tmp.open("wb") as f:
-                    for chunk in response.iter_bytes(1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                            written += len(chunk)
-                if written < min_bytes:
-                    raise RuntimeError(f"Tai file chua du: {url} | bytes={written}")
-        tmp.replace(path)
-    except Exception:
-        try:
-            tmp.unlink(missing_ok=True)
-        except Exception:
-            pass
-        raise
-
-
-PIPER_MIRRORS = [
-    (
-        "https://huggingface.co/doof-ferb/nghitts-copy/resolve/main/piper-tts/banmai.onnx?download=true",
-        "https://huggingface.co/doof-ferb/nghitts-copy/resolve/main/piper-tts/config.json?download=true",
-    ),
-    (
-        "https://huggingface.co/sannht/vi_voice/resolve/main/tts-model/banmai.onnx?download=true",
-        "https://huggingface.co/sannht/vi_voice/resolve/main/tts-model/banmai.onnx.json?download=true",
-    ),
-]
-
-
-async def ensure_piper_files() -> None:
-    if TTS_MODEL_PATH.exists() and TTS_CONFIG_PATH.exists():
-        return
-
-    # Always download model + matching config as one pair. Never leave a half-pair
-    # from a failed mirror attempt. The bundled config below is used when possible.
-    TTS_MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    print("[TTS] Kiem tra Piper Ban Mai...", flush=True)
-
-    # The package contains the known-good config.json as banmai.onnx.json, so the
-    # normal startup path only needs the ~63.5 MB ONNX model.
-    if TTS_CONFIG_PATH.exists():
-        model_urls = [pair[0] for pair in PIPER_MIRRORS]
-        for model_url in model_urls:
-            try:
-                print(f"[TTS] Tai Piper model: {model_url}", flush=True)
-                await asyncio.to_thread(_download_file_sync, model_url, TTS_MODEL_PATH, 50 * 1024 * 1024)
-                break
-            except Exception as exc:
-                print(f"[TTS] Mirror model loi: {str(exc)[:220]}", flush=True)
-                try:
-                    TTS_MODEL_PATH.unlink(missing_ok=True)
-                except Exception:
-                    pass
-        else:
-            raise RuntimeError("Khong tai duoc Piper model Ban Mai tu bat ky mirror nao")
-    else:
-        errors = []
-        for model_url, config_url in PIPER_MIRRORS:
-            temp_model = TTS_MODEL_PATH.with_suffix(TTS_MODEL_PATH.suffix + ".part")
-            temp_config = TTS_CONFIG_PATH.with_suffix(TTS_CONFIG_PATH.suffix + ".part")
-            try:
-                print(f"[TTS] Tai cap Piper model+config tu mirror...", flush=True)
-                await asyncio.to_thread(_download_file_sync, model_url, temp_model, 50 * 1024 * 1024)
-                await asyncio.to_thread(_download_file_sync, config_url, temp_config, 1000)
-                # Validate JSON before committing either file.
-                json.loads(temp_config.read_text(encoding="utf-8"))
-                temp_model.replace(TTS_MODEL_PATH)
-                temp_config.replace(TTS_CONFIG_PATH)
-                break
-            except Exception as exc:
-                errors.append(str(exc)[:180])
-                temp_model.unlink(missing_ok=True)
-                temp_config.unlink(missing_ok=True)
-        else:
-            raise RuntimeError("Khong tai duoc bo Piper model+config: " + " | ".join(errors))
-
-    print(
-        f"[TTS] Piper files OK | model={TTS_MODEL_PATH.name} | "
-        f"model_size={TTS_MODEL_PATH.stat().st_size / 1024 / 1024:.1f} MB | "
-        f"config_size={TTS_CONFIG_PATH.stat().st_size / 1024:.1f} KB",
-        flush=True,
-    )
-
-
-def _init_piper_sync() -> PiperVoice:
-    return PiperVoice.load(str(TTS_MODEL_PATH), use_cuda=False)
-
-
-async def get_piper_voice() -> PiperVoice:
-    global _piper_voice, _normalizer
-    if _piper_voice is not None:
-        return _piper_voice
-    async with _piper_init_lock:
-        if _piper_voice is not None:
-            return _piper_voice
-        await ensure_piper_files()
-        _piper_voice = await asyncio.to_thread(_init_piper_sync)
-        if VietnameseNormalizer is not None:
-            try:
-                _normalizer = VietnameseNormalizer()
-            except Exception:
-                _normalizer = None
-        print(
-            f"[TTS] Piper ready | voice={TTS_MODEL_NAME} | sample_rate={_piper_voice.config.sample_rate}",
-            flush=True,
-        )
-        return _piper_voice
+# One TTS job at a time keeps Render Free memory/CPU predictable.
+_tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
 
 
 def clean_text_for_tts(text: str) -> str:
@@ -288,51 +148,98 @@ def clean_text_for_tts(text: str) -> str:
     text = re.sub(r"[*#_~>`]", "", text)
     text = text.replace("\u2013", " ").replace("\u2014", " ")
     text = re.sub(r"\s+", " ", text).strip()
-    if _normalizer is not None:
-        try:
-            text = _normalizer.normalize(text)
-        except Exception:
-            pass
     return text.strip(" ,;:-_\n\r\t")
 
 
-def synthesize_full_pcm16_sync(text: str) -> bytes:
-    voice = _piper_voice
-    if voice is None:
-        raise RuntimeError("Piper voice chua duoc khoi tao")
+def _decode_mp3_to_pcm16(mp3_bytes: bytes) -> bytes:
+    # miniaudio is imported lazily so server startup remains lightweight.
+    import miniaudio
 
-    syn = SynthesisConfig(
-        volume=PIPER_VOLUME,
-        length_scale=max(0.60, min(1.50, 1.0 / max(0.5, PIPER_SPEED))),
-        noise_scale=PIPER_NOISE_SCALE,
-        noise_w_scale=PIPER_NOISE_W_SCALE,
-        normalize_audio=True,
+    decoded = miniaudio.decode(
+        mp3_bytes,
+        output_format=miniaudio.SampleFormat.SIGNED16,
+        nchannels=PCM_CHANNELS,
+        sample_rate=PCM_SAMPLE_RATE,
+    )
+    pcm = decoded.samples.tobytes()
+    if not pcm:
+        raise RuntimeError("Edge-TTS decode khong tao ra PCM")
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+    return pcm
+
+
+async def _synthesize_edge_voice(text: str, voice: str) -> bytes:
+    import edge_tts
+
+    communicate = edge_tts.Communicate(
+        text,
+        voice=voice,
+        rate=TTS_RATE,
     )
 
-    pieces = []
-    src_rate = int(voice.config.sample_rate)
-    for chunk in voice.synthesize(text, syn_config=syn):
-        pieces.append(chunk.audio_int16_bytes)
+    mp3_buffer = bytearray()
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio":
+            data = chunk.get("data") or b""
+            if data:
+                mp3_buffer.extend(data)
 
-    if not pieces:
-        raise RuntimeError("Piper khong sinh duoc audio")
+    if not mp3_buffer:
+        raise RuntimeError("Edge-TTS khong tra ve audio")
 
-    raw = b"".join(pieces)
-    if src_rate == PCM_SAMPLE_RATE:
-        return raw
-
-    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    resampled = soxr.resample(samples, src_rate, PCM_SAMPLE_RATE, quality="HQ")
-    out = np.clip(resampled * 32767.0, -32768.0, 32767.0).astype(np.int16)
-    return out.tobytes()
+    return await asyncio.to_thread(_decode_mp3_to_pcm16, bytes(mp3_buffer))
 
 
-async def synthesize_piper(text: str) -> bytes:
+async def synthesize_tts(text: str) -> tuple[bytes, str, int]:
     cleaned = clean_text_for_tts(text)
     if not cleaned:
         raise RuntimeError("Gemini returned empty TTS text")
-    await get_piper_voice()
-    return await asyncio.to_thread(synthesize_full_pcm16_sync, cleaned)
+
+    voices = []
+    for voice in (TTS_VOICE, TTS_FALLBACK_VOICE):
+        if voice and voice not in voices:
+            voices.append(voice)
+
+    last_error: Optional[Exception] = None
+    async with _tts_semaphore:
+        for voice_index, voice in enumerate(voices):
+            for attempt in range(1, TTS_RETRIES_PER_VOICE + 1):
+                started = time.monotonic()
+                try:
+                    print(
+                        f"[TTS] Edge-TTS voice={voice} | lan {attempt}/{TTS_RETRIES_PER_VOICE}",
+                        flush=True,
+                    )
+                    pcm = await asyncio.wait_for(
+                        _synthesize_edge_voice(cleaned, voice),
+                        timeout=TTS_TIMEOUT_SECONDS,
+                    )
+                    elapsed_ms = int((time.monotonic() - started) * 1000)
+                    audio_ms = int(len(pcm) * 1000 / PCM_BYTES_PER_SECOND)
+                    print(
+                        f"[TTS] Thanh cong | voice={voice} | PCM={len(pcm)} bytes | "
+                        f"audio={audio_ms} ms | synth={elapsed_ms} ms",
+                        flush=True,
+                    )
+                    return pcm, voice, elapsed_ms
+                except Exception as exc:
+                    last_error = exc
+                    print(
+                        f"[EDGE-TTS Error] voice={voice} | lan {attempt}: "
+                        f"{str(exc).replace(chr(10), ' ')[:260]}",
+                        flush=True,
+                    )
+                    if attempt < TTS_RETRIES_PER_VOICE:
+                        await asyncio.sleep(0.25)
+
+            if voice_index < len(voices) - 1:
+                print(
+                    f"[TTS] Voice {voice} that bai -> fallback {voices[voice_index + 1]}",
+                    flush=True,
+                )
+
+    raise RuntimeError(f"Tat ca Edge-TTS voice deu that bai: {last_error}")
 
 
 async def stream_pcm_to_esp(websocket: WebSocket, pcm: bytes) -> int:
@@ -351,6 +258,8 @@ async def stream_pcm_to_esp(websocket: WebSocket, pcm: bytes) -> int:
         if delay > 0:
             await asyncio.sleep(delay)
         else:
+            # Server is already behind real-time. Restart the timing origin
+            # rather than accumulating increasing negative drift.
             next_deadline = time.monotonic()
     return total
 
@@ -365,8 +274,9 @@ def read_root():
         "gemini_keys": len(API_KEYS),
         "current_gemini_key": CURRENT_KEY_INDEX + 1 if API_KEYS else None,
         "key_status": key_status_summary(),
-        "tts_provider": "piper-local-bundled-config",
-        "tts_voice": TTS_MODEL_NAME,
+        "tts_provider": "edge-tts",
+        "tts_voice": TTS_VOICE,
+        "tts_fallback_voice": TTS_FALLBACK_VOICE,
         "tts_output": "PCM16 16kHz mono",
     }
 
@@ -376,6 +286,7 @@ def read_root():
 # ==============================================================================
 async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
     global CURRENT_KEY_INDEX
+    gemini_started = time.monotonic()
 
     if not API_KEYS:
         raise RuntimeError("Khong co GEMINI_API_KEY")
@@ -417,6 +328,7 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
             finish_reason = None
             finish_message = None
             usage = None
+            first_text_ms = None
 
             async for chunk in stream:
                 try:
@@ -435,6 +347,8 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
                                     continue
                                 part_text = getattr(part, "text", None)
                                 if part_text:
+                                    if first_text_ms is None:
+                                        first_text_ms = int((time.monotonic() - gemini_started) * 1000)
                                     parts.append(part_text)
                 except Exception:
                     pass
@@ -448,8 +362,10 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
             finish_reason = finish_reason or "UNKNOWN"
             upper = finish_reason.upper()
 
+            gemini_total_ms = int((time.monotonic() - gemini_started) * 1000)
             print(
-                f"[GEMINI] Ket thuc Key #{key_idx + 1} | finish={finish_reason} | message={finish_message!r}",
+                f"[GEMINI] Ket thuc Key #{key_idx + 1} | finish={finish_reason} | "
+                f"message={finish_message!r} | first_text={first_text_ms} ms | total={gemini_total_ms} ms",
                 flush=True,
             )
             if usage:
@@ -587,14 +503,21 @@ async def websocket_chat(websocket: WebSocket):
 
                 await websocket.send_text(json.dumps({"event": "tts_start"}))
 
-                started = time.monotonic()
-                pcm = await synthesize_piper(cleaned)
-                tts_ms = int((time.monotonic() - started) * 1000)
-                print(f"[TTS] Piper da sinh audio | PCM={len(pcm)} bytes | synth={tts_ms} ms", flush=True)
+                tts_started = time.monotonic()
+                pcm, used_voice, tts_ms = await synthesize_tts(cleaned)
+                tts_ready_ms = int((time.monotonic() - tts_started) * 1000)
+                print(
+                    f"[PERF] TTS ready | voice={used_voice} | first_audio_ready={tts_ready_ms} ms",
+                    flush=True,
+                )
 
                 sent = await stream_pcm_to_esp(websocket, pcm)
                 await websocket.send_text(json.dumps({"event": "tts_done"}))
-                print(f"[WEBSOCKET] Da gui xong audio | PCM={sent} bytes", flush=True)
+                print(
+                    f"[WEBSOCKET] Da gui xong audio | PCM={sent} bytes | "
+                    f"TTS={tts_ms} ms | audio_duration={int(sent * 1000 / PCM_BYTES_PER_SECOND)} ms",
+                    flush=True,
+                )
 
             except WebSocketDisconnect:
                 raise

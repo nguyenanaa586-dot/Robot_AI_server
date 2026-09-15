@@ -1,19 +1,25 @@
-Bun Dau Server V1.5 RenderFixed Fix2
+Bun Dau Server V1.6 - Edge-TTS Seamless
 
-- Gemini thinking_config/thinking_level removed.
-- Piper Ban Mai uses bundled banmai.onnx.json plus downloaded banmai.onnx.
-- Model download has two verified Hugging Face mirrors and minimum-size validation.
-- Model + config are treated as a pair when fallback download is needed.
-- Gemini response reads candidate.content.parts directly instead of chunk.text, avoiding warnings from thought_signature/non-text parts.
-- Gemini finish_reason is checked; incomplete response reasons are rejected before TTS.
-- TTS output is resampled from Piper 22050 Hz to PCM16 16 kHz mono.
-- Default TTS volume/speed preserved from V1.5.
+Mục tiêu:
+- Loại bỏ Piper vì inference trên Render Free quá chậm.
+- Dùng Edge-TTS của Microsoft, miễn phí, với Hoài My làm voice chính và Nam Minh fallback.
+- Không chia câu để phát từng đoạn. Toàn bộ câu trả lời Gemini được tổng hợp thành MỘT file PCM liên tục trước khi gửi.
+- Giữ PCM16 / 16 kHz / mono và giao thức WebSocket hiện tại của ESP32.
+- Giữ sticky Gemini API key.
+- Không dùng thinking_config/thinking_level.
+- Đọc trực tiếp candidate.content.parts để không gọi chunk.text và tránh cảnh báo thought_signature.
+- Kiểm tra finish_reason trước khi gửi TTS.
+- Retry Edge-TTS cùng voice trước khi chuyển fallback.
+- TTS có timeout và semaphore để bảo vệ Render Free.
+- Log performance Gemini first_text/total và TTS synth/audio duration.
 
-Render environment variables:
-GEMINI_API_KEY
+Environment variables:
+GEMINI_API_KEY=key1,key2,...
 GEMINI_MODEL (optional)
 GEMINI_MAX_OUTPUT_TOKENS (optional, default 1024)
-PIPER_MODEL_DIR (optional, default models)
-PIPER_MODEL_NAME (optional, default banmai)
-PIPER_SPEED (optional, default 1.04)
-PIPER_VOLUME (optional, default 1.05)
+TTS_VOICE (optional, default vi-VN-HoaiMyNeural)
+TTS_FALLBACK_VOICE (optional, default vi-VN-NamMinhNeural)
+TTS_RATE (optional, default +10%)
+TTS_TIMEOUT_SECONDS (optional, default 25)
+TTS_RETRIES_PER_VOICE (optional, default 2)
+TTS_CONCURRENCY (optional, default 1)
