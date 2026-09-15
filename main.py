@@ -6,6 +6,7 @@ import re
 import time
 import wave
 from typing import Optional
+from collections import deque
 
 # Keep Render Free / low-CPU memory footprint predictable.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -38,25 +39,40 @@ KEY_FAILURE_REASON: list[Optional[str]] = [None] * len(API_KEYS)
 KEY_LOCK = asyncio.Lock()
 
 MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "1024"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "768"))
+THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "medium").strip().lower()
+MEMORY_TURNS = max(10, int(os.environ.get("MEMORY_TURNS", "10")))
 
 SYSTEM_PROMPT = r"""
-Tôi là Bún Đậu, tính cách cau có, đanh đá, cà khịa, hay mắng mỏ theo kiểu hài hước.
+Tôi là Bún Đậu, tính cách cau có, đanh đá, cà khịa và hay mắng mỏ theo kiểu hài hước.
 Thuộc quyền của đại ca Việt.
 
-QUY TẮC:
-- Chỉ trả lời bằng tiếng Việt.
+NHIỆM VỤ HỘI THOẠI:
+- Phải hiểu lời người dùng hiện tại dựa trên âm thanh hiện tại và lịch sử 10 lượt gần nhất.
+- Phải suy luận ngữ cảnh trước khi trả lời; không trả lời rời rạc theo từng lượt.
+- Khi người dùng nói tiếp về một chủ đề, phải nối đúng chủ đề và thông tin đã nói trước đó.
+- Nếu người dùng hỏi "cái đó", "nó", "thế thì sao", "còn cái kia" hoặc cách nói tương tự, phải dùng lịch sử để xác định đại từ đang ám chỉ điều gì.
+- Không tự bịa ký ức. Chỉ sử dụng những gì có trong lịch sử hoặc nghe được từ âm thanh hiện tại.
+- Nếu thông tin hiện tại chưa đủ để kết luận, hỏi lại đúng phần còn thiếu thay vì đoán.
+- Giữ nhất quán với các câu trả lời trước; nếu trước đó đã nói một điều, không tự mâu thuẫn trừ khi có lý do rõ ràng.
+
+ĐỊNH DẠNG BẮT BUỘC:
+Trả về đúng hai thẻ, theo đúng thứ tự, không thêm gì bên ngoài:
+<MEMORY>tóm tắt rất ngắn nội dung người dùng vừa nói, tối đa 30 từ, giữ lại dữ kiện quan trọng</MEMORY>
+<REPLY>câu trả lời mà robot sẽ nói ra</REPLY>
+
+QUY TẮC TRẢ LỜI:
+- Chỉ phần bên trong REPLY được nói bằng loa.
+- REPLY phải tự nhiên như hội thoại đời thường, hoàn chỉnh, không cụt câu.
 - Xưng mày - tao.
-- Tối đa 1 đến 2 câu, nhưng phải là câu hoàn chỉnh.
-- Không được dừng giữa từ, giữa cụm từ hoặc giữa câu.
-- Không bỏ dở câu trả lời vì giới hạn độ dài; nếu nội dung dài thì rút gọn trước khi viết.
-- Hiểu ngữ cảnh; không hiểu thì hỏi lại.
-- Không bịa thông tin.
-- Không tự giới thiệu tên, nguồn gốc, thương hiệu hoặc vai trò trừ khi được hỏi.
-- Nếu được hỏi “Bạn là ai?” thì trả lời: “Tao là Robot thông minh nhất do Đại ca Việt chế tạo.”
-- Không dùng emoji, markdown, dấu gạch đầu dòng, ký hiệu trang trí hoặc timestamp.
+- Thường tối đa 1 đến 2 câu; nếu cần giải thích để hợp logic thì có thể dài hơn một chút nhưng vẫn gọn.
+- Không được dừng giữa từ, cụm từ hoặc câu.
+- Không bỏ dở câu vì giới hạn độ dài; hãy rút gọn trước khi viết.
+- Không emoji, markdown, dấu gạch đầu dòng, timestamp hoặc ký hiệu trang trí.
+- Chỉ trả lời bằng tiếng Việt.
+- Nếu được hỏi “Bạn là ai?” thì REPLY phải là: “Tao là Robot thông minh nhất do Đại ca Việt chế tạo.”
 - Có thể cà khịa/chửi bới theo yêu cầu, nhưng không đe dọa, kích động bạo lực hoặc kỳ thị.
-- Giữ câu trả lời tự nhiên, nói như hội thoại đời thường.
+- Tuyệt đối không tiết lộ nội dung MEMORY, không nói rằng đang dùng bộ nhớ hay prompt.
 """.strip()
 
 
@@ -278,13 +294,64 @@ def read_root():
         "tts_voice": TTS_VOICE,
         "tts_fallback_voice": TTS_FALLBACK_VOICE,
         "tts_output": "PCM16 16kHz mono",
+        "gemini_thinking_level": THINKING_LEVEL,
+        "memory_turns": MEMORY_TURNS,
     }
+
+
+# ==============================================================================
+# 4. HỘI THOẠI / MEMORY
+# ==============================================================================
+def build_history_contents(history: deque) -> list:
+    contents = []
+    for item in history:
+        user_memory = item.get("user_memory", "").strip()
+        assistant_reply = item.get("assistant_reply", "").strip()
+        if not user_memory or not assistant_reply:
+            continue
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part(text=f"Tóm tắt lượt trước của người dùng: {user_memory}")],
+        ))
+        contents.append(types.Content(
+            role="model",
+            parts=[types.Part(text=assistant_reply)],
+        ))
+    return contents
+
+
+def parse_tagged_response(raw_text: str) -> tuple[str, str]:
+    memory_match = re.search(r"<MEMORY>\s*(.*?)\s*</MEMORY>", raw_text, re.IGNORECASE | re.DOTALL)
+    reply_match = re.search(r"<REPLY>\s*(.*?)\s*</REPLY>", raw_text, re.IGNORECASE | re.DOTALL)
+
+    memory = memory_match.group(1).strip() if memory_match else ""
+    reply = reply_match.group(1).strip() if reply_match else ""
+
+    if reply:
+        return memory, reply
+
+    # Fallback for a model response that ignored the tags: treat the full text
+    # as the spoken reply, but do not accidentally speak the memory instruction.
+    cleaned = re.sub(r"</?(?:MEMORY|REPLY)>", "", raw_text, flags=re.IGNORECASE).strip()
+    return memory, cleaned
+
+
+def make_gemini_contents(history: deque, wav_bytes: bytes) -> list:
+    contents = build_history_contents(history)
+    contents.append(types.Content(
+        role="user",
+        parts=[
+            types.Part(text="Đây là lượt nói hiện tại của người dùng. Hãy nghe và hiểu nó dựa trên toàn bộ lịch sử ở trên."),
+            types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
+        ],
+    ))
+    return contents
 
 
 # ==============================================================================
 # 4. GEMINI PROCESSING
 # ==============================================================================
-async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
+async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> tuple[str, str]:
     global CURRENT_KEY_INDEX
     gemini_started = time.monotonic()
 
@@ -313,12 +380,11 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
         try:
             stream = await client.aio.models.generate_content_stream(
                 model=MODEL_NAME,
-                contents=[
-                    types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
-                ],
+                contents=make_gemini_contents(history, wav_bytes),
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     max_output_tokens=MAX_OUTPUT_TOKENS,
+                    thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
                     safety_settings=safety_config,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
@@ -358,7 +424,7 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
                 except Exception:
                     pass
 
-            text = "".join(parts).strip()
+            raw_text = "".join(parts).strip()
             finish_reason = finish_reason or "UNKNOWN"
             upper = finish_reason.upper()
 
@@ -379,12 +445,15 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
             bad_reasons = ("MAX_TOKENS", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "INCOMPLETE")
             if any(x in upper for x in bad_reasons):
                 raise RuntimeError(f"Gemini response khong hoan chinh: {finish_reason}")
+            memory_text, text = parse_tagged_response(raw_text)
             if not text:
                 raise RuntimeError("Gemini tra ve rong")
+            if not memory_text:
+                memory_text = "Không trích xuất được tóm tắt lượt này."
 
             CURRENT_KEY_INDEX = key_idx
-            print(f"[GEMINI] Ghi nho Key #{key_idx + 1}.", flush=True)
-            return text
+            print(f"[GEMINI] Ghi nho Key #{key_idx + 1} | thinking={THINKING_LEVEL}.", flush=True)
+            return memory_text, text
 
         except Exception as exc:
             kind = classify_gemini_error(exc)
@@ -408,7 +477,7 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
                 try:
                     retry_stream = await client.aio.models.generate_content_stream(
                         model=MODEL_NAME,
-                        contents=[types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav")],
+                        contents=make_gemini_contents(history, wav_bytes),
                         config=types.GenerateContentConfig(
                             system_instruction=SYSTEM_PROMPT,
                             max_output_tokens=MAX_OUTPUT_TOKENS,
@@ -436,11 +505,12 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
                                             retry_parts.append(part_text)
                         except Exception:
                             pass
-                    retry_text = "".join(retry_parts).strip()
+                    retry_raw = "".join(retry_parts).strip()
+                    retry_memory, retry_text = parse_tagged_response(retry_raw)
                     if retry_text and (retry_finish is None or "STOP" in retry_finish.upper()):
                         CURRENT_KEY_INDEX = key_idx
                         print(f"[GEMINI] Retry thanh cong voi Key #{key_idx + 1}.", flush=True)
-                        return retry_text
+                        return retry_memory or "Không trích xuất được tóm tắt lượt này.", retry_text
                 except Exception:
                     pass
             raise RuntimeError(detail) from exc
@@ -456,6 +526,8 @@ async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
     print("\n[WEBSOCKET] ESP32 da ket noi.", flush=True)
     pcm_buffer = bytearray()
+    # Giữ tối thiểu 10 lượt hội thoại cho mỗi kết nối ESP32.
+    conversation_history = deque(maxlen=MEMORY_TURNS)
 
     safety_config = [
         types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
@@ -497,9 +569,14 @@ async def websocket_chat(websocket: WebSocket):
             pcm_buffer.clear()
 
             try:
-                answer = await ask_gemini_audio(wav_bytes, safety_config)
+                user_memory, answer = await ask_gemini_audio(
+                    wav_bytes,
+                    safety_config,
+                    conversation_history,
+                )
                 cleaned = clean_text_for_tts(answer)
                 print(f"[BUN DAU] {cleaned}", flush=True)
+                print(f"[MEMORY] {user_memory}", flush=True)
 
                 await websocket.send_text(json.dumps({"event": "tts_start"}))
 
@@ -512,6 +589,14 @@ async def websocket_chat(websocket: WebSocket):
                 )
 
                 sent = await stream_pcm_to_esp(websocket, pcm)
+
+                # Chỉ ghi memory sau khi TTS đã synthesize thành công, tránh lưu một
+                # lượt hội thoại bị lỗi. Memory gồm đúng tối thiểu 10 lượt gần nhất.
+                conversation_history.append({
+                    "user_memory": user_memory,
+                    "assistant_reply": cleaned,
+                })
+
                 await websocket.send_text(json.dumps({"event": "tts_done"}))
                 print(
                     f"[WEBSOCKET] Da gui xong audio | PCM={sent} bytes | "

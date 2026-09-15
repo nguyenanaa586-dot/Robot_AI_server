@@ -1,25 +1,22 @@
-Bun Dau Server V1.6 - Edge-TTS Seamless
+Bun Dau Server V1.7 - Reasoning + 10-turn memory
 
-Mục tiêu:
-- Loại bỏ Piper vì inference trên Render Free quá chậm.
-- Dùng Edge-TTS của Microsoft, miễn phí, với Hoài My làm voice chính và Nam Minh fallback.
-- Không chia câu để phát từng đoạn. Toàn bộ câu trả lời Gemini được tổng hợp thành MỘT file PCM liên tục trước khi gửi.
-- Giữ PCM16 / 16 kHz / mono và giao thức WebSocket hiện tại của ESP32.
-- Giữ sticky Gemini API key.
-- Không dùng thinking_config/thinking_level.
-- Đọc trực tiếp candidate.content.parts để không gọi chunk.text và tránh cảnh báo thought_signature.
-- Kiểm tra finish_reason trước khi gửi TTS.
-- Retry Edge-TTS cùng voice trước khi chuyển fallback.
-- TTS có timeout và semaphore để bảo vệ Render Free.
-- Log performance Gemini first_text/total và TTS synth/audio duration.
+- Gemini 3.6 Flash.
+- google-genai 2.23.0.
+- thinking_level=medium by default (configurable with GEMINI_THINKING_LEVEL).
+- Conversation memory: minimum 10 recent turns per ESP32 WebSocket session.
+- Each turn stores a short model-generated summary of what the user said plus the robot reply.
+- Current user audio is still sent as WAV; previous turns are kept as compact text, not old audio files.
+- Output format is forced in the prompt using MEMORY and REPLY tags. Only REPLY is sent to TTS.
+- Edge-TTS primary HoaiMy, fallback NamMinh.
+- Full-response TTS remains one continuous synthesis job; no sentence-by-sentence playback.
+- finish_reason is checked.
+- thought_signature parts are ignored by reading content.parts directly.
+- Sticky Gemini key behavior is preserved.
 
-Environment variables:
-GEMINI_API_KEY=key1,key2,...
-GEMINI_MODEL (optional)
-GEMINI_MAX_OUTPUT_TOKENS (optional, default 1024)
-TTS_VOICE (optional, default vi-VN-HoaiMyNeural)
-TTS_FALLBACK_VOICE (optional, default vi-VN-NamMinhNeural)
-TTS_RATE (optional, default +10%)
-TTS_TIMEOUT_SECONDS (optional, default 25)
-TTS_RETRIES_PER_VOICE (optional, default 2)
-TTS_CONCURRENCY (optional, default 1)
+Render variables (optional):
+GEMINI_THINKING_LEVEL=medium
+MEMORY_TURNS=10
+GEMINI_MAX_OUTPUT_TOKENS=768
+TTS_VOICE=vi-VN-HoaiMyNeural
+TTS_FALLBACK_VOICE=vi-VN-NamMinhNeural
+TTS_RATE=+10%
