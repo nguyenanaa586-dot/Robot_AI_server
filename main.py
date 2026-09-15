@@ -334,7 +334,6 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     max_output_tokens=MAX_OUTPUT_TOKENS,
-                    thinking_config=types.ThinkingConfig(thinking_level="minimal"),
                     safety_settings=safety_config,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
@@ -415,7 +414,6 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config) -> str:
                         config=types.GenerateContentConfig(
                             system_instruction=SYSTEM_PROMPT,
                             max_output_tokens=MAX_OUTPUT_TOKENS,
-                            thinking_config=types.ThinkingConfig(thinking_level="minimal"),
                             safety_settings=safety_config,
                             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                         ),
