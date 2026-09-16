@@ -39,8 +39,9 @@ KEY_FAILURE_REASON: list[Optional[str]] = [None] * len(API_KEYS)
 KEY_LOCK = asyncio.Lock()
 
 MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "768"))
-THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "medium").strip().lower()
+MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "384"))
+# LOW keeps real reasoning enabled while reducing response latency.
+THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
 MEMORY_TURNS = max(10, int(os.environ.get("MEMORY_TURNS", "10")))
 
 SYSTEM_PROMPT = r"""
@@ -133,155 +134,8 @@ def key_status_summary() -> str:
 
 
 # ==============================================================================
-# 2. EDGE-TTS SEAMLESS TTS
-# ==============================================================================
-# TTS strategy:
-# - No sentence-by-sentence playback. The full Gemini response is synthesized as
-#   ONE audio job to preserve continuous cadence and avoid gaps between sentences.
-# - Primary voice: Hoai My.
-# - Fallback voice: Nam Minh.
-# - Retry the same voice before switching to fallback.
-# - Output is decoded directly to PCM16 mono 16 kHz for ESP32.
-PCM_SAMPLE_RATE = 16000
-PCM_CHANNELS = 1
-PCM_BYTES_PER_SAMPLE = 2
-PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE
-TTS_CHUNK_SIZE = 2048  # 64 ms of PCM16/16kHz/mono
-
-TTS_VOICE = os.environ.get("TTS_VOICE", "vi-VN-HoaiMyNeural").strip()
-TTS_FALLBACK_VOICE = os.environ.get("TTS_FALLBACK_VOICE", "vi-VN-NamMinhNeural").strip()
-TTS_RATE = os.environ.get("TTS_RATE", "+10%").strip()
-TTS_TIMEOUT_SECONDS = float(os.environ.get("TTS_TIMEOUT_SECONDS", "25"))
-TTS_RETRIES_PER_VOICE = max(1, int(os.environ.get("TTS_RETRIES_PER_VOICE", "2")))
-TTS_CONCURRENCY = max(1, int(os.environ.get("TTS_CONCURRENCY", "1")))
-
-# One TTS job at a time keeps Render Free memory/CPU predictable.
-_tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
-
-
-def clean_text_for_tts(text: str) -> str:
-    text = re.sub(r"\d{1,2}:\d{2}(?::\d{2})?", "", text)
-    text = re.sub(r"[*#_~>`]", "", text)
-    text = text.replace("\u2013", " ").replace("\u2014", " ")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text.strip(" ,;:-_\n\r\t")
-
-
-def _decode_mp3_to_pcm16(mp3_bytes: bytes) -> bytes:
-    # miniaudio is imported lazily so server startup remains lightweight.
-    import miniaudio
-
-    decoded = miniaudio.decode(
-        mp3_bytes,
-        output_format=miniaudio.SampleFormat.SIGNED16,
-        nchannels=PCM_CHANNELS,
-        sample_rate=PCM_SAMPLE_RATE,
-    )
-    pcm = decoded.samples.tobytes()
-    if not pcm:
-        raise RuntimeError("Edge-TTS decode khong tao ra PCM")
-    if len(pcm) % 2:
-        pcm = pcm[:-1]
-    return pcm
-
-
-async def _synthesize_edge_voice(text: str, voice: str) -> bytes:
-    import edge_tts
-
-    communicate = edge_tts.Communicate(
-        text,
-        voice=voice,
-        rate=TTS_RATE,
-    )
-
-    mp3_buffer = bytearray()
-    async for chunk in communicate.stream():
-        if chunk.get("type") == "audio":
-            data = chunk.get("data") or b""
-            if data:
-                mp3_buffer.extend(data)
-
-    if not mp3_buffer:
-        raise RuntimeError("Edge-TTS khong tra ve audio")
-
-    return await asyncio.to_thread(_decode_mp3_to_pcm16, bytes(mp3_buffer))
-
-
-async def synthesize_tts(text: str) -> tuple[bytes, str, int]:
-    cleaned = clean_text_for_tts(text)
-    if not cleaned:
-        raise RuntimeError("Gemini returned empty TTS text")
-
-    voices = []
-    for voice in (TTS_VOICE, TTS_FALLBACK_VOICE):
-        if voice and voice not in voices:
-            voices.append(voice)
-
-    last_error: Optional[Exception] = None
-    async with _tts_semaphore:
-        for voice_index, voice in enumerate(voices):
-            for attempt in range(1, TTS_RETRIES_PER_VOICE + 1):
-                started = time.monotonic()
-                try:
-                    print(
-                        f"[TTS] Edge-TTS voice={voice} | lan {attempt}/{TTS_RETRIES_PER_VOICE}",
-                        flush=True,
-                    )
-                    pcm = await asyncio.wait_for(
-                        _synthesize_edge_voice(cleaned, voice),
-                        timeout=TTS_TIMEOUT_SECONDS,
-                    )
-                    elapsed_ms = int((time.monotonic() - started) * 1000)
-                    audio_ms = int(len(pcm) * 1000 / PCM_BYTES_PER_SECOND)
-                    print(
-                        f"[TTS] Thanh cong | voice={voice} | PCM={len(pcm)} bytes | "
-                        f"audio={audio_ms} ms | synth={elapsed_ms} ms",
-                        flush=True,
-                    )
-                    return pcm, voice, elapsed_ms
-                except Exception as exc:
-                    last_error = exc
-                    print(
-                        f"[EDGE-TTS Error] voice={voice} | lan {attempt}: "
-                        f"{str(exc).replace(chr(10), ' ')[:260]}",
-                        flush=True,
-                    )
-                    if attempt < TTS_RETRIES_PER_VOICE:
-                        await asyncio.sleep(0.25)
-
-            if voice_index < len(voices) - 1:
-                print(
-                    f"[TTS] Voice {voice} that bai -> fallback {voices[voice_index + 1]}",
-                    flush=True,
-                )
-
-    raise RuntimeError(f"Tat ca Edge-TTS voice deu that bai: {last_error}")
-
-
-async def stream_pcm_to_esp(websocket: WebSocket, pcm: bytes) -> int:
-    total = 0
-    next_deadline = time.monotonic()
-    for i in range(0, len(pcm), TTS_CHUNK_SIZE):
-        chunk = pcm[i:i + TTS_CHUNK_SIZE]
-        if len(chunk) % 2:
-            chunk = chunk[:-1]
-        if not chunk:
-            continue
-        await websocket.send_bytes(chunk)
-        total += len(chunk)
-        next_deadline += len(chunk) / PCM_BYTES_PER_SECOND
-        delay = next_deadline - time.monotonic()
-        if delay > 0:
-            await asyncio.sleep(delay)
-        else:
-            # Server is already behind real-time. Restart the timing origin
-            # rather than accumulating increasing negative drift.
-            next_deadline = time.monotonic()
-    return total
-
-
-# ==============================================================================
-# 3. HTTP
+# 2. GEMINI 3.1 FLASH TTS + EDGE-TTS FALLBACK
+# ==============================================================================\n# Gemini 3.1 Flash TTS is the primary TTS path. It supports streaming audio,\n# so the server can begin sending PCM to the ESP32 while TTS is still generating.\n# The model outputs 24 kHz / 16-bit / mono PCM; ESP32 expects 16 kHz, so we\n# resample to 16 kHz with soxr before sending.\n# Fallback: Edge-TTS Hoai My -> Nam Minh.\nPCM_SAMPLE_RATE = 16000\nTTS_SOURCE_SAMPLE_RATE = 24000\nPCM_CHANNELS = 1\nPCM_BYTES_PER_SAMPLE = 2\nPCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE\nTTS_CHUNK_SIZE = 2048\nTTS_PREBUFFER_MS = max(0, int(os.environ.get("TTS_PREBUFFER_MS", "320")))\nTTS_TIMEOUT_SECONDS = float(os.environ.get("TTS_TIMEOUT_SECONDS", "25"))\nTTS_RETRIES_PER_VOICE = max(1, int(os.environ.get("TTS_RETRIES_PER_VOICE", "2")))\nEDGE_TTS_ENABLED = os.environ.get("EDGE_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}\nEDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "vi-VN-HoaiMyNeural").strip()\nEDGE_TTS_FALLBACK_VOICE = os.environ.get("EDGE_TTS_FALLBACK_VOICE", "vi-VN-NamMinhNeural").strip()\nEDGE_TTS_RATE = os.environ.get("EDGE_TTS_RATE", "+10%").strip()\nGEMINI_TTS_ENABLED = os.environ.get("GEMINI_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}\nGEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview").strip()\nGEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Despina").strip()\nGEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()\nGEMINI_TTS_STYLE = os.environ.get(\n    "GEMINI_TTS_STYLE",\n    "Nói tiếng Việt tự nhiên, rõ ràng, thân thiện nhưng hơi tinh nghịch; tốc độ nhanh vừa phải, không kéo dài từ, không ngắt câu bất thường."\n).strip()\nTTS_CONCURRENCY = 1\n_tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)\n\n\ndef clean_text_for_tts(text: str) -> str:\n    text = re.sub(r"<MEMORY>.*?</MEMORY>", "", text, flags=re.IGNORECASE | re.DOTALL)\n    text = re.sub(r"<REPLY>|</REPLY>", "", text, flags=re.IGNORECASE)\n    text = re.sub(r"[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]", " ", text)\n    return re.sub(r"\\s+", " ", text).strip()\n\n\ndef _extract_tts_audio_bytes(chunk) -> bytes:\n    try:\n        candidates = getattr(chunk, "candidates", None) or []\n        if not candidates:\n            return b""\n        content = getattr(candidates[0], "content", None)\n        parts = getattr(content, "parts", None) if content else None\n        if not parts:\n            return b""\n        for part in parts:\n            inline = getattr(part, "inline_data", None)\n            if inline is not None:\n                data = getattr(inline, "data", None)\n                if isinstance(data, bytes):\n                    return data\n                if isinstance(data, bytearray):\n                    return bytes(data)\n                if isinstance(data, str):\n                    import base64\n                    return base64.b64decode(data)\n    except Exception:\n        pass\n    return b""\n\n\ndef _resample_pcm24_to_16(data: bytes) -> bytes:\n    if not data:\n        return b""\n    import numpy as np\n    import soxr\n    samples = np.frombuffer(data, dtype=np.int16)\n    if samples.size == 0:\n        return b""\n    converted = soxr.resample(samples, TTS_SOURCE_SAMPLE_RATE, PCM_SAMPLE_RATE, quality="QQ")\n    converted = np.clip(converted, -32768, 32767).astype(np.int16)\n    return converted.tobytes()\n\n\nasync def _edge_tts_pcm(text: str, voice: str) -> bytes:\n    import edge_tts\n    import miniaudio\n    communicate = edge_tts.Communicate(text, voice=voice, rate=EDGE_TTS_RATE)\n    audio = bytearray()\n    async for chunk in communicate.stream():\n        if chunk.get("type") == "audio" and chunk.get("data"):\n            audio.extend(chunk["data"])\n    if not audio:\n        raise RuntimeError("Edge-TTS khong tra audio")\n\n    def decode() -> bytes:\n        decoded = miniaudio.decode(bytes(audio), output_format=miniaudio.SampleFormat.S16, nchannels=1, sample_rate=PCM_SAMPLE_RATE)\n        return bytes(decoded.samples)\n\n    pcm = await asyncio.to_thread(decode)\n    if not pcm:\n        raise RuntimeError("Edge-TTS decode rong")\n    return pcm\n\n\nasync def _send_pcm_paced(websocket: WebSocket, pcm: bytes, state: dict) -> int:\n    total = 0\n    if not pcm:\n        return 0\n    state.setdefault("next_deadline", time.monotonic())\n    for i in range(0, len(pcm), TTS_CHUNK_SIZE):\n        chunk = pcm[i:i+TTS_CHUNK_SIZE]\n        if len(chunk) % 2:\n            chunk = chunk[:-1]\n        if not chunk:\n            continue\n        await websocket.send_bytes(chunk)\n        total += len(chunk)\n        state["next_deadline"] += len(chunk) / PCM_BYTES_PER_SECOND\n        delay = state["next_deadline"] - time.monotonic()\n        if delay > 0:\n            await asyncio.sleep(delay)\n        else:\n            state["next_deadline"] = time.monotonic()\n    return total\n\n\nasync def stream_gemini_tts_to_esp(websocket: WebSocket, text: str, key_idx: int) -> tuple[int, int, str]:\n    client = get_genai_client(key_idx)\n    if client is None:\n        raise RuntimeError("Gemini client unavailable")\n\n    started = time.monotonic()\n    first_audio_ms = None\n    total_sent = 0\n    buffered = bytearray()\n    state = {"next_deadline": time.monotonic()}\n\n    prompt = f"{GEMINI_TTS_STYLE}\\nĐọc nguyên văn đúng nội dung sau, không thêm hoặc bớt từ: {text}"\n    stream = await client.aio.models.generate_content_stream(\n        model=GEMINI_TTS_MODEL,\n        contents=prompt,\n        config=types.GenerateContentConfig(\n            response_modalities=["AUDIO"],\n            speech_config=types.SpeechConfig(\n                language_code=GEMINI_TTS_LANGUAGE,\n                voice_config=types.VoiceConfig(\n                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=GEMINI_TTS_VOICE)\n                ),\n            ),\n        ),\n    )\n\n    prebuffer_bytes = int(PCM_BYTES_PER_SECOND * TTS_PREBUFFER_MS / 1000)\n    async for chunk in stream:\n        raw24 = _extract_tts_audio_bytes(chunk)\n        if not raw24:\n            continue\n        pcm16 = await asyncio.to_thread(_resample_pcm24_to_16, raw24)\n        if not pcm16:\n            continue\n        buffered.extend(pcm16)\n        if first_audio_ms is None:\n            first_audio_ms = int((time.monotonic() - started) * 1000)\n        if len(buffered) >= prebuffer_bytes:\n            total_sent += await _send_pcm_paced(websocket, bytes(buffered), state)\n            buffered.clear()\n\n    if buffered:\n        total_sent += await _send_pcm_paced(websocket, bytes(buffered), state)\n\n    if total_sent <= 0:\n        raise RuntimeError("Gemini TTS khong tra audio")\n    elapsed = int((time.monotonic() - started) * 1000)\n    print(\n        f"[TTS] Gemini TTS thanh cong | model={GEMINI_TTS_MODEL} | voice={GEMINI_TTS_VOICE} | "\n        f"first_audio={first_audio_ms} ms | PCM={total_sent} bytes | audio={int(total_sent*1000/PCM_BYTES_PER_SECOND)} ms | total={elapsed} ms",\n        flush=True,\n    )\n    return total_sent, first_audio_ms or elapsed, GEMINI_TTS_VOICE\n\n\nasync def send_edge_fallback_to_esp(websocket: WebSocket, text: str) -> tuple[int, int, str]:\n    if not EDGE_TTS_ENABLED:\n        raise RuntimeError("Gemini TTS loi va Edge-TTS fallback dang tat")\n    voices = [v for v in (EDGE_TTS_VOICE, EDGE_TTS_FALLBACK_VOICE) if v]\n    last = None\n    for voice in dict.fromkeys(voices):\n        for attempt in range(1, TTS_RETRIES_PER_VOICE + 1):\n            started = time.monotonic()\n            try:\n                print(f"[TTS] Edge fallback voice={voice} | lan {attempt}/{TTS_RETRIES_PER_VOICE}", flush=True)\n                pcm = await asyncio.wait_for(_edge_tts_pcm(text, voice), timeout=TTS_TIMEOUT_SECONDS)\n                state={"next_deadline": time.monotonic()}\n                sent = await _send_pcm_paced(websocket, pcm, state)\n                elapsed=int((time.monotonic()-started)*1000)\n                print(f"[TTS] Edge fallback thanh cong | voice={voice} | PCM={sent} bytes | synth={elapsed} ms", flush=True)\n                return sent, elapsed, voice\n            except Exception as exc:\n                last=exc\n                print(f"[EDGE-TTS Error] voice={voice} | lan {attempt}: {str(exc)[:260]}", flush=True)\n                if attempt < TTS_RETRIES_PER_VOICE:\n                    await asyncio.sleep(0.2)\n    raise RuntimeError(f"Tat ca TTS deu that bai: {last}")\n\n\n# 3. HTTP
 # ==============================================================================
 @app.get("/")
 def read_root():
@@ -290,9 +144,10 @@ def read_root():
         "gemini_keys": len(API_KEYS),
         "current_gemini_key": CURRENT_KEY_INDEX + 1 if API_KEYS else None,
         "key_status": key_status_summary(),
-        "tts_provider": "edge-tts",
-        "tts_voice": TTS_VOICE,
-        "tts_fallback_voice": TTS_FALLBACK_VOICE,
+        "tts_provider": "gemini-3.1-flash-tts-preview",
+        "tts_voice": GEMINI_TTS_VOICE if GEMINI_TTS_ENABLED else EDGE_TTS_VOICE,
+        "tts_fallback_voice": EDGE_TTS_VOICE,
+        "tts_streaming": True,
         "tts_output": "PCM16 16kHz mono",
         "gemini_thinking_level": THINKING_LEVEL,
         "memory_turns": MEMORY_TURNS,
@@ -581,17 +436,48 @@ async def websocket_chat(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"event": "tts_start"}))
 
                 tts_started = time.monotonic()
-                pcm, used_voice, tts_ms = await synthesize_tts(cleaned)
-                tts_ready_ms = int((time.monotonic() - tts_started) * 1000)
+                sent = 0
+                used_voice = ""
+                first_audio_ms = None
+                try:
+                    if GEMINI_TTS_ENABLED:
+                        # Use the same sticky Gemini key. A quota/permission failure
+                        # rotates the key and then falls back to Edge-TTS.
+                        key_idx = CURRENT_KEY_INDEX
+                        try:
+                            sent, first_audio_ms, used_voice = await asyncio.wait_for(
+                                stream_gemini_tts_to_esp(websocket, cleaned, key_idx),
+                                timeout=TTS_TIMEOUT_SECONDS + max(5, int(len(cleaned) / 20)),
+                            )
+                        except Exception as tts_exc:
+                            kind = classify_gemini_error(tts_exc)
+                            detail = str(tts_exc).replace("\n", " ")[:240]
+                            print(f"[GEMINI TTS ERROR] Key #{key_idx+1} | {detail}", flush=True)
+                            if kind == "rotate" and key_idx < len(API_KEYS)-1:
+                                mark_key_disabled(key_idx, detail)
+                                nxt = next_active_key_after(key_idx)
+                                if nxt is not None:
+                                    CURRENT_KEY_INDEX = nxt
+                                    print(f"[GEMINI TTS] Chuyen sang Key #{nxt+1}", flush=True)
+                                    sent, first_audio_ms, used_voice = await asyncio.wait_for(
+                                        stream_gemini_tts_to_esp(websocket, cleaned, nxt),
+                                        timeout=TTS_TIMEOUT_SECONDS + max(5, int(len(cleaned) / 20)),
+                                    )
+                            else:
+                                raise
+                    else:
+                        raise RuntimeError("Gemini TTS disabled")
+                except Exception as exc:
+                    print(f"[TTS] Gemini TTS that bai -> Edge-TTS fallback: {str(exc)[:260]}", flush=True)
+                    sent, _, used_voice = await send_edge_fallback_to_esp(websocket, cleaned)
+                    first_audio_ms = int((time.monotonic() - tts_started) * 1000)
+
+                tts_total_ms = int((time.monotonic() - tts_started) * 1000)
                 print(
-                    f"[PERF] TTS ready | voice={used_voice} | first_audio_ready={tts_ready_ms} ms",
+                    f"[PERF] TTS first_audio={first_audio_ms} ms | total={tts_total_ms} ms | voice={used_voice}",
                     flush=True,
                 )
 
-                sent = await stream_pcm_to_esp(websocket, pcm)
-
-                # Chỉ ghi memory sau khi TTS đã synthesize thành công, tránh lưu một
-                # lượt hội thoại bị lỗi. Memory gồm đúng tối thiểu 10 lượt gần nhất.
                 conversation_history.append({
                     "user_memory": user_memory,
                     "assistant_reply": cleaned,
@@ -600,7 +486,7 @@ async def websocket_chat(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"event": "tts_done"}))
                 print(
                     f"[WEBSOCKET] Da gui xong audio | PCM={sent} bytes | "
-                    f"TTS={tts_ms} ms | audio_duration={int(sent * 1000 / PCM_BYTES_PER_SECOND)} ms",
+                    f"TTS_total={tts_total_ms} ms | audio_duration={int(sent * 1000 / PCM_BYTES_PER_SECOND)} ms",
                     flush=True,
                 )
 
