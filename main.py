@@ -52,12 +52,10 @@ NHIỆM VỤ HỘI THOẠI:
 - Phải hiểu lời người dùng hiện tại dựa trên âm thanh hiện tại và lịch sử 10 lượt gần nhất.
 - Phải suy luận ngữ cảnh trước khi trả lời; không trả lời rời rạc theo từng lượt.
 - Khi người dùng nói tiếp về một chủ đề, phải nối đúng chủ đề và thông tin đã nói trước đó.
-- câu nói phải mang tính xây dựng, gợi mở, chứ không được kiểu trả lời đi vào ngõ cụt, gây ra câu chuyện đi vào ngõ cụt.
 - Nếu người dùng hỏi "cái đó", "nó", "thế thì sao", "còn cái kia" hoặc cách nói tương tự, phải dùng lịch sử để xác định đại từ đang ám chỉ điều gì.
 - Không tự bịa ký ức. Chỉ sử dụng những gì có trong lịch sử hoặc nghe được từ âm thanh hiện tại.
 - Nếu thông tin hiện tại chưa đủ để kết luận, hỏi lại đúng phần còn thiếu thay vì đoán.
 - Giữ nhất quán với các câu trả lời trước; nếu trước đó đã nói một điều, không tự mâu thuẫn trừ khi có lý do rõ ràng.
-- giọng điệu phù hợp với từng câu nói(ví dụ vui vẻ thì thêm tiếng cười, buồn bã thêm tiếng thở dài, tức giận giọng đanh đá,...) để tăng cảm xúc.
 
 ĐỊNH DẠNG BẮT BUỘC:
 Trả về đúng hai thẻ, theo đúng thứ tự, không thêm gì bên ngoài:
@@ -66,7 +64,6 @@ Trả về đúng hai thẻ, theo đúng thứ tự, không thêm gì bên ngoà
 
 QUY TẮC TRẢ LỜI:
 - Chỉ phần bên trong REPLY được nói bằng loa.
-- liên kết mạng thời gian thực, tìm kiếm thông tin trên mạng ở nơi uy tín để đưa ra câu trả lời thông minh, logic.
 - REPLY phải tự nhiên như hội thoại đời thường, hoàn chỉnh, không cụt câu.
 - Xưng mày - tao.
 - Thường tối đa 1 đến 2 câu; nếu cần giải thích để hợp logic thì có thể dài hơn một chút nhưng vẫn gọn.
@@ -226,7 +223,7 @@ async def _edge_tts_pcm(text: str, voice: str) -> bytes:
         raise RuntimeError("Edge-TTS khong tra audio")
 
     def decode() -> bytes:
-        decoded = miniaudio.decode(bytes(audio), output_format=miniaudio.SampleFormat.S16, nchannels=1, sample_rate=PCM_SAMPLE_RATE)
+        decoded = miniaudio.decode(bytes(audio), output_format=miniaudio.SampleFormat.SIGNED16, nchannels=1, sample_rate=PCM_SAMPLE_RATE)
         return bytes(decoded.samples)
 
     pcm = await asyncio.to_thread(decode)
@@ -580,6 +577,7 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> t
 # ==============================================================================
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
+    global CURRENT_KEY_INDEX
     await websocket.accept()
     print("\n[WEBSOCKET] ESP32 da ket noi.", flush=True)
     pcm_buffer = bytearray()
