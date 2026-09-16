@@ -160,7 +160,7 @@ GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Zephyr").strip()
 GEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()
 GEMINI_TTS_STYLE = os.environ.get(
     "GEMINI_TTS_STYLE",
-    "Nói tiếng Việt tự nhiên, đọc với giọng điệu đanh đá. giọng con gái miền Bắc việt nam, chất giọng trẻ con hài hước, tốc độ nhanh vừa phải, chất giọng cá tính."
+    "Nói tiếng Việt tự nhiên, đọc với giọng điệu đanh đá. giọng con gái miền Bắc việt nam, chất giọng bé con hài hước, tốc độ nhanh vừa phải"
 ).strip()
 TTS_CONCURRENCY = 1
 _tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
