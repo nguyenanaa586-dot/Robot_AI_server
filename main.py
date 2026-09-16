@@ -160,7 +160,7 @@ GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Zephyr").strip()
 GEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()
 GEMINI_TTS_STYLE = os.environ.get(
     "GEMINI_TTS_STYLE",
-    "hơi mang âm hưởng tổng hợp và điện tử, tông giọng sáng và trẻ trung, phụ âm rõ nét, cao độ được kiểm soát, rất ít tiếng hơi, âm thanh gọn gàng, phát âm chuẩn xác, tốc độ hơi nhanh hơn so với giọng nói tự nhiên của con người, tự tin nhưng thân thiện, phảng phất nét cơ khí tinh tế, tránh nghe giống phát thanh viên thông thường, tránh biểu đạt cảm xúc thái quá."
+    "nói giọng nữ miền Bắc Việt Nam, hơi mang âm hưởng tổng hợp và điện tử, tông giọng sáng, giọng trẻ con, phụ âm rõ nét, cao độ được kiểm soát, rất ít tiếng hơi, âm thanh gọn gàng, phát âm chuẩn xác, tốc độ hơi nhanh hơn so với giọng nói tự nhiên của con người, tự tin nhưng thân thiện, phảng phất nét cơ khí tinh tế, tránh nghe giống phát thanh viên thông thường, tránh biểu đạt cảm xúc thái quá."
 ).strip()
 TTS_CONCURRENCY = 1
 _tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
