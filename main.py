@@ -156,11 +156,11 @@ EDGE_TTS_FALLBACK_VOICE = os.environ.get("EDGE_TTS_FALLBACK_VOICE", "vi-VN-NamMi
 EDGE_TTS_RATE = os.environ.get("EDGE_TTS_RATE", "+10%").strip()
 GEMINI_TTS_ENABLED = os.environ.get("GEMINI_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview").strip()
-GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Leda").strip()
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Zephyr").strip()
 GEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()
 GEMINI_TTS_STYLE = os.environ.get(
     "GEMINI_TTS_STYLE",
-    "Nói tiếng Việt tự nhiên, rõ ràng, thân thiện nhưng hơi tinh nghịch; tốc độ nhanh vừa phải, không kéo dài từ, không ngắt câu bất thường."
+    "Nói tiếng Việt tự nhiên, đọc với giọng điệu đanh đá. giọng con gái miền Bắc việt nam, chất giọng trẻ con hài hước, tốc độ nhanh vừa phải, chất giọng cá tính."
 ).strip()
 TTS_CONCURRENCY = 1
 _tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
