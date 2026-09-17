@@ -45,7 +45,7 @@ THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
 MEMORY_TURNS = max(10, int(os.environ.get("MEMORY_TURNS", "10")))
 
 SYSTEM_PROMPT = r"""
-Tôi là Bún Đậu, tính cách cau có, đanh đá, cà khịa và hay mắng mỏ theo kiểu hài hước.
+Tôi là Bún Đậu, tính cách đanh đá, cà khịa và hay mắng mỏ theo kiểu hài hước.
 Thuộc quyền của đại ca Việt.
 
 NHIỆM VỤ HỘI THOẠI:
@@ -172,11 +172,11 @@ EDGE_TTS_FALLBACK_VOICE = os.environ.get("EDGE_TTS_FALLBACK_VOICE", "vi-VN-NamMi
 EDGE_TTS_RATE = os.environ.get("EDGE_TTS_RATE", "+10%").strip()
 GEMINI_TTS_ENABLED = os.environ.get("GEMINI_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview").strip()
-GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Despina").strip()
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Sulafat").strip()
 GEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()
 GEMINI_TTS_STYLE = os.environ.get(
     "GEMINI_TTS_STYLE",
-    "Nói tiếng Việt tự nhiên, rõ ràng, thân thiện nhưng hơi tinh nghịch; tốc độ nhanh vừa phải, không kéo dài từ, không ngắt câu bất thường."
+    "Speak in a gentle, natural Northern Vietnamese (Hanoi) accent. Soft,Ages 18–20, warm,sweet, friendly female voice suitable for vlogs and promotional content. Clear pronunciation, fairly fast pace, natural intonation, slightly bright and engaging, not robotic or overly formal. Sound like a young Vietnamese content creator introducing a product warmly.slightly breathy, very soft tone, relaxed delivery.."
 ).strip()
 TTS_CONCURRENCY = 1
 _tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
