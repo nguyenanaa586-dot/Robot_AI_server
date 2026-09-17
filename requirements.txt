@@ -4,6 +4,6 @@ websockets==15.0.1
 google-genai==2.23.0
 edge-tts==7.2.8
 miniaudio==1.61
-httpx==0.28.1
 numpy==2.3.2
 soxr==0.5.0.post1
+httpx==0.28.1

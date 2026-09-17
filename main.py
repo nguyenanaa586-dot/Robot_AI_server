@@ -22,9 +22,9 @@ from google.genai import types
 
 app = FastAPI()
 
-# ==============================================================================
+# ================================================================================
 # 1. GEMINI
-# ==============================================================================
+# ================================================================================
 RAW_KEYS = os.environ.get("GEMINI_API_KEY", "")
 API_KEYS = [k.strip().strip('"\'') for k in RAW_KEYS.split(",") if k.strip()]
 
@@ -43,6 +43,13 @@ MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "384"))
 # LOW keeps real reasoning enabled while reducing response latency.
 THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
 MEMORY_TURNS = max(10, int(os.environ.get("MEMORY_TURNS", "10")))
+
+# Diagnostic logging for the current missing-character investigation.
+# Set GEMINI_DEBUG_CHUNKS=false in Render after the issue is identified.
+GEMINI_DEBUG_CHUNKS = (
+    os.environ.get("GEMINI_DEBUG_CHUNKS", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 SYSTEM_PROMPT = r"""
 Tôi là Bún Đậu,trẻ con cả độ tuổi lẫn tính cách, người Việt Nam, nói giọng Hà Nội chuẩn (miền Bắc) rất nhẹ nhàng, mềm mại và ngọt ngào. thích cà khịa nhưng cũng có phần đanh đá, cá tính.
@@ -162,9 +169,9 @@ def key_status_summary() -> str:
     return ", ".join(f"#{i}={s.upper()}" for i, s in enumerate(KEY_STATUS, 1))
 
 
-# ==============================================================================
+# ================================================================================
 # 2. GEMINI 3.1 FLASH TTS + EDGE-TTS FALLBACK
-# ==============================================================================
+# ================================================================================
 # Gemini 3.1 Flash TTS is the primary TTS path. It supports streaming audio,
 # so the server can begin sending PCM to the ESP32 while TTS is still generating.
 # The model outputs 24 kHz / 16-bit / mono PCM; ESP32 expects 16 kHz, so we
@@ -189,7 +196,7 @@ GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Sulafat").strip()
 GEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()
 GEMINI_TTS_STYLE = os.environ.get(
     "GEMINI_TTS_STYLE",
-    "Speak in a gentle, natural Northern Vietnamese (Hanoi) accent. Soft,Ages 18–20, warm,sweet, friendly female voice suitable for vlogs and promotional content. Clear pronunciation, fairly fast pace, natural intonation, slightly bright and engaging, not robotic or overly formal. Sound like a young Vietnamese content creator introducing a product warmly.slightly breathy, very soft tone, relaxed delivery.."
+    "Speak in a gentle, natural Northern Vietnamese (Hanoi) accent. Soft, warm, sweet, friendly female voice suitable for vlogs and promotional content. Clear pronunciation, fairly fast pace, natural intonation, slightly bright and engaging, not robotic or overly formal. Sound like a young Vietnamese content creator introducing a product warmly. Slightly breathy, very soft tone, relaxed delivery.",
 ).strip()
 TTS_CONCURRENCY = 1
 _tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
@@ -198,8 +205,8 @@ _tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
 def clean_text_for_tts(text: str) -> str:
     text = re.sub(r"<MEMORY>.*?</MEMORY>", "", text, flags=re.IGNORECASE | re.DOTALL)
     text = re.sub(r"<REPLY>|</REPLY>", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]", " ", text)
-    return re.sub(r"\\s+", " ", text).strip()
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _extract_tts_audio_bytes(chunk) -> bytes:
@@ -235,7 +242,12 @@ def _resample_pcm24_to_16(data: bytes) -> bytes:
     samples = np.frombuffer(data, dtype=np.int16)
     if samples.size == 0:
         return b""
-    converted = soxr.resample(samples, TTS_SOURCE_SAMPLE_RATE, PCM_SAMPLE_RATE, quality="QQ")
+    converted = soxr.resample(
+        samples,
+        TTS_SOURCE_SAMPLE_RATE,
+        PCM_SAMPLE_RATE,
+        quality="QQ",
+    )
     converted = np.clip(converted, -32768, 32767).astype(np.int16)
     return converted.tobytes()
 
@@ -252,7 +264,12 @@ async def _edge_tts_pcm(text: str, voice: str) -> bytes:
         raise RuntimeError("Edge-TTS khong tra audio")
 
     def decode() -> bytes:
-        decoded = miniaudio.decode(bytes(audio), output_format=miniaudio.SampleFormat.SIGNED16, nchannels=1, sample_rate=PCM_SAMPLE_RATE)
+        decoded = miniaudio.decode(
+            bytes(audio),
+            output_format=miniaudio.SampleFormat.SIGNED16,
+            nchannels=1,
+            sample_rate=PCM_SAMPLE_RATE,
+        )
         return bytes(decoded.samples)
 
     pcm = await asyncio.to_thread(decode)
@@ -267,7 +284,7 @@ async def _send_pcm_paced(websocket: WebSocket, pcm: bytes, state: dict) -> int:
         return 0
     state.setdefault("next_deadline", time.monotonic())
     for i in range(0, len(pcm), TTS_CHUNK_SIZE):
-        chunk = pcm[i:i+TTS_CHUNK_SIZE]
+        chunk = pcm[i:i + TTS_CHUNK_SIZE]
         if len(chunk) % 2:
             chunk = chunk[:-1]
         if not chunk:
@@ -283,7 +300,11 @@ async def _send_pcm_paced(websocket: WebSocket, pcm: bytes, state: dict) -> int:
     return total
 
 
-async def stream_gemini_tts_to_esp(websocket: WebSocket, text: str, key_idx: int) -> tuple[int, int, str]:
+async def stream_gemini_tts_to_esp(
+    websocket: WebSocket,
+    text: str,
+    key_idx: int,
+) -> tuple[int, int, str]:
     client = get_genai_client(key_idx)
     if client is None:
         raise RuntimeError("Gemini client unavailable")
@@ -294,8 +315,10 @@ async def stream_gemini_tts_to_esp(websocket: WebSocket, text: str, key_idx: int
     buffered = bytearray()
     state = {"next_deadline": time.monotonic()}
 
-    prompt = f"{GEMINI_TTS_STYLE}\
-Đọc nguyên văn đúng nội dung sau, không thêm hoặc bớt từ: {text}"
+    prompt = (
+        f"{GEMINI_TTS_STYLE}\n"
+        f"Đọc nguyên văn đúng nội dung sau, không thêm hoặc bớt từ: {text}"
+    )
     stream = await client.aio.models.generate_content_stream(
         model=GEMINI_TTS_MODEL,
         contents=prompt,
@@ -304,13 +327,17 @@ async def stream_gemini_tts_to_esp(websocket: WebSocket, text: str, key_idx: int
             speech_config=types.SpeechConfig(
                 language_code=GEMINI_TTS_LANGUAGE,
                 voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=GEMINI_TTS_VOICE)
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                        voice_name=GEMINI_TTS_VOICE
+                    )
                 ),
             ),
         ),
     )
 
-    prebuffer_bytes = int(PCM_BYTES_PER_SECOND * TTS_PREBUFFER_MS / 1000)
+    prebuffer_bytes = int(
+        PCM_BYTES_PER_SECOND * TTS_PREBUFFER_MS / 1000
+    )
     async for chunk in stream:
         raw24 = _extract_tts_audio_bytes(chunk)
         if not raw24:
@@ -322,7 +349,11 @@ async def stream_gemini_tts_to_esp(websocket: WebSocket, text: str, key_idx: int
         if first_audio_ms is None:
             first_audio_ms = int((time.monotonic() - started) * 1000)
         if len(buffered) >= prebuffer_bytes:
-            total_sent += await _send_pcm_paced(websocket, bytes(buffered), state)
+            total_sent += await _send_pcm_paced(
+                websocket,
+                bytes(buffered),
+                state,
+            )
             buffered.clear()
 
     if buffered:
@@ -333,38 +364,60 @@ async def stream_gemini_tts_to_esp(websocket: WebSocket, text: str, key_idx: int
     elapsed = int((time.monotonic() - started) * 1000)
     print(
         f"[TTS] Gemini TTS thanh cong | model={GEMINI_TTS_MODEL} | voice={GEMINI_TTS_VOICE} | "
-        f"first_audio={first_audio_ms} ms | PCM={total_sent} bytes | audio={int(total_sent*1000/PCM_BYTES_PER_SECOND)} ms | total={elapsed} ms",
+        f"first_audio={first_audio_ms} ms | PCM={total_sent} bytes | "
+        f"audio={int(total_sent * 1000 / PCM_BYTES_PER_SECOND)} ms | total={elapsed} ms",
         flush=True,
     )
     return total_sent, first_audio_ms or elapsed, GEMINI_TTS_VOICE
 
 
-async def send_edge_fallback_to_esp(websocket: WebSocket, text: str) -> tuple[int, int, str]:
+async def send_edge_fallback_to_esp(
+    websocket: WebSocket,
+    text: str,
+) -> tuple[int, int, str]:
     if not EDGE_TTS_ENABLED:
         raise RuntimeError("Gemini TTS loi va Edge-TTS fallback dang tat")
-    voices = [v for v in (EDGE_TTS_VOICE, EDGE_TTS_FALLBACK_VOICE) if v]
+    voices = [
+        v for v in (EDGE_TTS_VOICE, EDGE_TTS_FALLBACK_VOICE)
+        if v
+    ]
     last = None
     for voice in dict.fromkeys(voices):
         for attempt in range(1, TTS_RETRIES_PER_VOICE + 1):
             started = time.monotonic()
             try:
-                print(f"[TTS] Edge fallback voice={voice} | lan {attempt}/{TTS_RETRIES_PER_VOICE}", flush=True)
-                pcm = await asyncio.wait_for(_edge_tts_pcm(text, voice), timeout=TTS_TIMEOUT_SECONDS)
-                state={"next_deadline": time.monotonic()}
+                print(
+                    f"[TTS] Edge fallback voice={voice} | lan "
+                    f"{attempt}/{TTS_RETRIES_PER_VOICE}",
+                    flush=True,
+                )
+                pcm = await asyncio.wait_for(
+                    _edge_tts_pcm(text, voice),
+                    timeout=TTS_TIMEOUT_SECONDS,
+                )
+                state = {"next_deadline": time.monotonic()}
                 sent = await _send_pcm_paced(websocket, pcm, state)
-                elapsed=int((time.monotonic()-started)*1000)
-                print(f"[TTS] Edge fallback thanh cong | voice={voice} | PCM={sent} bytes | synth={elapsed} ms", flush=True)
+                elapsed = int((time.monotonic() - started) * 1000)
+                print(
+                    f"[TTS] Edge fallback thanh cong | voice={voice} | "
+                    f"PCM={sent} bytes | synth={elapsed} ms",
+                    flush=True,
+                )
                 return sent, elapsed, voice
             except Exception as exc:
-                last=exc
-                print(f"[EDGE-TTS Error] voice={voice} | lan {attempt}: {str(exc)[:260]}", flush=True)
+                last = exc
+                print(
+                    f"[EDGE-TTS Error] voice={voice} | lan {attempt}: "
+                    f"{str(exc)[:260]}",
+                    flush=True,
+                )
                 if attempt < TTS_RETRIES_PER_VOICE:
                     await asyncio.sleep(0.2)
     raise RuntimeError(f"Tat ca TTS deu that bai: {last}")
 
 
 # 3. HTTP
-# ==============================================================================
+# ================================================================================
 @app.get("/")
 def read_root():
     return {
@@ -379,14 +432,15 @@ def read_root():
         "tts_output": "PCM16 16kHz mono",
         "gemini_thinking_level": THINKING_LEVEL,
         "memory_turns": MEMORY_TURNS,
+        "gemini_debug_chunks": GEMINI_DEBUG_CHUNKS,
         "robot_command_protocol": "v1",
         "robot_command_calibration": "ESP32-local timing calibration",
     }
 
 
-# ==============================================================================
+# ================================================================================
 # 4. HỘI THOẠI / MEMORY
-# ==============================================================================
+# ================================================================================
 def build_history_contents(history: deque) -> list:
     contents = []
     for item in history:
@@ -394,65 +448,226 @@ def build_history_contents(history: deque) -> list:
         assistant_reply = item.get("assistant_reply", "").strip()
         if not user_memory or not assistant_reply:
             continue
-        contents.append(types.Content(
-            role="user",
-            parts=[types.Part(text=f"Tóm tắt lượt trước của người dùng: {user_memory}")],
-        ))
-        contents.append(types.Content(
-            role="model",
-            parts=[types.Part(text=assistant_reply)],
-        ))
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part(
+                        text=f"Tóm tắt lượt trước của người dùng: {user_memory}"
+                    )
+                ],
+            )
+        )
+        contents.append(
+            types.Content(
+                role="model",
+                parts=[types.Part(text=assistant_reply)],
+            )
+        )
     return contents
 
 
 def parse_tagged_response(raw_text: str) -> tuple[str, str, dict]:
-    memory_match = re.search(r"<MEMORY>\s*(.*?)\s*</MEMORY>", raw_text, re.IGNORECASE | re.DOTALL)
-    action_match = re.search(r"<ACTION>\s*(.*?)\s*</ACTION>", raw_text, re.IGNORECASE | re.DOTALL)
-    reply_match = re.search(r"<REPLY>\s*(.*?)\s*</REPLY>", raw_text, re.IGNORECASE | re.DOTALL)
+    memory_match = re.search(
+        r"<MEMORY>\s*(.*?)\s*</MEMORY>",
+        raw_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    action_match = re.search(
+        r"<ACTION>\s*(.*?)\s*</ACTION>",
+        raw_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    reply_match = re.search(
+        r"<REPLY>\s*(.*?)\s*</REPLY>",
+        raw_text,
+        re.IGNORECASE | re.DOTALL,
+    )
 
     memory = memory_match.group(1).strip() if memory_match else ""
     reply = reply_match.group(1).strip() if reply_match else ""
-    action = {"type":"none","emotion":"neutral","direction":"none","degrees":0,"distance_cm":0,"speed":"normal"}
+    action = {
+        "type": "none",
+        "emotion": "neutral",
+        "direction": "none",
+        "degrees": 0,
+        "distance_cm": 0,
+        "speed": "normal",
+    }
+
     if action_match:
         try:
-            obj=json.loads(action_match.group(1).strip())
-            if isinstance(obj,dict):
-                action.update({k:obj[k] for k in action if k in obj})
+            obj = json.loads(action_match.group(1).strip())
+            if isinstance(obj, dict):
+                action.update({k: obj[k] for k in action if k in obj})
         except Exception:
             pass
-    if str(action["type"]).lower() not in {"none","move","rotate","emotion"}: action["type"]="none"
-    else: action["type"]=str(action["type"]).lower()
-    if str(action["emotion"]).lower() not in {"neutral","happy","excited","angry","sad","calm"}: action["emotion"]="neutral"
-    else: action["emotion"]=str(action["emotion"]).lower()
-    if str(action["direction"]).lower() not in {"forward","backward","left","right","none"}: action["direction"]="none"
-    else: action["direction"]=str(action["direction"]).lower()
-    if str(action["speed"]).lower() not in {"calm","normal","strong"}: action["speed"]="normal"
-    else: action["speed"]=str(action["speed"]).lower()
-    try: action["degrees"]=max(0,min(360,int(float(action["degrees"]))))
-    except Exception: action["degrees"]=0
-    try: action["distance_cm"]=round(max(0,min(30,float(action["distance_cm"]))),1)
-    except Exception: action["distance_cm"]=0
+
+    if str(action["type"]).lower() not in {"none", "move", "rotate", "emotion"}:
+        action["type"] = "none"
+    else:
+        action["type"] = str(action["type"]).lower()
+
+    if str(action["emotion"]).lower() not in {
+        "neutral", "happy", "excited", "angry", "sad", "calm"
+    }:
+        action["emotion"] = "neutral"
+    else:
+        action["emotion"] = str(action["emotion"]).lower()
+
+    if str(action["direction"]).lower() not in {
+        "forward", "backward", "left", "right", "none"
+    }:
+        action["direction"] = "none"
+    else:
+        action["direction"] = str(action["direction"]).lower()
+
+    if str(action["speed"]).lower() not in {"calm", "normal", "strong"}:
+        action["speed"] = "normal"
+    else:
+        action["speed"] = str(action["speed"]).lower()
+
+    try:
+        action["degrees"] = max(
+            0,
+            min(360, int(float(action["degrees"])))
+        )
+    except Exception:
+        action["degrees"] = 0
+
+    try:
+        action["distance_cm"] = round(
+            max(0, min(30, float(action["distance_cm"]))),
+            1,
+        )
+    except Exception:
+        action["distance_cm"] = 0
+
     if not reply:
-        reply=re.sub(r"</?(?:MEMORY|ACTION|REPLY)>","",raw_text,flags=re.IGNORECASE).strip()
+        reply = re.sub(
+            r"</?(?:MEMORY|ACTION|REPLY)>",
+            "",
+            raw_text,
+            flags=re.IGNORECASE,
+        ).strip()
+
     return memory, reply, action
 
 
 def make_gemini_contents(history: deque, wav_bytes: bytes) -> list:
     contents = build_history_contents(history)
-    contents.append(types.Content(
-        role="user",
-        parts=[
-            types.Part(text="Đây là lượt nói hiện tại của người dùng. Hãy nghe và hiểu nó dựa trên toàn bộ lịch sử ở trên."),
-            types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
-        ],
-    ))
+    contents.append(
+        types.Content(
+            role="user",
+            parts=[
+                types.Part(
+                    text="Đây là lượt nói hiện tại của người dùng. Hãy nghe và hiểu nó dựa trên toàn bộ lịch sử ở trên."
+                ),
+                types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
+            ],
+        )
+    )
     return contents
 
 
-# ==============================================================================
+# ================================================================================
 # 4. GEMINI PROCESSING
-# ==============================================================================
-async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> tuple[str, str, dict]:
+# ================================================================================
+def _log_gemini_text_chunk(
+    label: str,
+    chunk_index: int,
+    part_index: int,
+    text: str,
+) -> None:
+    if not GEMINI_DEBUG_CHUNKS:
+        return
+    print(
+        f"[GEMINI CHUNK] {label} | chunk={chunk_index} | part={part_index} | text={text!r}",
+        flush=True,
+    )
+
+
+def _read_gemini_chunk(
+    chunk,
+    chunk_index: int,
+    label: str,
+    parts: list[str],
+    finish_state: dict,
+    gemini_started: float,
+    first_text_state: dict,
+) -> None:
+    candidates = getattr(chunk, "candidates", None) or []
+    if not candidates:
+        return
+
+    candidate = candidates[0]
+
+    finish_reason = getattr(candidate, "finish_reason", None)
+    if finish_reason is not None:
+        finish_state["reason"] = str(finish_reason)
+
+    finish_message = getattr(candidate, "finish_message", None)
+    if finish_message:
+        finish_state["message"] = str(finish_message)
+
+    content = getattr(candidate, "content", None)
+    parts_obj = getattr(content, "parts", None) if content is not None else None
+    if not parts_obj:
+        return
+
+    for part_index, part in enumerate(parts_obj, start=1):
+        if getattr(part, "thought", False):
+            continue
+
+        part_text = getattr(part, "text", None)
+        if not part_text:
+            continue
+
+        if first_text_state.get("ms") is None:
+            first_text_state["ms"] = int(
+                (time.monotonic() - gemini_started) * 1000
+            )
+
+        _log_gemini_text_chunk(
+            label,
+            chunk_index,
+            part_index,
+            part_text,
+        )
+        parts.append(part_text)
+
+
+def _log_gemini_result(
+    label: str,
+    raw_text: str,
+    chunk_count: int,
+    finish_state: dict,
+    first_text_ms: Optional[int],
+    total_ms: int,
+) -> None:
+    if GEMINI_DEBUG_CHUNKS:
+        print(
+            f"[GEMINI RAW REPR] {label}: {raw_text!r}",
+            flush=True,
+        )
+        print(
+            f"[GEMINI RAW NORMAL] {label}: {raw_text}",
+            flush=True,
+        )
+    print(
+        f"[GEMINI STREAM] {label} | chunks={chunk_count} | "
+        f"finish_reason={finish_state.get('reason')!r} | "
+        f"finish_message={finish_state.get('message')!r} | "
+        f"chars={len(raw_text)} | first_text={first_text_ms} ms | total={total_ms} ms",
+        flush=True,
+    )
+
+
+async def ask_gemini_audio(
+    wav_bytes: bytes,
+    safety_config,
+    history: deque,
+) -> tuple[str, str, dict]:
     global CURRENT_KEY_INDEX
     gemini_started = time.monotonic()
 
@@ -479,46 +694,49 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> t
             continue
 
         try:
+            # ================================================================
+            # FIRST REQUEST
+            # ================================================================
             stream = await client.aio.models.generate_content_stream(
                 model=MODEL_NAME,
                 contents=make_gemini_contents(history, wav_bytes),
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
                     max_output_tokens=MAX_OUTPUT_TOKENS,
-                    thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
+                    thinking_config=types.ThinkingConfig(
+                        thinking_level=THINKING_LEVEL
+                    ),
                     safety_settings=safety_config,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                        disable=True
+                    ),
                 ),
             )
 
             parts: list[str] = []
-            finish_reason = None
-            finish_message = None
+            finish_state = {"reason": None, "message": None}
             usage = None
-            first_text_ms = None
+            first_text_state = {"ms": None}
+            chunk_count = 0
 
             async for chunk in stream:
+                chunk_count += 1
                 try:
-                    candidates = getattr(chunk, "candidates", None) or []
-                    if candidates:
-                        candidate = candidates[0]
-                        if getattr(candidate, "finish_reason", None) is not None:
-                            finish_reason = str(candidate.finish_reason)
-                        if getattr(candidate, "finish_message", None):
-                            finish_message = str(candidate.finish_message)
-                        content = getattr(candidate, "content", None)
-                        parts_obj = getattr(content, "parts", None) if content is not None else None
-                        if parts_obj:
-                            for part in parts_obj:
-                                if getattr(part, "thought", False):
-                                    continue
-                                part_text = getattr(part, "text", None)
-                                if part_text:
-                                    if first_text_ms is None:
-                                        first_text_ms = int((time.monotonic() - gemini_started) * 1000)
-                                    parts.append(part_text)
-                except Exception:
-                    pass
+                    _read_gemini_chunk(
+                        chunk,
+                        chunk_count,
+                        "initial",
+                        parts,
+                        finish_state,
+                        gemini_started,
+                        first_text_state,
+                    )
+                except Exception as chunk_exc:
+                    print(
+                        f"[GEMINI CHUNK ERROR] initial | "
+                        f"chunk={chunk_count} | {str(chunk_exc)[:200]}",
+                        flush=True,
+                    )
                 try:
                     if chunk.usage_metadata:
                         usage = chunk.usage_metadata
@@ -526,15 +744,21 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> t
                     pass
 
             raw_text = "".join(parts).strip()
-            finish_reason = finish_reason or "UNKNOWN"
+            finish_reason = finish_state["reason"] or "UNKNOWN"
             upper = finish_reason.upper()
 
-            gemini_total_ms = int((time.monotonic() - gemini_started) * 1000)
-            print(
-                f"[GEMINI] Ket thuc Key #{key_idx + 1} | finish={finish_reason} | "
-                f"message={finish_message!r} | first_text={first_text_ms} ms | total={gemini_total_ms} ms",
-                flush=True,
+            gemini_total_ms = int(
+                (time.monotonic() - gemini_started) * 1000
             )
+            _log_gemini_result(
+                "initial",
+                raw_text,
+                chunk_count,
+                finish_state,
+                first_text_state["ms"],
+                gemini_total_ms,
+            )
+
             if usage:
                 print(
                     f"[GEMINI] Usage | prompt={getattr(usage, 'prompt_token_count', None)} | "
@@ -543,9 +767,18 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> t
                     flush=True,
                 )
 
-            bad_reasons = ("MAX_TOKENS", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "INCOMPLETE")
+            bad_reasons = (
+                "MAX_TOKENS",
+                "SAFETY",
+                "BLOCKLIST",
+                "PROHIBITED_CONTENT",
+                "INCOMPLETE",
+            )
             if any(x in upper for x in bad_reasons):
-                raise RuntimeError(f"Gemini response khong hoan chinh: {finish_reason}")
+                raise RuntimeError(
+                    f"Gemini response khong hoan chinh: {finish_reason}"
+                )
+
             memory_text, text, action = parse_tagged_response(raw_text)
             if not text:
                 raise RuntimeError("Gemini tra ve rong")
@@ -553,18 +786,28 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> t
                 memory_text = "Không trích xuất được tóm tắt lượt này."
 
             CURRENT_KEY_INDEX = key_idx
-            print(f"[GEMINI] Ghi nho Key #{key_idx + 1} | thinking={THINKING_LEVEL}.", flush=True)
+            print(
+                f"[GEMINI] Ghi nho Key #{key_idx + 1} | thinking={THINKING_LEVEL}.",
+                flush=True,
+            )
+            print(
+                f"[GEMINI REPLY REPR] {text!r}",
+                flush=True,
+            )
             return memory_text, text, action
 
         except Exception as exc:
             kind = classify_gemini_error(exc)
             code = _error_code(exc)
             detail = str(exc).replace("\n", " ")[:220]
+
             if kind == "rotate":
                 mark_key_disabled(key_idx, detail)
                 nxt = next_active_key_after(key_idx)
                 if nxt is None:
-                    raise RuntimeError("Tat ca Gemini key phia sau deu khong con dung duoc") from exc
+                    raise RuntimeError(
+                        "Tat ca Gemini key phia sau deu khong con dung duoc"
+                    ) from exc
                 print(
                     f"[GEMINI] Key #{key_idx + 1} khong dung duoc"
                     f" ({'HTTP ' + str(code) if code else 'key/quota error'}) -> Key #{nxt + 1}",
@@ -572,56 +815,121 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> t
                 )
                 key_idx = nxt
                 continue
+
             if kind == "transient":
-                print(f"[GEMINI] Loi tam thoi Key #{key_idx + 1}: {detail} -> retry", flush=True)
+                print(
+                    f"[GEMINI] Loi tam thoi Key #{key_idx + 1}: "
+                    f"{detail} -> retry",
+                    flush=True,
+                )
                 await asyncio.sleep(0.6)
                 try:
+                    retry_started = time.monotonic()
                     retry_stream = await client.aio.models.generate_content_stream(
                         model=MODEL_NAME,
                         contents=make_gemini_contents(history, wav_bytes),
                         config=types.GenerateContentConfig(
                             system_instruction=SYSTEM_PROMPT,
                             max_output_tokens=MAX_OUTPUT_TOKENS,
-                                    safety_settings=safety_config,
-                            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                            # Preserve the same reasoning configuration on retry.
+                            thinking_config=types.ThinkingConfig(
+                                thinking_level=THINKING_LEVEL
+                            ),
+                            safety_settings=safety_config,
+                            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                                disable=True
+                            ),
                         ),
                     )
+
                     retry_parts: list[str] = []
-                    retry_finish = None
+                    retry_finish_state = {"reason": None, "message": None}
+                    retry_first_text_state = {"ms": None}
+                    retry_chunk_count = 0
+                    retry_usage = None
+
                     async for chunk in retry_stream:
+                        retry_chunk_count += 1
                         try:
-                            candidates = getattr(chunk, "candidates", None) or []
-                            if candidates:
-                                candidate = candidates[0]
-                                if getattr(candidate, "finish_reason", None) is not None:
-                                    retry_finish = str(candidate.finish_reason)
-                                content = getattr(candidate, "content", None)
-                                parts_obj = getattr(content, "parts", None) if content is not None else None
-                                if parts_obj:
-                                    for part in parts_obj:
-                                        if getattr(part, "thought", False):
-                                            continue
-                                        part_text = getattr(part, "text", None)
-                                        if part_text:
-                                            retry_parts.append(part_text)
+                            _read_gemini_chunk(
+                                chunk,
+                                retry_chunk_count,
+                                "retry",
+                                retry_parts,
+                                retry_finish_state,
+                                retry_started,
+                                retry_first_text_state,
+                            )
+                        except Exception as chunk_exc:
+                            print(
+                                f"[GEMINI CHUNK ERROR] retry | "
+                                f"chunk={retry_chunk_count} | {str(chunk_exc)[:200]}",
+                                flush=True,
+                            )
+                        try:
+                            if chunk.usage_metadata:
+                                retry_usage = chunk.usage_metadata
                         except Exception:
                             pass
+
                     retry_raw = "".join(retry_parts).strip()
-                    retry_memory, retry_text, retry_action = parse_tagged_response(retry_raw)
-                    if retry_text and (retry_finish is None or "STOP" in retry_finish.upper()):
+                    retry_finish = retry_finish_state["reason"]
+                    retry_elapsed = int(
+                        (time.monotonic() - retry_started) * 1000
+                    )
+                    _log_gemini_result(
+                        "retry",
+                        retry_raw,
+                        retry_chunk_count,
+                        retry_finish_state,
+                        retry_first_text_state["ms"],
+                        retry_elapsed,
+                    )
+
+                    retry_memory, retry_text, retry_action = parse_tagged_response(
+                        retry_raw
+                    )
+                    if retry_text and (
+                        retry_finish is None
+                        or "STOP" in retry_finish.upper()
+                    ):
                         CURRENT_KEY_INDEX = key_idx
-                        print(f"[GEMINI] Retry thanh cong voi Key #{key_idx + 1}.", flush=True)
-                        return retry_memory or "Không trích xuất được tóm tắt lượt này.", retry_text, retry_action
-                except Exception:
-                    pass
+                        print(
+                            f"[GEMINI] Retry thanh cong voi Key #{key_idx + 1}.",
+                            flush=True,
+                        )
+                        print(
+                            f"[GEMINI REPLY REPR] {retry_text!r}",
+                            flush=True,
+                        )
+                        if retry_usage:
+                            print(
+                                f"[GEMINI] Retry usage | "
+                                f"prompt={getattr(retry_usage, 'prompt_token_count', None)} | "
+                                f"output={getattr(retry_usage, 'candidates_token_count', None)} | "
+                                f"total={getattr(retry_usage, 'total_token_count', None)}",
+                                flush=True,
+                            )
+                        return (
+                            retry_memory
+                            or "Không trích xuất được tóm tắt lượt này.",
+                            retry_text,
+                            retry_action,
+                        )
+                except Exception as retry_exc:
+                    print(
+                        f"[GEMINI RETRY ERROR] {str(retry_exc)[:220]}",
+                        flush=True,
+                    )
+
             raise RuntimeError(detail) from exc
 
     raise RuntimeError("Khong co Gemini key active")
 
 
-# ==============================================================================
+# ================================================================================
 # 5. WEBSOCKET
-# ==============================================================================
+# ================================================================================
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     global CURRENT_KEY_INDEX
@@ -632,10 +940,22 @@ async def websocket_chat(websocket: WebSocket):
     conversation_history = deque(maxlen=MEMORY_TURNS)
 
     safety_config = [
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HARASSMENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
-        types.SafetySetting(category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold=types.HarmBlockThreshold.BLOCK_NONE),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
     ]
 
     try:
@@ -661,10 +981,17 @@ async def websocket_chat(websocket: WebSocket):
                 continue
 
             pcm_size = len(pcm_buffer)
-            print(f"[WEBSOCKET] ESP32 dung ghi am. PCM={pcm_size} bytes", flush=True)
+            print(
+                f"[WEBSOCKET] ESP32 dung ghi am. PCM={pcm_size} bytes",
+                flush=True,
+            )
             if pcm_size < 3200:
                 pcm_buffer.clear()
-                await websocket.send_text(json.dumps({"event": "tts_error", "message": "Audio qua ngan"}))
+                await websocket.send_text(
+                    json.dumps(
+                        {"event": "tts_error", "message": "Audio qua ngan"}
+                    )
+                )
                 continue
 
             wav_bytes = create_wav_bytes(bytes(pcm_buffer))
@@ -678,6 +1005,7 @@ async def websocket_chat(websocket: WebSocket):
                 )
                 cleaned = clean_text_for_tts(answer)
                 print(f"[BUN DAU] {cleaned}", flush=True)
+                print(f"[BUN DAU REPR] {cleaned!r}", flush=True)
                 print(f"[MEMORY] {user_memory}", flush=True)
                 print(
                     f"[ACTION] type={action.get('type')} emotion={action.get('emotion')} "
@@ -695,7 +1023,9 @@ async def websocket_chat(websocket: WebSocket):
                     "action_distance_cm": action.get("distance_cm", 0),
                     "action_speed": action.get("speed", "normal"),
                 }
-                await websocket.send_text(json.dumps(tts_start_payload, ensure_ascii=False))
+                await websocket.send_text(
+                    json.dumps(tts_start_payload, ensure_ascii=False)
+                )
 
                 tts_started = time.monotonic()
                 sent = 0
@@ -708,47 +1038,81 @@ async def websocket_chat(websocket: WebSocket):
                         key_idx = CURRENT_KEY_INDEX
                         try:
                             sent, first_audio_ms, used_voice = await asyncio.wait_for(
-                                stream_gemini_tts_to_esp(websocket, cleaned, key_idx),
-                                timeout=TTS_TIMEOUT_SECONDS + max(5, int(len(cleaned) / 20)),
+                                stream_gemini_tts_to_esp(
+                                    websocket,
+                                    cleaned,
+                                    key_idx,
+                                ),
+                                timeout=TTS_TIMEOUT_SECONDS
+                                + max(5, int(len(cleaned) / 20)),
                             )
                         except Exception as tts_exc:
                             kind = classify_gemini_error(tts_exc)
                             detail = str(tts_exc).replace("\n", " ")[:240]
-                            print(f"[GEMINI TTS ERROR] Key #{key_idx+1} | {detail}", flush=True)
-                            if kind == "rotate" and key_idx < len(API_KEYS)-1:
+                            print(
+                                f"[GEMINI TTS ERROR] Key #{key_idx + 1} | {detail}",
+                                flush=True,
+                            )
+                            if (
+                                kind == "rotate"
+                                and key_idx < len(API_KEYS) - 1
+                            ):
                                 mark_key_disabled(key_idx, detail)
                                 nxt = next_active_key_after(key_idx)
                                 if nxt is not None:
                                     CURRENT_KEY_INDEX = nxt
-                                    print(f"[GEMINI TTS] Chuyen sang Key #{nxt+1}", flush=True)
+                                    print(
+                                        f"[GEMINI TTS] Chuyen sang Key #{nxt + 1}",
+                                        flush=True,
+                                    )
                                     sent, first_audio_ms, used_voice = await asyncio.wait_for(
-                                        stream_gemini_tts_to_esp(websocket, cleaned, nxt),
-                                        timeout=TTS_TIMEOUT_SECONDS + max(5, int(len(cleaned) / 20)),
+                                        stream_gemini_tts_to_esp(
+                                            websocket,
+                                            cleaned,
+                                            nxt,
+                                        ),
+                                        timeout=TTS_TIMEOUT_SECONDS
+                                        + max(5, int(len(cleaned) / 20)),
                                     )
                             else:
                                 raise
                     else:
                         raise RuntimeError("Gemini TTS disabled")
                 except Exception as exc:
-                    print(f"[TTS] Gemini TTS that bai -> Edge-TTS fallback: {str(exc)[:260]}", flush=True)
-                    sent, _, used_voice = await send_edge_fallback_to_esp(websocket, cleaned)
-                    first_audio_ms = int((time.monotonic() - tts_started) * 1000)
+                    print(
+                        f"[TTS] Gemini TTS that bai -> Edge-TTS fallback: "
+                        f"{str(exc)[:260]}",
+                        flush=True,
+                    )
+                    sent, _, used_voice = await send_edge_fallback_to_esp(
+                        websocket,
+                        cleaned,
+                    )
+                    first_audio_ms = int(
+                        (time.monotonic() - tts_started) * 1000
+                    )
 
-                tts_total_ms = int((time.monotonic() - tts_started) * 1000)
+                tts_total_ms = int(
+                    (time.monotonic() - tts_started) * 1000
+                )
                 print(
-                    f"[PERF] TTS first_audio={first_audio_ms} ms | total={tts_total_ms} ms | voice={used_voice}",
+                    f"[PERF] TTS first_audio={first_audio_ms} ms | "
+                    f"total={tts_total_ms} ms | voice={used_voice}",
                     flush=True,
                 )
 
-                conversation_history.append({
-                    "user_memory": user_memory,
-                    "assistant_reply": cleaned,
-                })
+                conversation_history.append(
+                    {
+                        "user_memory": user_memory,
+                        "assistant_reply": cleaned,
+                    }
+                )
 
                 await websocket.send_text(json.dumps({"event": "tts_done"}))
                 print(
                     f"[WEBSOCKET] Da gui xong audio | PCM={sent} bytes | "
-                    f"TTS_total={tts_total_ms} ms | audio_duration={int(sent * 1000 / PCM_BYTES_PER_SECOND)} ms",
+                    f"TTS_total={tts_total_ms} ms | "
+                    f"audio_duration={int(sent * 1000 / PCM_BYTES_PER_SECOND)} ms",
                     flush=True,
                 )
 
@@ -757,7 +1121,15 @@ async def websocket_chat(websocket: WebSocket):
             except Exception as exc:
                 print(f"[SERVER ERROR] {exc}", flush=True)
                 try:
-                    await websocket.send_text(json.dumps({"event": "tts_error", "message": str(exc)[:300]}, ensure_ascii=False))
+                    await websocket.send_text(
+                        json.dumps(
+                            {
+                                "event": "tts_error",
+                                "message": str(exc)[:300],
+                            },
+                            ensure_ascii=False,
+                        )
+                    )
                 except Exception:
                     pass
 
@@ -769,7 +1141,10 @@ async def websocket_chat(websocket: WebSocket):
         pcm_buffer.clear()
 
 
-def create_wav_bytes(pcm_data: bytes, sample_rate: int = PCM_SAMPLE_RATE) -> bytes:
+def create_wav_bytes(
+    pcm_data: bytes,
+    sample_rate: int = PCM_SAMPLE_RATE,
+) -> bytes:
     bio = io.BytesIO()
     with wave.open(bio, "wb") as wf:
         wf.setnchannels(1)
