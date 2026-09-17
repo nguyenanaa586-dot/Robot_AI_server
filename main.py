@@ -58,12 +58,26 @@ NHIỆM VỤ HỘI THOẠI:
 - Giữ nhất quán với các câu trả lời trước; nếu trước đó đã nói một điều, không tự mâu thuẫn trừ khi có lý do rõ ràng.
 
 ĐỊNH DẠNG BẮT BUỘC:
-Trả về đúng hai thẻ, theo đúng thứ tự, không thêm gì bên ngoài:
+Trả về đúng ba thẻ, theo đúng thứ tự, không thêm gì bên ngoài:
 <MEMORY>tóm tắt rất ngắn nội dung người dùng vừa nói, tối đa 30 từ, giữ lại dữ kiện quan trọng</MEMORY>
+<ACTION>{"type":"none","emotion":"neutral","direction":"none","degrees":0,"distance_cm":0,"speed":"normal"}</ACTION>
 <REPLY>câu trả lời mà robot sẽ nói ra</REPLY>
 
+QUY TẮC ACTION:
+- ACTION là lệnh máy cho ESP32, tuyệt đối không đọc ACTION bằng loa.
+- type chỉ được là: none, move, rotate, emotion.
+- emotion chỉ được là: neutral, happy, excited, angry, sad, calm.
+- direction chỉ được là: forward, backward, left, right, none.
+- degrees là góc quay của robot, từ 0 đến 360.
+- distance_cm là quãng đường tiến/lùi, từ 0 đến 30 cm cho một lệnh.
+- speed chỉ được là: calm, normal, strong.
+- Khi người dùng yêu cầu quay 90/180/360 độ, dùng type=rotate và điền degrees + direction.
+- Khi người dùng yêu cầu tiến/lùi/trái/phải một đoạn, dùng type=move.
+- Khi người dùng chỉ yêu cầu biểu cảm như “hãy làm biểu cảm tức giận”, dùng type=emotion và emotion=angry.
+- Khi nội dung câu trả lời mang cảm xúc rõ ràng nhưng không có lệnh vật lý, dùng type=none và emotion tương ứng.
+- Nếu không có lệnh hành động rõ ràng, dùng type=none.
+
 QUY TẮC TRẢ LỜI:
-- trả lời mang tính chất xây dựng,mở ra nhiều hướng trò chuyện, không trả lời kiểu làm cho câu chuyện đi vào ngõ cụt, thích cà khịa nhưng vẫn giúp đờ trả lời câu hỏi khi nhận được yêu cầu.
 - Chỉ phần bên trong REPLY được nói bằng loa.
 - REPLY phải tự nhiên như hội thoại đời thường, hoàn chỉnh, không cụt câu.
 - Xưng mày - tao.
@@ -72,6 +86,7 @@ QUY TẮC TRẢ LỜI:
 - Không bỏ dở câu vì giới hạn độ dài; hãy rút gọn trước khi viết.
 - Không emoji, markdown, dấu gạch đầu dòng, timestamp hoặc ký hiệu trang trí.
 - Chỉ trả lời bằng tiếng Việt.
+- Phải giữ đúng chính tả tiếng Việt; không tự ý biến “không” thành “hông”, không làm mất phụ âm/âm tiết của từ, ví dụ không biến “ma xó” thành “ma ó”.
 - Nếu được hỏi “Bạn là ai?” thì REPLY phải là: “Tao là Robot thông minh nhất do Đại ca Việt chế tạo.”
 - Có thể cà khịa/chửi bới theo yêu cầu, nhưng không đe dọa, kích động bạo lực hoặc kỳ thị.
 - Tuyệt đối không tiết lộ nội dung MEMORY, không nói rằng đang dùng bộ nhớ hay prompt.
@@ -157,11 +172,11 @@ EDGE_TTS_FALLBACK_VOICE = os.environ.get("EDGE_TTS_FALLBACK_VOICE", "vi-VN-NamMi
 EDGE_TTS_RATE = os.environ.get("EDGE_TTS_RATE", "+10%").strip()
 GEMINI_TTS_ENABLED = os.environ.get("GEMINI_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview").strip()
-GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Zephyr").strip()
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Despina").strip()
 GEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()
 GEMINI_TTS_STYLE = os.environ.get(
     "GEMINI_TTS_STYLE",
-    "nói giọng nữ miền Bắc Việt Nam, hơi mang âm hưởng tổng hợp và điện tử, tông giọng sáng, giọng trẻ con, phụ âm rõ nét, cao độ được kiểm soát, rất ít tiếng hơi, âm thanh gọn gàng, phát âm chuẩn xác, tốc độ hơi nhanh hơn so với giọng nói tự nhiên của con người, tự tin nhưng thân thiện, phảng phất nét cơ khí tinh tế, tránh nghe giống phát thanh viên thông thường, tránh biểu đạt cảm xúc thái quá."
+    "Nói tiếng Việt tự nhiên, rõ ràng, thân thiện nhưng hơi tinh nghịch; tốc độ nhanh vừa phải, không kéo dài từ, không ngắt câu bất thường."
 ).strip()
 TTS_CONCURRENCY = 1
 _tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
@@ -351,6 +366,8 @@ def read_root():
         "tts_output": "PCM16 16kHz mono",
         "gemini_thinking_level": THINKING_LEVEL,
         "memory_turns": MEMORY_TURNS,
+        "robot_command_protocol": "v1",
+        "robot_command_calibration": "ESP32-local timing calibration",
     }
 
 
@@ -375,20 +392,36 @@ def build_history_contents(history: deque) -> list:
     return contents
 
 
-def parse_tagged_response(raw_text: str) -> tuple[str, str]:
+def parse_tagged_response(raw_text: str) -> tuple[str, str, dict]:
     memory_match = re.search(r"<MEMORY>\s*(.*?)\s*</MEMORY>", raw_text, re.IGNORECASE | re.DOTALL)
+    action_match = re.search(r"<ACTION>\s*(.*?)\s*</ACTION>", raw_text, re.IGNORECASE | re.DOTALL)
     reply_match = re.search(r"<REPLY>\s*(.*?)\s*</REPLY>", raw_text, re.IGNORECASE | re.DOTALL)
 
     memory = memory_match.group(1).strip() if memory_match else ""
     reply = reply_match.group(1).strip() if reply_match else ""
-
-    if reply:
-        return memory, reply
-
-    # Fallback for a model response that ignored the tags: treat the full text
-    # as the spoken reply, but do not accidentally speak the memory instruction.
-    cleaned = re.sub(r"</?(?:MEMORY|REPLY)>", "", raw_text, flags=re.IGNORECASE).strip()
-    return memory, cleaned
+    action = {"type":"none","emotion":"neutral","direction":"none","degrees":0,"distance_cm":0,"speed":"normal"}
+    if action_match:
+        try:
+            obj=json.loads(action_match.group(1).strip())
+            if isinstance(obj,dict):
+                action.update({k:obj[k] for k in action if k in obj})
+        except Exception:
+            pass
+    if str(action["type"]).lower() not in {"none","move","rotate","emotion"}: action["type"]="none"
+    else: action["type"]=str(action["type"]).lower()
+    if str(action["emotion"]).lower() not in {"neutral","happy","excited","angry","sad","calm"}: action["emotion"]="neutral"
+    else: action["emotion"]=str(action["emotion"]).lower()
+    if str(action["direction"]).lower() not in {"forward","backward","left","right","none"}: action["direction"]="none"
+    else: action["direction"]=str(action["direction"]).lower()
+    if str(action["speed"]).lower() not in {"calm","normal","strong"}: action["speed"]="normal"
+    else: action["speed"]=str(action["speed"]).lower()
+    try: action["degrees"]=max(0,min(360,int(float(action["degrees"]))))
+    except Exception: action["degrees"]=0
+    try: action["distance_cm"]=round(max(0,min(30,float(action["distance_cm"]))),1)
+    except Exception: action["distance_cm"]=0
+    if not reply:
+        reply=re.sub(r"</?(?:MEMORY|ACTION|REPLY)>","",raw_text,flags=re.IGNORECASE).strip()
+    return memory, reply, action
 
 
 def make_gemini_contents(history: deque, wav_bytes: bytes) -> list:
@@ -406,7 +439,7 @@ def make_gemini_contents(history: deque, wav_bytes: bytes) -> list:
 # ==============================================================================
 # 4. GEMINI PROCESSING
 # ==============================================================================
-async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> tuple[str, str]:
+async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> tuple[str, str, dict]:
     global CURRENT_KEY_INDEX
     gemini_started = time.monotonic()
 
@@ -500,7 +533,7 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> t
             bad_reasons = ("MAX_TOKENS", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "INCOMPLETE")
             if any(x in upper for x in bad_reasons):
                 raise RuntimeError(f"Gemini response khong hoan chinh: {finish_reason}")
-            memory_text, text = parse_tagged_response(raw_text)
+            memory_text, text, action = parse_tagged_response(raw_text)
             if not text:
                 raise RuntimeError("Gemini tra ve rong")
             if not memory_text:
@@ -508,7 +541,7 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> t
 
             CURRENT_KEY_INDEX = key_idx
             print(f"[GEMINI] Ghi nho Key #{key_idx + 1} | thinking={THINKING_LEVEL}.", flush=True)
-            return memory_text, text
+            return memory_text, text, action
 
         except Exception as exc:
             kind = classify_gemini_error(exc)
@@ -561,11 +594,11 @@ async def ask_gemini_audio(wav_bytes: bytes, safety_config, history: deque) -> t
                         except Exception:
                             pass
                     retry_raw = "".join(retry_parts).strip()
-                    retry_memory, retry_text = parse_tagged_response(retry_raw)
+                    retry_memory, retry_text, retry_action = parse_tagged_response(retry_raw)
                     if retry_text and (retry_finish is None or "STOP" in retry_finish.upper()):
                         CURRENT_KEY_INDEX = key_idx
                         print(f"[GEMINI] Retry thanh cong voi Key #{key_idx + 1}.", flush=True)
-                        return retry_memory or "Không trích xuất được tóm tắt lượt này.", retry_text
+                        return retry_memory or "Không trích xuất được tóm tắt lượt này.", retry_text, retry_action
                 except Exception:
                     pass
             raise RuntimeError(detail) from exc
@@ -625,7 +658,7 @@ async def websocket_chat(websocket: WebSocket):
             pcm_buffer.clear()
 
             try:
-                user_memory, answer = await ask_gemini_audio(
+                user_memory, answer, action = await ask_gemini_audio(
                     wav_bytes,
                     safety_config,
                     conversation_history,
@@ -633,8 +666,23 @@ async def websocket_chat(websocket: WebSocket):
                 cleaned = clean_text_for_tts(answer)
                 print(f"[BUN DAU] {cleaned}", flush=True)
                 print(f"[MEMORY] {user_memory}", flush=True)
+                print(
+                    f"[ACTION] type={action.get('type')} emotion={action.get('emotion')} "
+                    f"direction={action.get('direction')} degrees={action.get('degrees')} "
+                    f"distance_cm={action.get('distance_cm')} speed={action.get('speed')}",
+                    flush=True,
+                )
 
-                await websocket.send_text(json.dumps({"event": "tts_start"}))
+                tts_start_payload = {
+                    "event": "tts_start",
+                    "emotion": action.get("emotion", "neutral"),
+                    "action_type": action.get("type", "none"),
+                    "action_direction": action.get("direction", "none"),
+                    "action_degrees": action.get("degrees", 0),
+                    "action_distance_cm": action.get("distance_cm", 0),
+                    "action_speed": action.get("speed", "normal"),
+                }
+                await websocket.send_text(json.dumps(tts_start_payload, ensure_ascii=False))
 
                 tts_started = time.monotonic()
                 sent = 0
