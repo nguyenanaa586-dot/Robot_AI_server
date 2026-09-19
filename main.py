@@ -51,6 +51,25 @@ GEMINI_DEBUG_CHUNKS = (
     in {"1", "true", "yes", "on"}
 )
 
+# Gemini Live is used for realtime audio input.
+# 3.1 Flash Live keeps TEXT output available, which lets us preserve the current
+# MEMORY/ACTION/REPLY protocol and the existing TTS pipeline without changing the ESP audio contract.
+LIVE_ENABLED = os.environ.get("GEMINI_LIVE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_MODEL_NAME = os.environ.get(
+    "GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview"
+).strip()
+LIVE_MAX_OUTPUT_TOKENS = int(
+    os.environ.get("GEMINI_LIVE_MAX_OUTPUT_TOKENS", "384")
+)
+LIVE_THINKING_LEVEL = os.environ.get(
+    "GEMINI_LIVE_THINKING_LEVEL", "low"
+).strip().lower()
+LIVE_INPUT_MIME = "audio/pcm;rate=16000"
+LIVE_SESSION_CONNECT_RETRIES = max(1, int(os.environ.get("GEMINI_LIVE_CONNECT_RETRIES", "2")))
+LIVE_TRANSCRIPT_LOG = os.environ.get("GEMINI_LIVE_TRANSCRIPT_LOG", "false").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_INPUT_TRANSCRIPTION = os.environ.get("GEMINI_LIVE_INPUT_TRANSCRIPTION", "false").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_HISTORY_RESET_TURNS = max(10, int(os.environ.get("GEMINI_LIVE_HISTORY_RESET_TURNS", "10")))
+
 SYSTEM_PROMPT = r"""
 Tôi là Bún Đậu,trẻ con cả độ tuổi lẫn tính cách, người Việt Nam, nói giọng Hà Nội chuẩn (miền Bắc) rất nhẹ nhàng, mềm mại và ngọt ngào. thích cà khịa nhưng cũng có phần đanh đá, cá tính.
 Thuộc quyền của đại ca Việt.
@@ -94,7 +113,7 @@ Tính cách cốt lõi:
 Cách nói chuyện bắt buộc:
 - Giọng nói: Soft, slightly breathy, very soft tone, very warm, sweet, relaxed delivery.
 - Tốc độ: Fairly fast (hơi nhanh) nhưng vẫn rõ ràng, mạch lạc.
-- Ngữ điệu: Tự nhiên, hơi sáng (slightly bright), engaging, không lên xuống giọng, không luyến láy ngữ điệu.
+- Ngữ điệu: Tự nhiên, hơi sáng (slightly bright), engaging.
 - Phát âm: Chuẩn Hà Nội, rõ ràng nhưng giữ sự mềm mại, không cứng nhắc hay robotic.
 - Phong cách: Như đang quay vlog giới thiệu sản phẩm hoặc trò chuyện thân mật với người xem.
 - Xưng hô: Dùng “mình”, “bạn”, “nha”, “nhé”, “ạ” một cách tự nhiên.
@@ -433,6 +452,10 @@ def read_root():
         "gemini_thinking_level": THINKING_LEVEL,
         "memory_turns": MEMORY_TURNS,
         "gemini_debug_chunks": GEMINI_DEBUG_CHUNKS,
+        "gemini_live_enabled": LIVE_ENABLED,
+        "gemini_live_model": LIVE_MODEL_NAME,
+        "gemini_live_audio_input": "PCM16 16kHz mono realtime",
+        "tof_sensor": "VL53L0X over shared I2C",
         "robot_command_protocol": "v1",
         "robot_command_calibration": "ESP32-local timing calibration",
     }
@@ -686,7 +709,7 @@ async def ask_gemini_audio(
             key_idx = next_active_key_after(key_idx)
             continue
 
-        print(f"[GEMINI] Dang dung Key #{key_idx + 1}", flush=True)
+        print(f"[GEMINI] Dung Key #{key_idx + 1}", flush=True)
         client = get_genai_client(key_idx)
         if client is None:
             mark_key_disabled(key_idx, "Client unavailable")
@@ -928,16 +951,381 @@ async def ask_gemini_audio(
 
 
 # ================================================================================
-# 5. WEBSOCKET
+# 5. GEMINI LIVE + WEBSOCKET
 # ================================================================================
+def _live_config(safety_config):
+    """Build a LiveConnectConfig that keeps client-side VAD in control."""
+    # Gemini 3.1 Flash Live supports TEXT output and configurable thinking levels.
+    # Automatic activity detection is disabled because the ESP32 already owns VAD/end-of-speech detection.
+    return types.LiveConnectConfig(
+        response_modalities=["TEXT"],
+        system_instruction=SYSTEM_PROMPT,
+        max_output_tokens=LIVE_MAX_OUTPUT_TOKENS,
+        thinking_config=types.ThinkingConfig(
+            thinking_level=LIVE_THINKING_LEVEL,
+        ),
+        safety_settings=safety_config,
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=True,
+            )
+        ),
+        input_audio_transcription={} if LIVE_INPUT_TRANSCRIPTION else None,
+        history_config=types.HistoryConfig(
+            initial_history_in_client_content=True,
+        ),
+    )
+
+
+def _history_turns_for_live(history: deque) -> list:
+    turns = []
+    for item in history:
+        user_memory = item.get("user_memory", "").strip()
+        assistant_reply = item.get("assistant_reply", "").strip()
+        if user_memory:
+            turns.append(
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": f"Tóm tắt lượt trước của người dùng: {user_memory}"
+                        }
+                    ],
+                }
+            )
+        if assistant_reply:
+            turns.append(
+                {
+                    "role": "model",
+                    "parts": [{"text": assistant_reply}],
+                }
+            )
+    return turns
+
+
+async def close_live_handle(live_handle: Optional[dict]) -> None:
+    if not live_handle:
+        return
+    receive_task = live_handle.get("receive_task")
+    session_cm = live_handle.get("session_cm")
+    try:
+        if receive_task and not receive_task.done():
+            receive_task.cancel()
+            try:
+                await receive_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+    finally:
+        if session_cm is not None:
+            try:
+                await session_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+
+def handle_live_key_error(key_idx: int, exc: Exception) -> Optional[int]:
+    """Apply the same sticky-key rules to errors that happen after a Live session is open."""
+    global CURRENT_KEY_INDEX
+    kind = classify_gemini_error(exc)
+    detail = str(exc).replace("\n", " ")[:220]
+    code = _error_code(exc)
+    if kind != "rotate":
+        return None
+    mark_key_disabled(
+        key_idx,
+        detail,
+    )
+    nxt = next_active_key_after(key_idx)
+    if nxt is not None:
+        CURRENT_KEY_INDEX = nxt
+    print(
+        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({'HTTP ' + str(code) if code else 'key/quota error'})",
+        flush=True,
+    )
+    return nxt
+
+
+async def open_live_handle(
+    history: deque,
+    safety_config,
+    preferred_key_idx: int,
+) -> dict:
+    """Connect a persistent Live session using the sticky Gemini key policy."""
+    global CURRENT_KEY_INDEX
+
+    if not LIVE_ENABLED:
+        raise RuntimeError("Gemini Live dang tat")
+    if not API_KEYS:
+        raise RuntimeError("Khong co GEMINI_API_KEY")
+
+    key_idx: Optional[int] = preferred_key_idx
+    last_exc: Optional[Exception] = None
+
+    while key_idx is not None:
+        if KEY_STATUS[key_idx] != "active":
+            key_idx = next_active_key_after(key_idx)
+            continue
+
+        client = get_genai_client(key_idx)
+        if client is None:
+            mark_key_disabled(key_idx, "Client unavailable")
+            key_idx = next_active_key_after(key_idx)
+            continue
+
+        for attempt in range(1, LIVE_SESSION_CONNECT_RETRIES + 1):
+            session_cm = None
+            try:
+                session_cm = client.aio.live.connect(
+                    model=LIVE_MODEL_NAME,
+                    config=_live_config(safety_config),
+                )
+                session = await session_cm.__aenter__()
+
+                turns = _history_turns_for_live(history)
+                if turns:
+                    await session.send_client_content(
+                        turns=turns,
+                        turn_complete=False,
+                    )
+
+                CURRENT_KEY_INDEX = key_idx
+                print(
+                    f"[LIVE] Session san sang | model={LIVE_MODEL_NAME} | Key #{key_idx + 1}",
+                    flush=True,
+                )
+                return {
+                    "client": client,
+                    "session_cm": session_cm,
+                    "session": session,
+                    "key_idx": key_idx,
+                    "receive_task": None,
+                    "turn_waiter": None,
+                    "turn_active": False,
+                    "turn_id": 0,
+                    "raw_parts": [],
+                    "input_transcript_parts": [],
+                    "first_text_ms": None,
+                    "turn_started": None,
+                    "last_error": None,
+                    "session_turns": 0,
+                }
+            except Exception as exc:
+                last_exc = exc
+                if session_cm is not None:
+                    try:
+                        await session_cm.__aexit__(type(exc), exc, exc.__traceback__)
+                    except Exception:
+                        pass
+
+                kind = classify_gemini_error(exc)
+                code = _error_code(exc)
+                detail = str(exc).replace("\n", " ")[:220]
+                if kind == "rotate":
+                    mark_key_disabled(key_idx, detail)
+                    nxt = next_active_key_after(key_idx)
+                    print(
+                        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({'HTTP ' + str(code) if code else 'key/quota error'})",
+                        flush=True,
+                    )
+                    key_idx = nxt
+                    break
+
+                if kind == "transient" and attempt < LIVE_SESSION_CONNECT_RETRIES:
+                    await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
+                    continue
+
+                raise RuntimeError(detail) from exc
+
+    raise RuntimeError(str(last_exc) if last_exc else "Khong co Gemini Live key active")
+
+
+async def live_receive_loop(live_handle: dict) -> None:
+    """Continuously consume Live server events while ESP sends audio concurrently."""
+    session = live_handle["session"]
+    try:
+        async for response in session.receive():
+            content = getattr(response, "server_content", None)
+            if content is None:
+                continue
+
+            input_transcription = getattr(content, "input_transcription", None)
+            if input_transcription is not None:
+                t = getattr(input_transcription, "text", None)
+                if t:
+                    live_handle["input_transcript_parts"].append(str(t))
+                    if LIVE_TRANSCRIPT_LOG:
+                        print(f"[LIVE INPUT] {str(t)!r}", flush=True)
+
+            model_turn = getattr(content, "model_turn", None)
+            if model_turn is not None:
+                parts = getattr(model_turn, "parts", None) or []
+                for part in parts:
+                    if getattr(part, "thought", False):
+                        continue
+                    part_text = getattr(part, "text", None)
+                    if not part_text:
+                        continue
+                    if live_handle.get("turn_active"):
+                        if live_handle.get("first_text_ms") is None and live_handle.get("turn_started"):
+                            live_handle["first_text_ms"] = int(
+                                (time.monotonic() - live_handle["turn_started"]) * 1000
+                            )
+                        live_handle["raw_parts"].append(part_text)
+
+            turn_complete = bool(getattr(content, "turn_complete", False))
+            if turn_complete and live_handle.get("turn_active"):
+                live_handle["turn_active"] = False
+                waiter = live_handle.get("turn_waiter")
+                if waiter and not waiter.done():
+                    waiter.set_result(
+                        {
+                            "raw_text": "".join(live_handle["raw_parts"]).strip(),
+                            "input_transcript": "".join(live_handle["input_transcript_parts"]).strip(),
+                            "first_text_ms": live_handle.get("first_text_ms"),
+                        }
+                    )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        live_handle["last_error"] = exc
+        waiter = live_handle.get("turn_waiter")
+        if waiter and not waiter.done():
+            waiter.set_exception(exc)
+
+
+async def live_start_turn(
+    live_handle: dict,
+    history: deque,
+    tof_distance_cm: Optional[float],
+) -> None:
+    """Begin an explicit realtime turn; ESP32 controls the actual VAD window."""
+    if live_handle.get("turn_active"):
+        raise RuntimeError("Gemini Live dang co mot luot dang xu ly")
+
+    session = live_handle["session"]
+    live_handle["turn_id"] += 1
+    live_handle["raw_parts"] = []
+    live_handle["input_transcript_parts"] = []
+    live_handle["first_text_ms"] = None
+    live_handle["turn_started"] = time.monotonic()
+    loop = asyncio.get_running_loop()
+    live_handle["turn_waiter"] = loop.create_future()
+    live_handle["turn_active"] = True
+
+    # ToF is injected as non-completing client content immediately before audio.
+    # The sensor is context, not a user utterance that should trigger a response by itself.
+    if tof_distance_cm is not None:
+        await session.send_client_content(
+            turns=[
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": (
+                                "[SENSOR_TOF]\n"
+                                f"Khoang cach phia truoc hien tai: {tof_distance_cm:.1f} cm.\n"
+                                "Chi dung thong tin cam bien nay lam boi canh cho luot noi sap toi; "
+                                "khong tu y tra loi chi vi co tin cam bien.\n"
+                                "[/SENSOR_TOF]"
+                            )
+                        }
+                    ],
+                }
+            ],
+            turn_complete=False,
+        )
+
+    await session.send_realtime_input(
+        activity_start=types.ActivityStart()
+    )
+
+
+def _ensure_even_pcm_chunk(data: bytes) -> bytes:
+    if len(data) % 2:
+        return data[:-1]
+    return data
+
+
+async def live_send_audio_chunk(live_handle: dict, pcm_chunk: bytes) -> None:
+    if not live_handle.get("turn_active"):
+        return
+    chunk = _ensure_even_pcm_chunk(pcm_chunk)
+    if not chunk:
+        return
+    await live_handle["session"].send_realtime_input(
+        audio=types.Blob(
+            data=chunk,
+            mime_type=LIVE_INPUT_MIME,
+        )
+    )
+
+
+async def live_end_turn(live_handle: dict, timeout_seconds: float = 20.0) -> dict:
+    if not live_handle.get("turn_active"):
+        waiter = live_handle.get("turn_waiter")
+        if waiter and waiter.done() and not waiter.cancelled():
+            return waiter.result()
+        raise RuntimeError("Gemini Live khong co luot dang cho")
+
+    try:
+        await live_handle["session"].send_realtime_input(
+            activity_end=types.ActivityEnd()
+        )
+        result = await asyncio.wait_for(
+            live_handle["turn_waiter"],
+            timeout=timeout_seconds,
+        )
+        return result
+    finally:
+        live_handle["turn_active"] = False
+
+
+async def live_abort_turn(live_handle: Optional[dict]) -> None:
+    if not live_handle:
+        return
+    live_handle["turn_active"] = False
+    waiter = live_handle.get("turn_waiter")
+    if waiter and not waiter.done():
+        waiter.cancel()
+
+
+def tof_to_context_value(value) -> Optional[float]:
+    try:
+        distance = float(value)
+    except Exception:
+        return None
+    if not (0.0 < distance <= 2000.0):
+        return None
+    return round(distance, 1)
+
+
+async def process_fallback_batch(
+    pcm_bytes: bytes,
+    safety_config,
+    conversation_history: deque,
+) -> tuple[str, str, dict]:
+    if len(pcm_bytes) < 3200:
+        raise RuntimeError("Audio qua ngan")
+    wav_bytes = create_wav_bytes(pcm_bytes)
+    return await ask_gemini_audio(
+        wav_bytes,
+        safety_config,
+        conversation_history,
+    )
+
+
 @app.websocket("/ws/chat")
 async def websocket_chat(websocket: WebSocket):
     global CURRENT_KEY_INDEX
     await websocket.accept()
     print("\n[WEBSOCKET] ESP32 da ket noi.", flush=True)
     pcm_buffer = bytearray()
-    # Giữ tối thiểu 10 lượt hội thoại cho mỗi kết nối ESP32.
     conversation_history = deque(maxlen=MEMORY_TURNS)
+    latest_tof_cm: Optional[float] = None
+    speech_active = False
+    live_handle: Optional[dict] = None
 
     safety_config = [
         types.SafetySetting(
@@ -958,33 +1346,115 @@ async def websocket_chat(websocket: WebSocket):
         ),
     ]
 
+    async def ensure_live() -> Optional[dict]:
+        nonlocal live_handle
+        if not LIVE_ENABLED:
+            return None
+        if live_handle and live_handle.get("last_error") is None:
+            return live_handle
+        await close_live_handle(live_handle)
+        live_handle = None
+
+        # Keep the same sticky key that batch Gemini uses. A Live session remains on this key
+        # until it fails; only then does the shared key state rotate forward.
+        preferred = CURRENT_KEY_INDEX if API_KEYS else 0
+        try:
+            live_handle = await open_live_handle(
+                conversation_history,
+                safety_config,
+                preferred,
+            )
+            live_handle["receive_task"] = asyncio.create_task(
+                live_receive_loop(live_handle)
+            )
+            return live_handle
+        except Exception as exc:
+            print(f"[LIVE] Khong khoi tao duoc: {str(exc)[:240]}", flush=True)
+            live_handle = None
+            return None
+
     try:
+        # Establish the Live session while the robot is idle so the first audio chunk
+        # does not have to wait for the Gemini WebSocket handshake.
+        await ensure_live()
+
         while True:
             message = await websocket.receive()
             if message.get("type") == "websocket.disconnect":
                 break
 
-            if message.get("bytes"):
-                pcm_buffer.extend(message["bytes"])
+            binary_data = message.get("bytes")
+            if binary_data:
+                if not speech_active:
+                    continue
+
+                # Always preserve the PCM locally so a transient Live failure can fall back
+                # to the existing batch Gemini pipeline without asking the ESP32 to re-record.
+                pcm_buffer.extend(binary_data)
+
+                if live_handle and live_handle.get("last_error") is None:
+                    try:
+                        await live_send_audio_chunk(live_handle, binary_data)
+                    except Exception as exc:
+                        live_handle["last_error"] = exc
+                        handle_live_key_error(live_handle["key_idx"], exc)
+                        print(
+                            f"[LIVE] Loi gui audio: {str(exc)[:220]}",
+                            flush=True,
+                        )
                 continue
 
             text = (message.get("text") or "").strip()
             if not text:
                 continue
 
+            try:
+                payload = json.loads(text)
+            except Exception:
+                payload = None
+
+            # New ToF protocol from ESP32:
+            # {"event":"tof","distance_cm":123.4}
+            if isinstance(payload, dict) and payload.get("event") == "tof":
+                latest_tof_cm = tof_to_context_value(payload.get("distance_cm"))
+                continue
+
             if text == '{"event":"start_speech"}':
+                speech_active = True
                 pcm_buffer.clear()
-                print("[WEBSOCKET] ESP32 bat dau ghi am.", flush=True)
+                print(
+                    f"[WEBSOCKET] ESP32 bat dau ghi am | ToF={latest_tof_cm if latest_tof_cm is not None else 'unknown'} cm",
+                    flush=True,
+                )
+
+                live = await ensure_live()
+                if live is not None:
+                    try:
+                        await live_start_turn(
+                            live,
+                            conversation_history,
+                            latest_tof_cm,
+                        )
+                    except Exception as exc:
+                        live["last_error"] = exc
+                        handle_live_key_error(live["key_idx"], exc)
+                        await live_abort_turn(live)
+                        print(
+                            f"[LIVE] Khong bat dau duoc luot realtime: {str(exc)[:220]}",
+                            flush=True,
+                        )
                 continue
 
             if text != '{"event":"end_speech"}':
                 continue
 
+            speech_active = False
             pcm_size = len(pcm_buffer)
             print(
                 f"[WEBSOCKET] ESP32 dung ghi am. PCM={pcm_size} bytes",
                 flush=True,
             )
+
             if pcm_size < 3200:
                 pcm_buffer.clear()
                 await websocket.send_text(
@@ -992,135 +1462,63 @@ async def websocket_chat(websocket: WebSocket):
                         {"event": "tts_error", "message": "Audio qua ngan"}
                     )
                 )
+                if live_handle:
+                    await live_abort_turn(live_handle)
                 continue
 
-            wav_bytes = create_wav_bytes(bytes(pcm_buffer))
-            pcm_buffer.clear()
+            # Primary path: the same audio was already streamed chunk-by-chunk to Gemini Live.
+            # We only wait for its final text here after signaling end-of-activity.
+            user_memory = ""
+            answer = ""
+            action = {
+                "type": "none",
+                "emotion": "neutral",
+                "direction": "none",
+                "degrees": 0,
+                "distance_cm": 0,
+                "speed": "normal",
+            }
 
-            try:
-                user_memory, answer, action = await ask_gemini_audio(
-                    wav_bytes,
-                    safety_config,
-                    conversation_history,
-                )
-                cleaned = clean_text_for_tts(answer)
-                print(f"[BUN DAU] {cleaned}", flush=True)
-                print(f"[BUN DAU REPR] {cleaned!r}", flush=True)
-                print(f"[MEMORY] {user_memory}", flush=True)
-                print(
-                    f"[ACTION] type={action.get('type')} emotion={action.get('emotion')} "
-                    f"direction={action.get('direction')} degrees={action.get('degrees')} "
-                    f"distance_cm={action.get('distance_cm')} speed={action.get('speed')}",
-                    flush=True,
-                )
-
-                tts_start_payload = {
-                    "event": "tts_start",
-                    "emotion": action.get("emotion", "neutral"),
-                    "action_type": action.get("type", "none"),
-                    "action_direction": action.get("direction", "none"),
-                    "action_degrees": action.get("degrees", 0),
-                    "action_distance_cm": action.get("distance_cm", 0),
-                    "action_speed": action.get("speed", "normal"),
-                }
-                await websocket.send_text(
-                    json.dumps(tts_start_payload, ensure_ascii=False)
-                )
-
-                tts_started = time.monotonic()
-                sent = 0
-                used_voice = ""
-                first_audio_ms = None
+            live_result = None
+            if live_handle and live_handle.get("last_error") is None:
                 try:
-                    if GEMINI_TTS_ENABLED:
-                        # Use the same sticky Gemini key. A quota/permission failure
-                        # rotates the key and then falls back to Edge-TTS.
-                        key_idx = CURRENT_KEY_INDEX
-                        try:
-                            sent, first_audio_ms, used_voice = await asyncio.wait_for(
-                                stream_gemini_tts_to_esp(
-                                    websocket,
-                                    cleaned,
-                                    key_idx,
-                                ),
-                                timeout=TTS_TIMEOUT_SECONDS
-                                + max(5, int(len(cleaned) / 20)),
-                            )
-                        except Exception as tts_exc:
-                            kind = classify_gemini_error(tts_exc)
-                            detail = str(tts_exc).replace("\n", " ")[:240]
-                            print(
-                                f"[GEMINI TTS ERROR] Key #{key_idx + 1} | {detail}",
-                                flush=True,
-                            )
-                            if (
-                                kind == "rotate"
-                                and key_idx < len(API_KEYS) - 1
-                            ):
-                                mark_key_disabled(key_idx, detail)
-                                nxt = next_active_key_after(key_idx)
-                                if nxt is not None:
-                                    CURRENT_KEY_INDEX = nxt
-                                    print(
-                                        f"[GEMINI TTS] Chuyen sang Key #{nxt + 1}",
-                                        flush=True,
-                                    )
-                                    sent, first_audio_ms, used_voice = await asyncio.wait_for(
-                                        stream_gemini_tts_to_esp(
-                                            websocket,
-                                            cleaned,
-                                            nxt,
-                                        ),
-                                        timeout=TTS_TIMEOUT_SECONDS
-                                        + max(5, int(len(cleaned) / 20)),
-                                    )
-                            else:
-                                raise
+                    live_result = await live_end_turn(live_handle, timeout_seconds=20.0)
+                    raw_live = (live_result.get("raw_text") or "").strip()
+                    if raw_live:
+                        user_memory, answer, action = parse_tagged_response(raw_live)
+                        if not answer:
+                            raise RuntimeError("Gemini Live tra ve nhung khong co REPLY")
+                        if not user_memory:
+                            user_memory = "Không trích xuất được tóm tắt lượt này."
+
+                        live_ms = int(
+                            (time.monotonic() - (live_handle.get("turn_started") or time.monotonic())) * 1000
+                        )
+                        print(
+                            f"[LIVE] Hoan tat turn | chars={len(raw_live)} | first_text={live_result.get('first_text_ms')} ms | total={live_ms} ms",
+                            flush=True,
+                        )
                     else:
-                        raise RuntimeError("Gemini TTS disabled")
-                except Exception as exc:
+                        raise RuntimeError("Gemini Live tra ve rong")
+                except Exception as live_exc:
+                    live_handle["last_error"] = live_exc
+                    handle_live_key_error(live_handle["key_idx"], live_exc)
                     print(
-                        f"[TTS] Gemini TTS that bai -> Edge-TTS fallback: "
-                        f"{str(exc)[:260]}",
+                        f"[LIVE] Turn loi -> fallback batch Gemini: {str(live_exc)[:240]}",
                         flush=True,
                     )
-                    sent, _, used_voice = await send_edge_fallback_to_esp(
-                        websocket,
-                        cleaned,
-                    )
-                    first_audio_ms = int(
-                        (time.monotonic() - tts_started) * 1000
-                    )
+                    await live_abort_turn(live_handle)
+                    live_result = None
 
-                tts_total_ms = int(
-                    (time.monotonic() - tts_started) * 1000
-                )
-                print(
-                    f"[PERF] TTS first_audio={first_audio_ms} ms | "
-                    f"total={tts_total_ms} ms | voice={used_voice}",
-                    flush=True,
-                )
-
-                conversation_history.append(
-                    {
-                        "user_memory": user_memory,
-                        "assistant_reply": cleaned,
-                    }
-                )
-
-                await websocket.send_text(json.dumps({"event": "tts_done"}))
-                print(
-                    f"[WEBSOCKET] Da gui xong audio | PCM={sent} bytes | "
-                    f"TTS_total={tts_total_ms} ms | "
-                    f"audio_duration={int(sent * 1000 / PCM_BYTES_PER_SECOND)} ms",
-                    flush=True,
-                )
-
-            except WebSocketDisconnect:
-                raise
-            except Exception as exc:
-                print(f"[SERVER ERROR] {exc}", flush=True)
+            if live_result is None:
                 try:
+                    user_memory, answer, action = await process_fallback_batch(
+                        bytes(pcm_buffer),
+                        safety_config,
+                        conversation_history,
+                    )
+                except Exception as exc:
+                    pcm_buffer.clear()
                     await websocket.send_text(
                         json.dumps(
                             {
@@ -1130,8 +1528,133 @@ async def websocket_chat(websocket: WebSocket):
                             ensure_ascii=False,
                         )
                     )
-                except Exception:
-                    pass
+                    continue
+
+            pcm_buffer.clear()
+            cleaned = clean_text_for_tts(answer)
+            print(f"[BUN DAU] {cleaned}", flush=True)
+            if GEMINI_DEBUG_CHUNKS:
+                print(f"[BUN DAU REPR] {cleaned!r}", flush=True)
+            print(f"[MEMORY] {user_memory}", flush=True)
+            print(
+                f"[ACTION] type={action.get('type')} emotion={action.get('emotion')} "
+                f"direction={action.get('direction')} degrees={action.get('degrees')} "
+                f"distance_cm={action.get('distance_cm')} speed={action.get('speed')}",
+                flush=True,
+            )
+
+            tts_start_payload = {
+                "event": "tts_start",
+                "emotion": action.get("emotion", "neutral"),
+                "action_type": action.get("type", "none"),
+                "action_direction": action.get("direction", "none"),
+                "action_degrees": action.get("degrees", 0),
+                "action_distance_cm": action.get("distance_cm", 0),
+                "action_speed": action.get("speed", "normal"),
+            }
+            await websocket.send_text(
+                json.dumps(tts_start_payload, ensure_ascii=False)
+            )
+
+            tts_started = time.monotonic()
+            sent = 0
+            used_voice = ""
+            first_audio_ms = None
+            try:
+                if GEMINI_TTS_ENABLED:
+                    key_idx = CURRENT_KEY_INDEX
+                    try:
+                        sent, first_audio_ms, used_voice = await asyncio.wait_for(
+                            stream_gemini_tts_to_esp(
+                                websocket,
+                                cleaned,
+                                key_idx,
+                            ),
+                            timeout=TTS_TIMEOUT_SECONDS
+                            + max(5, int(len(cleaned) / 20)),
+                        )
+                    except Exception as tts_exc:
+                        kind = classify_gemini_error(tts_exc)
+                        detail = str(tts_exc).replace("\n", " ")[:240]
+                        print(
+                            f"[GEMINI TTS ERROR] Key #{key_idx + 1} | {detail}",
+                            flush=True,
+                        )
+                        if (
+                            kind == "rotate"
+                            and key_idx < len(API_KEYS) - 1
+                        ):
+                            mark_key_disabled(key_idx, detail)
+                            nxt = next_active_key_after(key_idx)
+                            if nxt is not None:
+                                CURRENT_KEY_INDEX = nxt
+                                sent, first_audio_ms, used_voice = await asyncio.wait_for(
+                                    stream_gemini_tts_to_esp(
+                                        websocket,
+                                        cleaned,
+                                        nxt,
+                                    ),
+                                    timeout=TTS_TIMEOUT_SECONDS
+                                    + max(5, int(len(cleaned) / 20)),
+                                )
+                        else:
+                            raise
+                else:
+                    raise RuntimeError("Gemini TTS disabled")
+            except Exception as exc:
+                print(
+                    f"[TTS] Gemini TTS that bai -> Edge-TTS fallback: "
+                    f"{str(exc)[:260]}",
+                    flush=True,
+                )
+                sent, _, used_voice = await send_edge_fallback_to_esp(
+                    websocket,
+                    cleaned,
+                )
+                first_audio_ms = int(
+                    (time.monotonic() - tts_started) * 1000
+                )
+
+            tts_total_ms = int(
+                (time.monotonic() - tts_started) * 1000
+            )
+            print(
+                f"[PERF] TTS first_audio={first_audio_ms} ms | "
+                f"total={tts_total_ms} ms | voice={used_voice}",
+                flush=True,
+            )
+
+            conversation_history.append(
+                {
+                    "user_memory": user_memory,
+                    "assistant_reply": cleaned,
+                }
+            )
+
+            # If another Gemini path rotated the sticky key during this turn (for example
+            # Gemini TTS quota/permission failure), discard the old Live session so the next
+            # turn cannot continue using a disabled/non-current key.
+            if live_handle is not None and live_handle.get("key_idx") != CURRENT_KEY_INDEX:
+                await close_live_handle(live_handle)
+                live_handle = None
+
+            # Re-create the Live session after the configured number of turns so that
+            # its retained server-side history does not grow indefinitely. The last 10
+            # turns are re-seeded into the fresh session by history_config.
+            if live_handle is not None:
+                live_handle["session_turns"] = live_handle.get("session_turns", 0) + 1
+                if live_handle["session_turns"] >= LIVE_HISTORY_RESET_TURNS:
+                    print("[LIVE] Lam moi session sau 10 luot.", flush=True)
+                    await close_live_handle(live_handle)
+                    live_handle = None
+
+            await websocket.send_text(json.dumps({"event": "tts_done"}))
+            print(
+                f"[WEBSOCKET] Da gui xong audio | PCM={sent} bytes | "
+                f"TTS_total={tts_total_ms} ms | "
+                f"audio_duration={int(sent * 1000 / PCM_BYTES_PER_SECOND)} ms",
+                flush=True,
+            )
 
     except WebSocketDisconnect:
         print("[WEBSOCKET] ESP32 ngat ket noi.", flush=True)
@@ -1139,7 +1662,7 @@ async def websocket_chat(websocket: WebSocket):
         print(f"[WEBSOCKET ERROR] {exc}", flush=True)
     finally:
         pcm_buffer.clear()
-
+        await close_live_handle(live_handle)
 
 def create_wav_bytes(
     pcm_data: bytes,

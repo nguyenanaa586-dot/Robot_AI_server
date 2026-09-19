@@ -1,7 +1,7 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 websockets==15.0.1
-google-genai==2.23.0
+google-genai==2.24.0
 edge-tts==7.2.8
 miniaudio==1.61
 numpy==2.3.2
