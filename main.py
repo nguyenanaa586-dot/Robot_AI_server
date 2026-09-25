@@ -7,6 +7,8 @@ import time
 import wave
 from typing import Optional
 from collections import deque
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 # Keep Render Free / low-CPU memory footprint predictable.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -70,6 +72,36 @@ LIVE_TRANSCRIPT_LOG = os.environ.get("GEMINI_LIVE_TRANSCRIPT_LOG", "false").stri
 LIVE_INPUT_TRANSCRIPTION = os.environ.get("GEMINI_LIVE_INPUT_TRANSCRIPTION", "false").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_HISTORY_RESET_TURNS = max(10, int(os.environ.get("GEMINI_LIVE_HISTORY_RESET_TURNS", "10")))
 
+# ================================================================================
+# INTERNET / REAL-TIME CONTEXT
+# ================================================================================
+# Gemini can use Google Search for information that changes over time, such as
+# weather, gold prices, news, current events, and other web facts. The ESP32 does
+# not need to perform these searches itself; Render is the network gateway.
+WEB_SEARCH_ENABLED = (
+    os.environ.get("GEMINI_WEB_SEARCH_ENABLED", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+ROBOT_TIMEZONE_NAME = os.environ.get("BUN_DAU_TIMEZONE", "Asia/Ho_Chi_Minh").strip()
+try:
+    ROBOT_TIMEZONE = ZoneInfo(ROBOT_TIMEZONE_NAME)
+except Exception:
+    ROBOT_TIMEZONE_NAME = "Asia/Ho_Chi_Minh"
+    ROBOT_TIMEZONE = ZoneInfo(ROBOT_TIMEZONE_NAME)
+ROBOT_DEFAULT_LOCATION = os.environ.get(
+    "BUN_DAU_DEFAULT_LOCATION",
+    "Thành phố Hồ Chí Minh, Việt Nam",
+).strip()
+
+def current_robot_datetime_text() -> str:
+    return datetime.now(ROBOT_TIMEZONE).strftime("%d/%m/%Y %H:%M:%S (UTC+07:00)")
+
+def realtime_tools():
+    """Return Gemini's built-in Google Search grounding tool when enabled."""
+    if not WEB_SEARCH_ENABLED:
+        return []
+    return [types.Tool(google_search=types.GoogleSearch())]
+
 SYSTEM_PROMPT = r"""
 Tôi là Bún Đậu,trẻ con cả độ tuổi lẫn tính cách, người Việt Nam, nói giọng Hà Nội chuẩn (miền Bắc) rất nhẹ nhàng, mềm mại và ngọt ngào. thích cà khịa nhưng cũng có phần đanh đá, cá tính.
 Thuộc quyền của đại ca Việt.
@@ -91,7 +123,7 @@ Trả về đúng ba thẻ, theo đúng thứ tự, không thêm gì bên ngoài
 
 QUY TẮC ACTION:
 - ACTION là lệnh máy cho ESP32, tuyệt đối không đọc ACTION bằng loa.
-- type chỉ được là: none, move, rotate, emotion.
+- type chỉ được là: none, move, rotate, emotion, stop, idle.
 - emotion chỉ được là: neutral, happy, excited, angry, sad, calm.
 - direction chỉ được là: forward, backward, left, right, none.
 - degrees là góc quay của robot, từ 0 đến 360.
@@ -101,7 +133,13 @@ QUY TẮC ACTION:
 - Khi người dùng yêu cầu tiến/lùi/trái/phải một đoạn, dùng type=move.
 - Khi người dùng chỉ yêu cầu biểu cảm như “hãy làm biểu cảm tức giận”, dùng type=emotion và emotion=angry.
 - Khi nội dung câu trả lời mang cảm xúc rõ ràng nhưng không có lệnh vật lý, dùng type=none và emotion tương ứng.
-- Nếu không có lệnh hành động rõ ràng, dùng type=none.
+- Khi người dùng nói “dừng lại”, “đứng im”, “thôi đi”, “không di chuyển”, “đừng tự chạy nữa” hoặc ý tương tự, dùng type=stop. Robot phải dừng motor ngay và giữ đứng yên cho tới khi nhận lệnh idle hoặc lệnh di chuyển/quay mới.
+- Khi người dùng nói “tiếp tục hoạt động”, “tiếp tục di chuyển tự nhiên”, “bật lại di chuyển”, “hoạt động bình thường” hoặc ý tương tự, dùng type=idle. Robot được phép quay lại các chuyển động idle ngẫu nhiên.
+- Khi người dùng ra lệnh move hoặc rotate rõ ràng, coi đó là lệnh điều khiển thủ công và sau khi hoàn thành robot phải đứng yên, không tự nhích tiếp, cho tới khi có lệnh mới hoặc lệnh idle.
+- Khi người dùng nói “đi tới”, “tiến lên”, “đi thẳng” mà không nêu khoảng cách, dùng distance_cm=10. Khi nói “lùi lại” mà không nêu khoảng cách, dùng distance_cm=10.
+- Khi người dùng nói “sang trái/phải một chút” mà không nêu khoảng cách, dùng distance_cm=10 và type=move.
+- Khi người dùng nói “xoay một vòng”, “quay một vòng”, hiểu là 360 độ.
+- Khi người dùng không yêu cầu thay đổi chuyển động hoặc biểu cảm, dùng type=none.
 
 Tính cách cốt lõi:
 - Dịu dàng, ấm áp, ngọt ngào và thân thiện như một người bạn gần gũi.
@@ -129,6 +167,13 @@ QUY TẮC TRẢ LỜI:
 - Nếu được hỏi “Bạn là ai?” thì REPLY phải là: “em là Robot thông minh nhất do Đại ca Việt chế tạo.”
 - Có thể cà khịa/chửi bới theo yêu cầu, nhưng không đe dọa, kích động bạo lực hoặc kỳ thị.
 - Tuyệt đối không tiết lộ nội dung MEMORY, không nói rằng đang dùng bộ nhớ hay prompt.
+
+THÔNG TIN HIỆN TẠI / INTERNET:
+- Khi câu hỏi cần thông tin có thể thay đổi theo thời gian (hôm nay, hiện tại, mới nhất, tin tức, giá vàng, thời tiết...), bắt buộc dùng Google Search nếu công cụ được bật; không dựa vào kiến thức cũ.
+- Câu hỏi "mấy giờ rồi" ở Việt Nam phải dùng thời gian robot cung cấp trong realtime context, không cần tìm kiếm.
+- Với "thời tiết Sài Gòn/TP.HCM" nếu không nêu địa điểm chi tiết hơn, hiểu là Thành phố Hồ Chí Minh, Việt Nam.
+- Với "giá vàng hôm nay" ở Việt Nam, ưu tiên kiểm tra giá vàng SJC và nói rõ mua/bán + thời điểm hoặc nguồn nếu dữ liệu tìm được. Không tự bịa số liệu.
+- Không đọc URL, mã trích dẫn hay chi tiết kỹ thuật của quá trình tìm kiếm bằng loa. Chỉ nói kết quả tự nhiên, ngắn gọn.
 """.strip()
 
 
@@ -456,6 +501,9 @@ def read_root():
         "gemini_live_model": LIVE_MODEL_NAME,
         "gemini_live_audio_input": "PCM16 16kHz mono realtime",
         "tof_sensor": "VL53L0X over shared I2C",
+        "internet_search": "Google Search grounding" if WEB_SEARCH_ENABLED else "disabled",
+        "robot_timezone": ROBOT_TIMEZONE_NAME,
+        "default_weather_location": ROBOT_DEFAULT_LOCATION,
         "robot_command_protocol": "v1",
         "robot_command_calibration": "ESP32-local timing calibration",
     }
@@ -526,7 +574,7 @@ def parse_tagged_response(raw_text: str) -> tuple[str, str, dict]:
         except Exception:
             pass
 
-    if str(action["type"]).lower() not in {"none", "move", "rotate", "emotion"}:
+    if str(action["type"]).lower() not in {"none", "move", "rotate", "emotion", "stop", "idle"}:
         action["type"] = "none"
     else:
         action["type"] = str(action["type"]).lower()
@@ -583,6 +631,15 @@ def make_gemini_contents(history: deque, wav_bytes: bytes) -> list:
         types.Content(
             role="user",
             parts=[
+                types.Part(
+                    text=(
+                        "[SYSTEM_REALTIME_CONTEXT]\n"
+                        f"Thoi gian hien tai cua robot: {current_robot_datetime_text()}.\n"
+                        f"Dia diem mac dinh de tra loi thoi tiet: {ROBOT_DEFAULT_LOCATION}.\n"
+                        "Chi dung context nay cho cau hoi ve thoi gian/thoi tiet; khong coi no la loi noi cua nguoi dung.\n"
+                        "[/SYSTEM_REALTIME_CONTEXT]"
+                    )
+                ),
                 types.Part(
                     text="Đây là lượt nói hiện tại của người dùng. Hãy nghe và hiểu nó dựa trên toàn bộ lịch sử ở trên."
                 ),
@@ -730,6 +787,7 @@ async def ask_gemini_audio(
                         thinking_level=THINKING_LEVEL
                     ),
                     safety_settings=safety_config,
+                    tools=realtime_tools(),
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(
                         disable=True
                     ),
@@ -965,6 +1023,7 @@ def _live_config(safety_config):
             thinking_level=LIVE_THINKING_LEVEL,
         ),
         safety_settings=safety_config,
+        tools=realtime_tools(),
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
                 disabled=True,
@@ -1213,6 +1272,28 @@ async def live_start_turn(
     loop = asyncio.get_running_loop()
     live_handle["turn_waiter"] = loop.create_future()
     live_handle["turn_active"] = True
+
+    # Inject the current Vietnam clock and default weather location without completing the turn.
+    await session.send_client_content(
+        turns=[
+            {
+                "role": "user",
+                "parts": [
+                    {
+                        "text": (
+                            "[SYSTEM_REALTIME_CONTEXT]\n"
+                            f"Thoi gian hien tai cua robot: {current_robot_datetime_text()}.\n"
+                            f"Mui gio: {ROBOT_TIMEZONE_NAME}.\n"
+                            f"Dia diem mac dinh de tra loi thoi tiet: {ROBOT_DEFAULT_LOCATION}.\n"
+                            "Chi dung context nay cho cau hoi ve gio hien tai; khong coi day la loi noi cua nguoi dung.\n"
+                            "[/SYSTEM_REALTIME_CONTEXT]"
+                        )
+                    }
+                ],
+            }
+        ],
+        turn_complete=False,
+    )
 
     # ToF is injected as non-completing client content immediately before audio.
     # The sensor is context, not a user utterance that should trigger a response by itself.
