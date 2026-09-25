@@ -1,5 +1,5 @@
-# ROBOT BÚN ĐẬU SERVER - V3.1 - GEMINI LIVE SETUP FIX
-# Fix: loại bỏ safety_settings khỏi Gemini Live setup vì backend Live trả 1007 Unknown name safetySettings.
+# ROBOT BÚN ĐẬU SERVER - V3.2 - GEMINI LIVE QUOTA/SEARCH FIX
+# Fix: tách Google Search khỏi Gemini Live theo mặc định và xử lý đúng WebSocket 1011 quota.
 
 import asyncio
 import io
@@ -75,6 +75,9 @@ LIVE_TRANSCRIPT_LOG = os.environ.get("GEMINI_LIVE_TRANSCRIPT_LOG", "false").stri
 LIVE_INPUT_TRANSCRIPTION = os.environ.get("GEMINI_LIVE_INPUT_TRANSCRIPTION", "false").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_HISTORY_RESET_TURNS = max(10, int(os.environ.get("GEMINI_LIVE_HISTORY_RESET_TURNS", "10")))
 
+# To re-enable Search inside Live after quota/access is verified, set
+# GEMINI_LIVE_WEB_SEARCH_ENABLED=true in Render. Leave it false on the free/quota-sensitive path.
+
 # ================================================================================
 # INTERNET / REAL-TIME CONTEXT
 # ================================================================================
@@ -83,6 +86,13 @@ LIVE_HISTORY_RESET_TURNS = max(10, int(os.environ.get("GEMINI_LIVE_HISTORY_RESET
 # not need to perform these searches itself; Render is the network gateway.
 WEB_SEARCH_ENABLED = (
     os.environ.get("GEMINI_WEB_SEARCH_ENABLED", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+# Google Search is kept available for the non-Live/batch path.
+# Live Search is disabled by default because some free/preview Live projects have
+# returned WebSocket 1011 quota errors as soon as the Search tool is attached.
+LIVE_WEB_SEARCH_ENABLED = (
+    os.environ.get("GEMINI_LIVE_WEB_SEARCH_ENABLED", "false").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 ROBOT_TIMEZONE_NAME = os.environ.get("BUN_DAU_TIMEZONE", "Asia/Ho_Chi_Minh").strip()
@@ -99,9 +109,10 @@ ROBOT_DEFAULT_LOCATION = os.environ.get(
 def current_robot_datetime_text() -> str:
     return datetime.now(ROBOT_TIMEZONE).strftime("%d/%m/%Y %H:%M:%S (UTC+07:00)")
 
-def realtime_tools():
-    """Return Gemini's built-in Google Search grounding tool when enabled."""
-    if not WEB_SEARCH_ENABLED:
+def realtime_tools(for_live: bool = False):
+    """Return Google Search only for the explicitly enabled execution path."""
+    enabled = LIVE_WEB_SEARCH_ENABLED if for_live else WEB_SEARCH_ENABLED
+    if not enabled:
         return []
     return [types.Tool(google_search=types.GoogleSearch())]
 
@@ -192,10 +203,10 @@ def _error_code(exc) -> Optional[int]:
         if isinstance(value, int):
             return value
         if value is not None:
-            m = re.search(r"\b(401|403|429|500|502|503|504)\b", str(value))
+            m = re.search(r"\b(401|403|429|500|502|503|504|1011)\b", str(value))
             if m:
                 return int(m.group(1))
-    m = re.search(r"\b(401|403|429|500|502|503|504)\b", str(exc))
+    m = re.search(r"\b(401|403|429|500|502|503|504|1011)\b", str(exc))
     return int(m.group(1)) if m else None
 
 
@@ -203,6 +214,12 @@ def classify_gemini_error(exc) -> str:
     code = _error_code(exc)
     text = str(exc).lower()
     if code in (401, 403, 429):
+        return "rotate"
+    # Live API can close the WebSocket with code 1011 and a quota/resource-exhausted reason.
+    # Treat only that explicit quota form as a key/quota failure.
+    if code == 1011 and any(x in text for x in (
+        "quota", "resource exhausted", "resource_exhausted", "exceeded your current quota",
+    )):
         return "rotate"
     key_markers = (
         "api key not valid", "api_key_invalid", "invalid api key", "invalid_api_key",
@@ -505,6 +522,7 @@ def read_root():
         "gemini_live_audio_input": "PCM16 16kHz mono realtime",
         "tof_sensor": "VL53L0X over shared I2C",
         "internet_search": "Google Search grounding" if WEB_SEARCH_ENABLED else "disabled",
+        "live_internet_search": "Google Search grounding" if LIVE_WEB_SEARCH_ENABLED else "disabled (quota-safe default)",
         "robot_timezone": ROBOT_TIMEZONE_NAME,
         "default_weather_location": ROBOT_DEFAULT_LOCATION,
         "robot_command_protocol": "v1",
@@ -1027,7 +1045,7 @@ def _live_config(safety_config):
         ),
         # Gemini Live setup hiện tại không nhận safetySettings ở backend Live mà server đang dùng.
         # Giữ safety_config cho pipeline generate_content fallback phía dưới, nhưng không gửi vào Live setup.
-        tools=realtime_tools(),
+        tools=realtime_tools(for_live=True),
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
                 disabled=True,
@@ -1103,8 +1121,12 @@ def handle_live_key_error(key_idx: int, exc: Exception) -> Optional[int]:
     nxt = next_active_key_after(key_idx)
     if nxt is not None:
         CURRENT_KEY_INDEX = nxt
+    reason_label = (
+        "WS 1011 QUOTA" if code == 1011
+        else ('HTTP ' + str(code) if code else 'key/quota error')
+    )
     print(
-        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({'HTTP ' + str(code) if code else 'key/quota error'})",
+        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({reason_label})",
         flush=True,
     )
     return nxt
@@ -1188,8 +1210,12 @@ async def open_live_handle(
                 if kind == "rotate":
                     mark_key_disabled(key_idx, detail)
                     nxt = next_active_key_after(key_idx)
+                    reason_label = (
+                        "WS 1011 QUOTA" if code == 1011
+                        else ('HTTP ' + str(code) if code else 'key/quota error')
+                    )
                     print(
-                        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({'HTTP ' + str(code) if code else 'key/quota error'})",
+                        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({reason_label})",
                         flush=True,
                     )
                     key_idx = nxt
