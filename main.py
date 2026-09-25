@@ -1,4 +1,4 @@
-# ROBOT BÚN ĐẬU SERVER - V3.3 - LIVE TRANSCRIBE + TEXT REASONING FIX
+# ROBOT BÚN ĐẬU SERVER - V3.4 - INTERNET ANSWERS + COMMAND ROLLBACK
 # Fix: dùng Gemini Live Transcribe cho audio realtime, sau đó dùng Gemini text model để suy luận/ACTION/TTS.
 
 import asyncio
@@ -89,6 +89,7 @@ WEB_SEARCH_ENABLED = (
     in {"1", "true", "yes", "on"}
 )
 # Google Search is kept available for the non-Live/batch path.
+# The Live layer is transcription-only; internet lookup happens in the text reasoning step.
 # Live Search is disabled by default because some free/preview Live projects have
 # returned WebSocket 1011 quota errors as soon as the Search tool is attached.
 LIVE_WEB_SEARCH_ENABLED = (
@@ -137,7 +138,7 @@ Trả về đúng ba thẻ, theo đúng thứ tự, không thêm gì bên ngoài
 
 QUY TẮC ACTION:
 - ACTION là lệnh máy cho ESP32, tuyệt đối không đọc ACTION bằng loa.
-- type chỉ được là: none, move, rotate, emotion, stop, idle.
+- type chỉ được là: none, move, rotate, emotion.
 - emotion chỉ được là: neutral, happy, excited, angry, sad, calm.
 - direction chỉ được là: forward, backward, left, right, none.
 - degrees là góc quay của robot, từ 0 đến 360.
@@ -147,9 +148,6 @@ QUY TẮC ACTION:
 - Khi người dùng yêu cầu tiến/lùi/trái/phải một đoạn, dùng type=move.
 - Khi người dùng chỉ yêu cầu biểu cảm như “hãy làm biểu cảm tức giận”, dùng type=emotion và emotion=angry.
 - Khi nội dung câu trả lời mang cảm xúc rõ ràng nhưng không có lệnh vật lý, dùng type=none và emotion tương ứng.
-- Khi người dùng nói “dừng lại”, “đứng im”, “thôi đi”, “không di chuyển”, “đừng tự chạy nữa” hoặc ý tương tự, dùng type=stop. Robot phải dừng motor ngay và giữ đứng yên cho tới khi nhận lệnh idle hoặc lệnh di chuyển/quay mới.
-- Khi người dùng nói “tiếp tục hoạt động”, “tiếp tục di chuyển tự nhiên”, “bật lại di chuyển”, “hoạt động bình thường” hoặc ý tương tự, dùng type=idle. Robot được phép quay lại các chuyển động idle ngẫu nhiên.
-- Khi người dùng ra lệnh move hoặc rotate rõ ràng, coi đó là lệnh điều khiển thủ công và sau khi hoàn thành robot phải đứng yên, không tự nhích tiếp, cho tới khi có lệnh mới hoặc lệnh idle.
 - Khi người dùng nói “đi tới”, “tiến lên”, “đi thẳng” mà không nêu khoảng cách, dùng distance_cm=10. Khi nói “lùi lại” mà không nêu khoảng cách, dùng distance_cm=10.
 - Khi người dùng nói “sang trái/phải một chút” mà không nêu khoảng cách, dùng distance_cm=10 và type=move.
 - Khi người dùng nói “xoay một vòng”, “quay một vòng”, hiểu là 360 độ.
@@ -186,7 +184,10 @@ THÔNG TIN HIỆN TẠI / INTERNET:
 - Khi câu hỏi cần thông tin có thể thay đổi theo thời gian (hôm nay, hiện tại, mới nhất, tin tức, giá vàng, thời tiết...), bắt buộc dùng Google Search nếu công cụ được bật; không dựa vào kiến thức cũ.
 - Câu hỏi "mấy giờ rồi" ở Việt Nam phải dùng thời gian robot cung cấp trong realtime context, không cần tìm kiếm.
 - Với "thời tiết Sài Gòn/TP.HCM" nếu không nêu địa điểm chi tiết hơn, hiểu là Thành phố Hồ Chí Minh, Việt Nam.
-- Với "giá vàng hôm nay" ở Việt Nam, ưu tiên kiểm tra giá vàng SJC và nói rõ mua/bán + thời điểm hoặc nguồn nếu dữ liệu tìm được. Không tự bịa số liệu.
+- Với "giá vàng hôm nay" ở Việt Nam, bắt buộc ưu tiên kiểm tra dữ liệu hiện tại trên web, ưu tiên giá vàng SJC và cố gắng nêu rõ giá mua/bán cùng thời điểm hoặc nguồn nếu dữ liệu tìm được. Không tự bịa số liệu và không dùng số cũ khi người dùng hỏi "hôm nay" hoặc "hiện tại".
+- Với thời tiết hiện tại/hôm nay, bắt buộc ưu tiên Google Search để lấy dữ liệu mới nếu công cụ được bật; nếu kết quả có nhiệt độ, mưa, độ ẩm hoặc cảnh báo thì tóm tắt ngắn gọn các thông tin hữu ích nhất.
+- Với tin tức, giá, thể thao, giao thông hoặc thông tin "mới nhất", phải ưu tiên Google Search và nói rõ khi dữ liệu có thời điểm cập nhật.
+- Nếu Google Search không trả được dữ liệu đáng tin cậy, nói ngắn gọn rằng chưa lấy được dữ liệu hiện tại thay vì đoán.
 - Không đọc URL, mã trích dẫn hay chi tiết kỹ thuật của quá trình tìm kiếm bằng loa. Chỉ nói kết quả tự nhiên, ngắn gọn.
 """.strip()
 
@@ -595,7 +596,7 @@ def parse_tagged_response(raw_text: str) -> tuple[str, str, dict]:
         except Exception:
             pass
 
-    if str(action["type"]).lower() not in {"none", "move", "rotate", "emotion", "stop", "idle"}:
+    if str(action["type"]).lower() not in {"none", "move", "rotate", "emotion"}:
         action["type"] = "none"
     else:
         action["type"] = str(action["type"]).lower()
