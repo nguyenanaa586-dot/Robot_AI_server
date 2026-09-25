@@ -1,3 +1,6 @@
+# ROBOT BÚN ĐẬU SERVER - V3.1 - GEMINI LIVE SETUP FIX
+# Fix: loại bỏ safety_settings khỏi Gemini Live setup vì backend Live trả 1007 Unknown name safetySettings.
+
 import asyncio
 import io
 import json
@@ -1022,7 +1025,8 @@ def _live_config(safety_config):
         thinking_config=types.ThinkingConfig(
             thinking_level=LIVE_THINKING_LEVEL,
         ),
-        safety_settings=safety_config,
+        # Gemini Live setup hiện tại không nhận safetySettings ở backend Live mà server đang dùng.
+        # Giữ safety_config cho pipeline generate_content fallback phía dưới, nhưng không gửi vào Live setup.
         tools=realtime_tools(),
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
