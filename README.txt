@@ -1,3 +1,14 @@
+BUN DAU SERVER V3.0 – COMMAND EXPANDED
+
+Logic changes are in main.py. Support deployment files are retained from V2.9.
+
+Added ACTION types:
+- stop: dừng motor và giữ robot đứng yên.
+- idle: cho phép chuyển động idle ngẫu nhiên trở lại.
+- Explicit move/rotate commands now instruct the robot to stay still after completion.
+
+Flash the paired ESP32 firmware ROBOT_BUN_DAU_V3_0_COMMAND_EXPANDED.ino for these physical commands.
+
 BUN DAU SERVER V2.2 - GEMINI LIVE + VL53L0X READY
 
 Mục đích
