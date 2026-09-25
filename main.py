@@ -1,6 +1,3 @@
-# ROBOT BÚN ĐẬU SERVER - V3.4 - INTERNET ANSWERS + COMMAND ROLLBACK
-# Fix: dùng Gemini Live Transcribe cho audio realtime, sau đó dùng Gemini text model để suy luận/ACTION/TTS.
-
 import asyncio
 import io
 import json
@@ -10,8 +7,6 @@ import time
 import wave
 from typing import Optional
 from collections import deque
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 # Keep Render Free / low-CPU memory footprint predictable.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -61,61 +56,19 @@ GEMINI_DEBUG_CHUNKS = (
 # MEMORY/ACTION/REPLY protocol and the existing TTS pipeline without changing the ESP audio contract.
 LIVE_ENABLED = os.environ.get("GEMINI_LIVE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_MODEL_NAME = os.environ.get(
-    "GEMINI_LIVE_MODEL", "gemini-3.5-transcribe-live"
+    "GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview"
 ).strip()
 LIVE_MAX_OUTPUT_TOKENS = int(
     os.environ.get("GEMINI_LIVE_MAX_OUTPUT_TOKENS", "384")
 )
-LIVE_TRANSCRIBE_LANGUAGE = os.environ.get(
-    "GEMINI_LIVE_TRANSCRIBE_LANGUAGE", "vi-VN"
-).strip()
+LIVE_THINKING_LEVEL = os.environ.get(
+    "GEMINI_LIVE_THINKING_LEVEL", "low"
+).strip().lower()
 LIVE_INPUT_MIME = "audio/pcm;rate=16000"
 LIVE_SESSION_CONNECT_RETRIES = max(1, int(os.environ.get("GEMINI_LIVE_CONNECT_RETRIES", "2")))
 LIVE_TRANSCRIPT_LOG = os.environ.get("GEMINI_LIVE_TRANSCRIPT_LOG", "false").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_INPUT_TRANSCRIPTION = os.environ.get("GEMINI_LIVE_INPUT_TRANSCRIPTION", "false").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_HISTORY_RESET_TURNS = max(10, int(os.environ.get("GEMINI_LIVE_HISTORY_RESET_TURNS", "10")))
-
-# To re-enable Search inside Live after quota/access is verified, set
-# GEMINI_LIVE_WEB_SEARCH_ENABLED=true in Render. Leave it false on the free/quota-sensitive path.
-
-# ================================================================================
-# INTERNET / REAL-TIME CONTEXT
-# ================================================================================
-# Gemini can use Google Search for information that changes over time, such as
-# weather, gold prices, news, current events, and other web facts. The ESP32 does
-# not need to perform these searches itself; Render is the network gateway.
-WEB_SEARCH_ENABLED = (
-    os.environ.get("GEMINI_WEB_SEARCH_ENABLED", "true").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-# Google Search is kept available for the non-Live/batch path.
-# The Live layer is transcription-only; internet lookup happens in the text reasoning step.
-# Live Search is disabled by default because some free/preview Live projects have
-# returned WebSocket 1011 quota errors as soon as the Search tool is attached.
-LIVE_WEB_SEARCH_ENABLED = (
-    os.environ.get("GEMINI_LIVE_WEB_SEARCH_ENABLED", "false").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
-ROBOT_TIMEZONE_NAME = os.environ.get("BUN_DAU_TIMEZONE", "Asia/Ho_Chi_Minh").strip()
-try:
-    ROBOT_TIMEZONE = ZoneInfo(ROBOT_TIMEZONE_NAME)
-except Exception:
-    ROBOT_TIMEZONE_NAME = "Asia/Ho_Chi_Minh"
-    ROBOT_TIMEZONE = ZoneInfo(ROBOT_TIMEZONE_NAME)
-ROBOT_DEFAULT_LOCATION = os.environ.get(
-    "BUN_DAU_DEFAULT_LOCATION",
-    "Thành phố Hồ Chí Minh, Việt Nam",
-).strip()
-
-def current_robot_datetime_text() -> str:
-    return datetime.now(ROBOT_TIMEZONE).strftime("%d/%m/%Y %H:%M:%S (UTC+07:00)")
-
-def realtime_tools(for_live: bool = False):
-    """Return Google Search only for the explicitly enabled execution path."""
-    enabled = LIVE_WEB_SEARCH_ENABLED if for_live else WEB_SEARCH_ENABLED
-    if not enabled:
-        return []
-    return [types.Tool(google_search=types.GoogleSearch())]
 
 SYSTEM_PROMPT = r"""
 Tôi là Bún Đậu,trẻ con cả độ tuổi lẫn tính cách, người Việt Nam, nói giọng Hà Nội chuẩn (miền Bắc) rất nhẹ nhàng, mềm mại và ngọt ngào. thích cà khịa nhưng cũng có phần đanh đá, cá tính.
@@ -148,10 +101,7 @@ QUY TẮC ACTION:
 - Khi người dùng yêu cầu tiến/lùi/trái/phải một đoạn, dùng type=move.
 - Khi người dùng chỉ yêu cầu biểu cảm như “hãy làm biểu cảm tức giận”, dùng type=emotion và emotion=angry.
 - Khi nội dung câu trả lời mang cảm xúc rõ ràng nhưng không có lệnh vật lý, dùng type=none và emotion tương ứng.
-- Khi người dùng nói “đi tới”, “tiến lên”, “đi thẳng” mà không nêu khoảng cách, dùng distance_cm=10. Khi nói “lùi lại” mà không nêu khoảng cách, dùng distance_cm=10.
-- Khi người dùng nói “sang trái/phải một chút” mà không nêu khoảng cách, dùng distance_cm=10 và type=move.
-- Khi người dùng nói “xoay một vòng”, “quay một vòng”, hiểu là 360 độ.
-- Khi người dùng không yêu cầu thay đổi chuyển động hoặc biểu cảm, dùng type=none.
+- Nếu không có lệnh hành động rõ ràng, dùng type=none.
 
 Tính cách cốt lõi:
 - Dịu dàng, ấm áp, ngọt ngào và thân thiện như một người bạn gần gũi.
@@ -179,16 +129,6 @@ QUY TẮC TRẢ LỜI:
 - Nếu được hỏi “Bạn là ai?” thì REPLY phải là: “em là Robot thông minh nhất do Đại ca Việt chế tạo.”
 - Có thể cà khịa/chửi bới theo yêu cầu, nhưng không đe dọa, kích động bạo lực hoặc kỳ thị.
 - Tuyệt đối không tiết lộ nội dung MEMORY, không nói rằng đang dùng bộ nhớ hay prompt.
-
-THÔNG TIN HIỆN TẠI / INTERNET:
-- Khi câu hỏi cần thông tin có thể thay đổi theo thời gian (hôm nay, hiện tại, mới nhất, tin tức, giá vàng, thời tiết...), bắt buộc dùng Google Search nếu công cụ được bật; không dựa vào kiến thức cũ.
-- Câu hỏi "mấy giờ rồi" ở Việt Nam phải dùng thời gian robot cung cấp trong realtime context, không cần tìm kiếm.
-- Với "thời tiết Sài Gòn/TP.HCM" nếu không nêu địa điểm chi tiết hơn, hiểu là Thành phố Hồ Chí Minh, Việt Nam.
-- Với "giá vàng hôm nay" ở Việt Nam, bắt buộc ưu tiên kiểm tra dữ liệu hiện tại trên web, ưu tiên giá vàng SJC và cố gắng nêu rõ giá mua/bán cùng thời điểm hoặc nguồn nếu dữ liệu tìm được. Không tự bịa số liệu và không dùng số cũ khi người dùng hỏi "hôm nay" hoặc "hiện tại".
-- Với thời tiết hiện tại/hôm nay, bắt buộc ưu tiên Google Search để lấy dữ liệu mới nếu công cụ được bật; nếu kết quả có nhiệt độ, mưa, độ ẩm hoặc cảnh báo thì tóm tắt ngắn gọn các thông tin hữu ích nhất.
-- Với tin tức, giá, thể thao, giao thông hoặc thông tin "mới nhất", phải ưu tiên Google Search và nói rõ khi dữ liệu có thời điểm cập nhật.
-- Nếu Google Search không trả được dữ liệu đáng tin cậy, nói ngắn gọn rằng chưa lấy được dữ liệu hiện tại thay vì đoán.
-- Không đọc URL, mã trích dẫn hay chi tiết kỹ thuật của quá trình tìm kiếm bằng loa. Chỉ nói kết quả tự nhiên, ngắn gọn.
 """.strip()
 
 
@@ -204,10 +144,10 @@ def _error_code(exc) -> Optional[int]:
         if isinstance(value, int):
             return value
         if value is not None:
-            m = re.search(r"\b(401|403|429|500|502|503|504|1011)\b", str(value))
+            m = re.search(r"\b(401|403|429|500|502|503|504)\b", str(value))
             if m:
                 return int(m.group(1))
-    m = re.search(r"\b(401|403|429|500|502|503|504|1011)\b", str(exc))
+    m = re.search(r"\b(401|403|429|500|502|503|504)\b", str(exc))
     return int(m.group(1)) if m else None
 
 
@@ -215,12 +155,6 @@ def classify_gemini_error(exc) -> str:
     code = _error_code(exc)
     text = str(exc).lower()
     if code in (401, 403, 429):
-        return "rotate"
-    # Live API can close the WebSocket with code 1011 and a quota/resource-exhausted reason.
-    # Treat only that explicit quota form as a key/quota failure.
-    if code == 1011 and any(x in text for x in (
-        "quota", "resource exhausted", "resource_exhausted", "exceeded your current quota",
-    )):
         return "rotate"
     key_markers = (
         "api key not valid", "api_key_invalid", "invalid api key", "invalid_api_key",
@@ -520,12 +454,8 @@ def read_root():
         "gemini_debug_chunks": GEMINI_DEBUG_CHUNKS,
         "gemini_live_enabled": LIVE_ENABLED,
         "gemini_live_model": LIVE_MODEL_NAME,
-        "gemini_live_audio_input": "PCM16 16kHz mono realtime transcription",
+        "gemini_live_audio_input": "PCM16 16kHz mono realtime",
         "tof_sensor": "VL53L0X over shared I2C",
-        "internet_search": "Google Search grounding" if WEB_SEARCH_ENABLED else "disabled",
-        "live_internet_search": "Google Search grounding" if LIVE_WEB_SEARCH_ENABLED else "disabled (quota-safe default)",
-        "robot_timezone": ROBOT_TIMEZONE_NAME,
-        "default_weather_location": ROBOT_DEFAULT_LOCATION,
         "robot_command_protocol": "v1",
         "robot_command_calibration": "ESP32-local timing calibration",
     }
@@ -654,15 +584,6 @@ def make_gemini_contents(history: deque, wav_bytes: bytes) -> list:
             role="user",
             parts=[
                 types.Part(
-                    text=(
-                        "[SYSTEM_REALTIME_CONTEXT]\n"
-                        f"Thoi gian hien tai cua robot: {current_robot_datetime_text()}.\n"
-                        f"Dia diem mac dinh de tra loi thoi tiet: {ROBOT_DEFAULT_LOCATION}.\n"
-                        "Chi dung context nay cho cau hoi ve thoi gian/thoi tiet; khong coi no la loi noi cua nguoi dung.\n"
-                        "[/SYSTEM_REALTIME_CONTEXT]"
-                    )
-                ),
-                types.Part(
                     text="Đây là lượt nói hiện tại của người dùng. Hãy nghe và hiểu nó dựa trên toàn bộ lịch sử ở trên."
                 ),
                 types.Part.from_bytes(data=wav_bytes, mime_type="audio/wav"),
@@ -765,130 +686,6 @@ def _log_gemini_result(
     )
 
 
-def make_gemini_text_contents(history: deque, user_text: str, tof_distance_cm: Optional[float] = None) -> list:
-    contents = build_history_contents(history)
-    context = (
-        "[SYSTEM_REALTIME_CONTEXT]\n"
-        f"Thoi gian hien tai cua robot: {current_robot_datetime_text()}.\n"
-        f"Dia diem mac dinh de tra loi thoi tiet: {ROBOT_DEFAULT_LOCATION}.\n"
-        "Chi dung context nay cho cau hoi ve thoi gian/thoi tiet; khong coi no la loi noi cua nguoi dung.\n"
-    )
-    if tof_distance_cm is not None:
-        context += (
-            f"Khoang cach phia truoc hien tai theo VL53L0X: {tof_distance_cm:.1f} cm. "
-            "Chi dung lam context vat ly, khong tu y tra loi chi vi co so do.\n"
-        )
-    context += "[/SYSTEM_REALTIME_CONTEXT]"
-    contents.append(
-        types.Content(
-            role="user",
-            parts=[
-                types.Part(text=context),
-                types.Part(
-                    text=(
-                        "Đây là bản chép lời realtime của lượt nói hiện tại từ Gemini Live Transcribe. "
-                        "Hãy xử lý nó như lời nói trực tiếp của người dùng và thực hiện đầy đủ MEMORY/ACTION/REPLY."
-                    )
-                ),
-                types.Part(text=user_text),
-            ],
-        )
-    )
-    return contents
-
-
-async def ask_gemini_text(
-    user_text: str,
-    safety_config,
-    history: deque,
-    tof_distance_cm: Optional[float] = None,
-) -> tuple[str, str, dict]:
-    global CURRENT_KEY_INDEX
-    if not user_text.strip():
-        raise RuntimeError("Ban ghi am khong co noi dung")
-    if not API_KEYS:
-        raise RuntimeError("Khong co GEMINI_API_KEY")
-
-    key_idx: Optional[int] = CURRENT_KEY_INDEX
-    while key_idx is not None:
-        if KEY_STATUS[key_idx] != "active":
-            key_idx = next_active_key_after(key_idx)
-            continue
-
-        print(f"[GEMINI] Xu ly transcript bang Key #{key_idx + 1}", flush=True)
-        client = get_genai_client(key_idx)
-        if client is None:
-            mark_key_disabled(key_idx, "Client unavailable")
-            key_idx = next_active_key_after(key_idx)
-            continue
-
-        started = time.monotonic()
-        try:
-            stream = await client.aio.models.generate_content_stream(
-                model=MODEL_NAME,
-                contents=make_gemini_text_contents(history, user_text, tof_distance_cm),
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                    thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
-                    safety_settings=safety_config,
-                    tools=realtime_tools(),
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                ),
-            )
-
-            parts: list[str] = []
-            finish_state = {"reason": None, "message": None}
-            first_text_state = {"ms": None}
-            chunk_count = 0
-            usage = None
-            async for chunk in stream:
-                chunk_count += 1
-                _read_gemini_chunk(
-                    chunk, chunk_count, "transcript", parts, finish_state, started, first_text_state
-                )
-                try:
-                    if chunk.usage_metadata:
-                        usage = chunk.usage_metadata
-                except Exception:
-                    pass
-
-            raw_text = "".join(parts).strip()
-            _log_gemini_result(
-                "transcript", raw_text, chunk_count, finish_state, first_text_state["ms"],
-                int((time.monotonic() - started) * 1000),
-            )
-            memory_text, answer, action = parse_tagged_response(raw_text)
-            if not answer:
-                raise RuntimeError("Gemini tra ve rong")
-            if not memory_text:
-                memory_text = "Không trích xuất được tóm tắt lượt này."
-            CURRENT_KEY_INDEX = key_idx
-            return memory_text, answer, action
-        except Exception as exc:
-            kind = classify_gemini_error(exc)
-            code = _error_code(exc)
-            detail = str(exc).replace("\n", " ")[:220]
-            if kind == "rotate":
-                mark_key_disabled(key_idx, detail)
-                nxt = next_active_key_after(key_idx)
-                if nxt is None:
-                    raise RuntimeError("Tat ca Gemini key phia sau deu khong con dung duoc") from exc
-                print(
-                    f"[GEMINI] Key #{key_idx + 1} khong dung duoc ({'HTTP ' + str(code) if code else 'key/quota error'}) -> Key #{nxt + 1}",
-                    flush=True,
-                )
-                key_idx = nxt
-                continue
-            if kind == "transient":
-                print(f"[GEMINI] Loi tam thoi Key #{key_idx + 1}: {detail} -> retry", flush=True)
-                await asyncio.sleep(0.6)
-                continue
-            raise RuntimeError(detail) from exc
-
-    raise RuntimeError("Khong co Gemini key active")
-
-
 async def ask_gemini_audio(
     wav_bytes: bytes,
     safety_config,
@@ -933,7 +730,6 @@ async def ask_gemini_audio(
                         thinking_level=THINKING_LEVEL
                     ),
                     safety_settings=safety_config,
-                    tools=realtime_tools(),
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(
                         disable=True
                     ),
@@ -1158,22 +954,28 @@ async def ask_gemini_audio(
 # 5. GEMINI LIVE + WEBSOCKET
 # ================================================================================
 def _live_config(safety_config):
-    """Build a Live Transcribe config for realtime speech-to-text."""
-    # Gemini 3.1 Flash Live currently rejects TEXT as the requested native-audio response
-    # modality in the runtime used by this project. Use the dedicated Gemini Live Transcribe
-    # model instead: it accepts realtime PCM audio and returns TEXT transcriptions.
-    # The final reasoning/ACTION/TTS step remains on the normal Gemini text model below.
+    """Build a LiveConnectConfig that keeps client-side VAD in control."""
+    # Gemini 3.1 Flash Live supports TEXT output and configurable thinking levels.
+    # Automatic activity detection is disabled because the ESP32 already owns VAD/end-of-speech detection.
     return types.LiveConnectConfig(
         response_modalities=["TEXT"],
-        system_instruction=(
-            "Chỉ làm nhiệm vụ chuyển tiếng nói tiếng Việt thành văn bản. "
-            "Không trả lời người dùng, không suy luận, không thêm nội dung. "
-            "Giữ nguyên ý nghĩa câu nói và các con số quan trọng."
+        system_instruction=SYSTEM_PROMPT,
+        max_output_tokens=LIVE_MAX_OUTPUT_TOKENS,
+        thinking_config=types.ThinkingConfig(
+            thinking_level=LIVE_THINKING_LEVEL,
         ),
-        input_audio_transcription=types.AudioTranscriptionConfig(
-            language_codes=[LIVE_TRANSCRIBE_LANGUAGE],
+        safety_settings=safety_config,
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                disabled=True,
+            )
+        ),
+        input_audio_transcription={} if LIVE_INPUT_TRANSCRIPTION else None,
+        history_config=types.HistoryConfig(
+            initial_history_in_client_content=True,
         ),
     )
+
 
 def _history_turns_for_live(history: deque) -> list:
     turns = []
@@ -1238,12 +1040,8 @@ def handle_live_key_error(key_idx: int, exc: Exception) -> Optional[int]:
     nxt = next_active_key_after(key_idx)
     if nxt is not None:
         CURRENT_KEY_INDEX = nxt
-    reason_label = (
-        "WS 1011 QUOTA" if code == 1011
-        else ('HTTP ' + str(code) if code else 'key/quota error')
-    )
     print(
-        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({reason_label})",
+        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({'HTTP ' + str(code) if code else 'key/quota error'})",
         flush=True,
     )
     return nxt
@@ -1285,6 +1083,13 @@ async def open_live_handle(
                 )
                 session = await session_cm.__aenter__()
 
+                turns = _history_turns_for_live(history)
+                if turns:
+                    await session.send_client_content(
+                        turns=turns,
+                        turn_complete=False,
+                    )
+
                 CURRENT_KEY_INDEX = key_idx
                 print(
                     f"[LIVE] Session san sang | model={LIVE_MODEL_NAME} | Key #{key_idx + 1}",
@@ -1320,12 +1125,8 @@ async def open_live_handle(
                 if kind == "rotate":
                     mark_key_disabled(key_idx, detail)
                     nxt = next_active_key_after(key_idx)
-                    reason_label = (
-                        "WS 1011 QUOTA" if code == 1011
-                        else ('HTTP ' + str(code) if code else 'key/quota error')
-                    )
                     print(
-                        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({reason_label})",
+                        f"[LIVE] Key #{key_idx + 1} bi vo hieu ({'HTTP ' + str(code) if code else 'key/quota error'})",
                         flush=True,
                     )
                     key_idx = nxt
@@ -1341,7 +1142,7 @@ async def open_live_handle(
 
 
 async def live_receive_loop(live_handle: dict) -> None:
-    """Continuously consume Live Transcribe events while ESP sends audio concurrently."""
+    """Continuously consume Live server events while ESP sends audio concurrently."""
     session = live_handle["session"]
     try:
         async for response in session.receive():
@@ -1352,11 +1153,26 @@ async def live_receive_loop(live_handle: dict) -> None:
             input_transcription = getattr(content, "input_transcription", None)
             if input_transcription is not None:
                 t = getattr(input_transcription, "text", None)
-                if t and live_handle.get("turn_active"):
+                if t:
                     live_handle["input_transcript_parts"].append(str(t))
-                    live_handle["last_transcript_at"] = time.monotonic()
                     if LIVE_TRANSCRIPT_LOG:
                         print(f"[LIVE INPUT] {str(t)!r}", flush=True)
+
+            model_turn = getattr(content, "model_turn", None)
+            if model_turn is not None:
+                parts = getattr(model_turn, "parts", None) or []
+                for part in parts:
+                    if getattr(part, "thought", False):
+                        continue
+                    part_text = getattr(part, "text", None)
+                    if not part_text:
+                        continue
+                    if live_handle.get("turn_active"):
+                        if live_handle.get("first_text_ms") is None and live_handle.get("turn_started"):
+                            live_handle["first_text_ms"] = int(
+                                (time.monotonic() - live_handle["turn_started"]) * 1000
+                            )
+                        live_handle["raw_parts"].append(part_text)
 
             turn_complete = bool(getattr(content, "turn_complete", False))
             if turn_complete and live_handle.get("turn_active"):
@@ -1365,28 +1181,9 @@ async def live_receive_loop(live_handle: dict) -> None:
                 if waiter and not waiter.done():
                     waiter.set_result(
                         {
-                            "raw_text": "",
+                            "raw_text": "".join(live_handle["raw_parts"]).strip(),
                             "input_transcript": "".join(live_handle["input_transcript_parts"]).strip(),
-                            "first_text_ms": None,
-                        }
-                    )
-            elif (
-                live_handle.get("awaiting_audio_end")
-                and live_handle.get("turn_active")
-                and live_handle.get("input_transcript_parts")
-                and (time.monotonic() - live_handle.get("last_transcript_at", 0.0) >= 0.25)
-            ):
-                # Some transcription responses may not expose turn_complete consistently.
-                # Once the final transcript has been quiet for 250 ms after audio_stream_end,
-                # it is safe to hand it to the normal Gemini text reasoning path.
-                live_handle["turn_active"] = False
-                waiter = live_handle.get("turn_waiter")
-                if waiter and not waiter.done():
-                    waiter.set_result(
-                        {
-                            "raw_text": "",
-                            "input_transcript": "".join(live_handle["input_transcript_parts"]).strip(),
-                            "first_text_ms": None,
+                            "first_text_ms": live_handle.get("first_text_ms"),
                         }
                     )
     except asyncio.CancelledError:
@@ -1403,23 +1200,52 @@ async def live_start_turn(
     history: deque,
     tof_distance_cm: Optional[float],
 ) -> None:
-    """Start a realtime transcription window; ESP32 still controls the VAD window."""
+    """Begin an explicit realtime turn; ESP32 controls the actual VAD window."""
     if live_handle.get("turn_active"):
         raise RuntimeError("Gemini Live dang co mot luot dang xu ly")
 
+    session = live_handle["session"]
     live_handle["turn_id"] += 1
     live_handle["raw_parts"] = []
     live_handle["input_transcript_parts"] = []
     live_handle["first_text_ms"] = None
     live_handle["turn_started"] = time.monotonic()
-    live_handle["awaiting_audio_end"] = False
-    live_handle["last_transcript_at"] = time.monotonic()
     loop = asyncio.get_running_loop()
     live_handle["turn_waiter"] = loop.create_future()
     live_handle["turn_active"] = True
 
-    # Save the sensor/time context locally for the text-reasoning step after transcription.
-    live_handle["tof_distance_cm"] = tof_distance_cm
+    # ToF is injected as non-completing client content immediately before audio.
+    # The sensor is context, not a user utterance that should trigger a response by itself.
+    if tof_distance_cm is not None:
+        await session.send_client_content(
+            turns=[
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": (
+                                "[SENSOR_TOF]\n"
+                                f"Khoang cach phia truoc hien tai: {tof_distance_cm:.1f} cm.\n"
+                                "Chi dung thong tin cam bien nay lam boi canh cho luot noi sap toi; "
+                                "khong tu y tra loi chi vi co tin cam bien.\n"
+                                "[/SENSOR_TOF]"
+                            )
+                        }
+                    ],
+                }
+            ],
+            turn_complete=False,
+        )
+
+    await session.send_realtime_input(
+        activity_start=types.ActivityStart()
+    )
+
+
+def _ensure_even_pcm_chunk(data: bytes) -> bytes:
+    if len(data) % 2:
+        return data[:-1]
+    return data
 
 
 async def live_send_audio_chunk(live_handle: dict, pcm_chunk: bytes) -> None:
@@ -1436,18 +1262,17 @@ async def live_send_audio_chunk(live_handle: dict, pcm_chunk: bytes) -> None:
     )
 
 
-async def live_end_turn(live_handle: dict, timeout_seconds: float = 5.0) -> dict:
+async def live_end_turn(live_handle: dict, timeout_seconds: float = 20.0) -> dict:
     if not live_handle.get("turn_active"):
         waiter = live_handle.get("turn_waiter")
         if waiter and waiter.done() and not waiter.cancelled():
             return waiter.result()
         raise RuntimeError("Gemini Live khong co luot dang cho")
 
-    live_handle["awaiting_audio_end"] = True
     try:
-        await live_handle["session"].send_realtime_input(audio_stream_end=True)
-        # The transcribe model normally emits the final input transcription and then completes.
-        # Give that final transcript a short window to arrive; no second audio upload is needed.
+        await live_handle["session"].send_realtime_input(
+            activity_end=types.ActivityEnd()
+        )
         result = await asyncio.wait_for(
             live_handle["turn_waiter"],
             timeout=timeout_seconds,
@@ -1455,17 +1280,16 @@ async def live_end_turn(live_handle: dict, timeout_seconds: float = 5.0) -> dict
         return result
     finally:
         live_handle["turn_active"] = False
-        live_handle["awaiting_audio_end"] = False
 
 
 async def live_abort_turn(live_handle: Optional[dict]) -> None:
     if not live_handle:
         return
     live_handle["turn_active"] = False
-    live_handle["awaiting_audio_end"] = False
     waiter = live_handle.get("turn_waiter")
     if waiter and not waiter.done():
         waiter.cancel()
+
 
 def tof_to_context_value(value) -> Optional[float]:
     try:
@@ -1658,29 +1482,29 @@ async def websocket_chat(websocket: WebSocket):
             live_result = None
             if live_handle and live_handle.get("last_error") is None:
                 try:
-                    live_result = await live_end_turn(live_handle, timeout_seconds=5.0)
-                    transcript = (live_result.get("input_transcript") or "").strip()
-                    if not transcript:
-                        raise RuntimeError("Gemini Live Transcribe khong tra transcript")
+                    live_result = await live_end_turn(live_handle, timeout_seconds=20.0)
+                    raw_live = (live_result.get("raw_text") or "").strip()
+                    if raw_live:
+                        user_memory, answer, action = parse_tagged_response(raw_live)
+                        if not answer:
+                            raise RuntimeError("Gemini Live tra ve nhung khong co REPLY")
+                        if not user_memory:
+                            user_memory = "Không trích xuất được tóm tắt lượt này."
 
-                    transcribe_ms = int(
-                        (time.monotonic() - (live_handle.get("turn_started") or time.monotonic())) * 1000
-                    )
-                    print(
-                        f"[LIVE] Transcribe hoan tat | chars={len(transcript)} | total={transcribe_ms} ms",
-                        flush=True,
-                    )
-                    user_memory, answer, action = await ask_gemini_text(
-                        transcript,
-                        safety_config,
-                        conversation_history,
-                        latest_tof_cm,
-                    )
+                        live_ms = int(
+                            (time.monotonic() - (live_handle.get("turn_started") or time.monotonic())) * 1000
+                        )
+                        print(
+                            f"[LIVE] Hoan tat turn | chars={len(raw_live)} | first_text={live_result.get('first_text_ms')} ms | total={live_ms} ms",
+                            flush=True,
+                        )
+                    else:
+                        raise RuntimeError("Gemini Live tra ve rong")
                 except Exception as live_exc:
                     live_handle["last_error"] = live_exc
                     handle_live_key_error(live_handle["key_idx"], live_exc)
                     print(
-                        f"[LIVE] Transcribe/Reasoning loi -> fallback batch audio: {str(live_exc)[:240]}",
+                        f"[LIVE] Turn loi -> fallback batch Gemini: {str(live_exc)[:240]}",
                         flush=True,
                     )
                     await live_abort_turn(live_handle)
