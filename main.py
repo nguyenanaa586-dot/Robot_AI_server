@@ -211,7 +211,7 @@ EDGE_TTS_FALLBACK_VOICE = os.environ.get("EDGE_TTS_FALLBACK_VOICE", "vi-VN-NamMi
 EDGE_TTS_RATE = os.environ.get("EDGE_TTS_RATE", "+10%").strip()
 GEMINI_TTS_ENABLED = os.environ.get("GEMINI_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview").strip()
-GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Sulafat").strip()
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Despina").strip()
 GEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()
 GEMINI_TTS_STYLE = os.environ.get(
     "GEMINI_TTS_STYLE",
