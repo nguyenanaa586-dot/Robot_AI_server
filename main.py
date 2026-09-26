@@ -215,7 +215,7 @@ GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Despina").strip()
 GEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()
 GEMINI_TTS_STYLE = os.environ.get(
     "GEMINI_TTS_STYLE",
-    "Speak in a gentle, natural Northern Vietnamese (Hanoi) accent. Soft, warm, sweet, friendly female voice suitable for vlogs and promotional content. Clear pronunciation, fairly fast pace, natural intonation, slightly bright and engaging, not robotic or overly formal. Sound like a young Vietnamese content creator introducing a product warmly. Slightly breathy, very soft tone, relaxed delivery,complemented by the deep, warm, and sultry voice of a young woman playfully feigning shyness with her boyfriend.",
+    "Speak in a gentle, natural Northern Vietnamese (Hanoi) accent. Soft, super warm and deep, sweet, friendly female voice suitable for vlogs and promotional content. Clear pronunciation, fairly fast pace, natural intonation, slightly bright and engaging, not robotic or overly formal. Sound like a young Vietnamese content creator introducing a product warmly. Slightly breathy, very soft tone, relaxed delivery,complemented by the deep, warm, and sultry voice of a young woman playfully feigning shyness with her boyfriend.",
 ).strip()
 TTS_CONCURRENCY = 1
 _tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
