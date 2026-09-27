@@ -1,12 +1,14 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.1 - INTERNET SEARCH FREE-TEST GUARD
-# Phiên bản: 4.1
+# ROBOT BÚN ĐẬU SERVER - V4.2 - SEARCH FREE + STABLE BATCH
+# Phiên bản: 4.2
 #
 # - Quay về pipeline audio WAV -> Gemini batch để ưu tiên độ ổn định/độ chính xác.
 # - Thêm Google Search grounding cho câu hỏi cần thông tin hiện tại.
 # - Thêm ngữ cảnh thời gian Việt Nam (Asia/Ho_Chi_Minh) cho câu hỏi "mấy giờ".
 # - Giữ MEMORY / ACTION / REPLY / TTS / Edge-TTS fallback / ToF / sticky key.
-# - Đổi model hội thoại sang Gemini 2.5 Flash để test Free Tier + Google Search grounding.
+# - Giữ Gemini 2.5 Flash để test Free Tier + Google Search grounding.
+# - Ổn định hóa batch: không stream text, giới hạn timeout Gemini, giảm thinking budget.
+# - Gemini lỗi/chậm không đẩy ESP32 vào tts_error; robot nói thông báo bằng TTS.
 # - Thêm bộ đếm Search theo ngày và tự chặn Search khi hết 500 lượt local guard.
 # - Khi hết lượt Search, robot nói rõ phải đợi ngày mai mới tìm kiếm tiếp.
 # - Giới hạn output Gemini được ghi chú rõ tại MAX_OUTPUT_TOKENS bên dưới.
@@ -59,6 +61,12 @@ MODEL_NAME = "gemini-2.5-flash"
 # GEMINI_MODEL=... environment variable cannot silently keep the old model.
 # LOW keeps real reasoning enabled while reducing response latency.
 THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
+# Gemini 2.5 uses a thinking budget in the legacy Generate Content API.
+# Keep the budget small for a voice robot so the ESP32 is not left waiting too long.
+GEMINI_THINKING_BUDGET = max(0, int(os.environ.get("GEMINI_THINKING_BUDGET", "1024")))
+# Hard cap for one Gemini batch request. This prevents the ESP32 from sitting in
+# THINKING until its own timeout when Google Search/model latency spikes.
+GEMINI_REQUEST_TIMEOUT_SECONDS = max(5.0, float(os.environ.get("GEMINI_REQUEST_TIMEOUT_SECONDS", "18")))
 MEMORY_TURNS = max(10, int(os.environ.get("MEMORY_TURNS", "10")))
 
 # ================================================================================
@@ -680,6 +688,8 @@ def read_root():
         "tts_streaming": True,
         "tts_output": "PCM16 16kHz mono",
         "gemini_thinking_level": THINKING_LEVEL,
+        "gemini_thinking_budget": GEMINI_THINKING_BUDGET,
+        "gemini_request_timeout_seconds": GEMINI_REQUEST_TIMEOUT_SECONDS,
         "memory_turns": MEMORY_TURNS,
         "gemini_debug_chunks": GEMINI_DEBUG_CHUNKS,
         "google_search_enabled": GOOGLE_SEARCH_ENABLED,
@@ -940,6 +950,14 @@ async def ask_gemini_audio(
     safety_config,
     history: deque,
 ) -> tuple[str, str, dict]:
+    """Stable batch Gemini path for the robot.
+
+    Important for Gemini 2.5 Flash:
+    - Use Generate Content (non-streaming) because the robot does not need partial
+      text; it waits for the final answer before starting TTS anyway.
+    - Use a small thinking budget for voice latency.
+    - Put a hard timeout around the Gemini request so the ESP32 never waits forever.
+    """
     global CURRENT_KEY_INDEX
     gemini_started = time.monotonic()
 
@@ -950,7 +968,6 @@ async def ask_gemini_audio(
     if CURRENT_KEY_INDEX >= total_keys:
         CURRENT_KEY_INDEX = 0
 
-    # The currently remembered key is always first.
     key_idx: Optional[int] = CURRENT_KEY_INDEX
 
     while key_idx is not None:
@@ -967,84 +984,98 @@ async def ask_gemini_audio(
 
         search_reserved = False
         search_state = {"did_search": False, "queries": set()}
+
         try:
             if GOOGLE_SEARCH_ENABLED:
                 search_reserved = await reserve_search_budget()
+
             search_tools_for_request = GOOGLE_SEARCH_TOOLS if search_reserved else None
             search_blocked = GOOGLE_SEARCH_ENABLED and not search_reserved
 
             if search_blocked:
+                snap = get_search_usage_snapshot()
                 print(
                     f"[SEARCH QUOTA] Het luot hom nay -> tat Google Search cho request nay | "
-                    f"used={get_search_usage_snapshot()['used']}/{GOOGLE_SEARCH_DAILY_LIMIT}",
+                    f"used={snap['used']}/{GOOGLE_SEARCH_DAILY_LIMIT}",
                     flush=True,
                 )
 
-            # ================================================================
-            # FIRST REQUEST
-            # ================================================================
-            stream = await client.aio.models.generate_content_stream(
-                model=MODEL_NAME,
-                contents=make_gemini_contents(history, wav_bytes),
-                config=types.GenerateContentConfig(
-                    system_instruction=_build_system_instruction(search_blocked=search_blocked),
-                    max_output_tokens=MAX_OUTPUT_TOKENS,
-                    tools=search_tools_for_request,
-                    thinking_config=types.ThinkingConfig(
-                        thinking_level=THINKING_LEVEL
-                    ),
-                    safety_settings=safety_config,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                        disable=True
-                    ),
+            config = types.GenerateContentConfig(
+                system_instruction=_build_system_instruction(search_blocked=search_blocked),
+                max_output_tokens=MAX_OUTPUT_TOKENS,
+                tools=search_tools_for_request,
+                thinking_config=types.ThinkingConfig(
+                    thinking_budget=GEMINI_THINKING_BUDGET,
+                ),
+                safety_settings=safety_config,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=True
                 ),
             )
 
-            parts: list[str] = []
-            finish_state = {"reason": None, "message": None}
-            usage = None
-            first_text_state = {"ms": None}
-            chunk_count = 0
+            print(
+                f"[GEMINI] Request batch | model={MODEL_NAME} | "
+                f"thinking_budget={GEMINI_THINKING_BUDGET} | "
+                f"search={'ON' if search_tools_for_request else 'OFF'} | "
+                f"timeout={GEMINI_REQUEST_TIMEOUT_SECONDS}s",
+                flush=True,
+            )
 
-            async for chunk in stream:
-                chunk_count += 1
-                try:
-                    _read_gemini_chunk(
-                        chunk,
-                        chunk_count,
-                        "initial",
-                        parts,
-                        finish_state,
-                        gemini_started,
-                        first_text_state,
-                        search_state,
-                    )
-                except Exception as chunk_exc:
-                    print(
-                        f"[GEMINI CHUNK ERROR] initial | "
-                        f"chunk={chunk_count} | {str(chunk_exc)[:200]}",
-                        flush=True,
-                    )
-                try:
-                    if chunk.usage_metadata:
-                        usage = chunk.usage_metadata
-                except Exception:
-                    pass
+            try:
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=MODEL_NAME,
+                        contents=make_gemini_contents(history, wav_bytes),
+                        config=config,
+                    ),
+                    timeout=GEMINI_REQUEST_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Gemini timeout sau {GEMINI_REQUEST_TIMEOUT_SECONDS:.0f}s"
+                ) from exc
+
+            # Inspect the final response for grounding metadata. For Gemini 2.5,
+            # Google documents Search grounding as a per-prompt tool charge/quota.
+            candidates = getattr(response, "candidates", None) or []
+            parts: list[str] = []
+            finish_reason = "UNKNOWN"
+            finish_message = None
+            usage = getattr(response, "usage_metadata", None)
+
+            if candidates:
+                candidate = candidates[0]
+                finish_value = getattr(candidate, "finish_reason", None)
+                if finish_value is not None:
+                    finish_reason = str(finish_value)
+                finish_message_value = getattr(candidate, "finish_message", None)
+                if finish_message_value:
+                    finish_message = str(finish_message_value)
+
+                grounding_metadata = getattr(candidate, "grounding_metadata", None)
+                if grounding_metadata is not None:
+                    queries = getattr(grounding_metadata, "web_search_queries", None) or []
+                    chunks = getattr(grounding_metadata, "grounding_chunks", None) or []
+                    if queries or chunks:
+                        search_state["did_search"] = True
+                        search_state["queries"].update(str(q) for q in queries)
+
+                content = getattr(candidate, "content", None)
+                response_parts = getattr(content, "parts", None) if content is not None else None
+                for part in response_parts or []:
+                    if getattr(part, "thought", False):
+                        continue
+                    part_text = getattr(part, "text", None)
+                    if part_text:
+                        parts.append(str(part_text))
 
             raw_text = "".join(parts).strip()
-            finish_reason = finish_state["reason"] or "UNKNOWN"
-            upper = finish_reason.upper()
-
-            gemini_total_ms = int(
-                (time.monotonic() - gemini_started) * 1000
-            )
-            _log_gemini_result(
-                "initial",
-                raw_text,
-                chunk_count,
-                finish_state,
-                first_text_state["ms"],
-                gemini_total_ms,
+            elapsed_ms = int((time.monotonic() - gemini_started) * 1000)
+            print(
+                f"[GEMINI] Batch xong | chars={len(raw_text)} | "
+                f"finish_reason={finish_reason!r} | total={elapsed_ms} ms | "
+                f"grounding={'YES' if search_state['did_search'] else 'NO'}",
+                flush=True,
             )
 
             if usage:
@@ -1060,12 +1091,14 @@ async def ask_gemini_audio(
                 bool(search_state.get("did_search")),
             )
             search_reserved = False
+
             if search_state.get("did_search"):
                 print(
-                    f"[SEARCH] Grounding executada | queries={sorted(search_state.get('queries', set()))}",
+                    f"[SEARCH] Grounding executed | queries={sorted(search_state['queries'])}",
                     flush=True,
                 )
 
+            upper = finish_reason.upper()
             bad_reasons = (
                 "MAX_TOKENS",
                 "SAFETY",
@@ -1076,50 +1109,45 @@ async def ask_gemini_audio(
             if any(x in upper for x in bad_reasons):
                 raise RuntimeError(
                     f"Gemini response khong hoan chinh: {finish_reason}"
+                    + (f" | {finish_message}" if finish_message else "")
                 )
+
+            if not raw_text:
+                raise RuntimeError("Gemini tra ve rong")
 
             memory_text, text, action = parse_tagged_response(raw_text)
             if not text:
-                raise RuntimeError("Gemini tra ve rong")
+                raise RuntimeError("Gemini tra ve rong REPLY")
             if not memory_text:
                 memory_text = "Không trích xuất được tóm tắt lượt này."
 
             CURRENT_KEY_INDEX = key_idx
             print(
-                f"[GEMINI] Ghi nho Key #{key_idx + 1} | thinking={THINKING_LEVEL}.",
+                f"[GEMINI] Ghi nho Key #{key_idx + 1} | thinking_budget={GEMINI_THINKING_BUDGET}.",
                 flush=True,
             )
-            print(
-                f"[GEMINI REPLY REPR] {text!r}",
-                flush=True,
-            )
+            print(f"[GEMINI REPLY REPR] {text!r}", flush=True)
             return memory_text, text, action
 
         except Exception as exc:
             if search_reserved:
-                await finalize_search_budget(
-                    search_reserved,
-                    bool(search_state.get("did_search")),
-                )
+                # If the request failed before a usable final response was received,
+                # release the local reservation without counting it as a grounded prompt.
+                try:
+                    await finalize_search_budget(search_reserved, False)
+                except Exception:
+                    pass
                 search_reserved = False
+
             kind = classify_gemini_error(exc)
             code = _error_code(exc)
-            detail = str(exc).replace("\n", " ")[:220]
+            detail = str(exc).replace("\n", " ")[:260]
 
             if kind == "search_quota":
                 mark_search_quota_exhausted()
-                return (
-                    "Hết lượt tìm kiếm hôm nay.",
-                    GOOGLE_SEARCH_WARNING_TEXT,
-                    {
-                        "type": "none",
-                        "emotion": "neutral",
-                        "direction": "none",
-                        "degrees": 0,
-                        "distance_cm": 0,
-                        "speed": "normal",
-                    },
-                )
+                raise RuntimeError(
+                    "GOOGLE_SEARCH_QUOTA_EXHAUSTED: " + GOOGLE_SEARCH_WARNING_TEXT
+                ) from exc
 
             if kind == "rotate":
                 mark_key_disabled(key_idx, detail)
@@ -1129,157 +1157,19 @@ async def ask_gemini_audio(
                         "Tat ca Gemini key phia sau deu khong con dung duoc"
                     ) from exc
                 print(
-                    f"[GEMINI] Key #{key_idx + 1} khong dung duoc"
-                    f" ({'HTTP ' + str(code) if code else 'key/quota error'}) -> Key #{nxt + 1}",
+                    f"[GEMINI] Key #{key_idx + 1} khong dung duoc "
+                    f"({'HTTP ' + str(code) if code else 'key/quota error'}) -> Key #{nxt + 1}",
                     flush=True,
                 )
                 key_idx = nxt
                 continue
 
-            if kind == "transient":
-                print(
-                    f"[GEMINI] Loi tam thoi Key #{key_idx + 1}: "
-                    f"{detail} -> retry",
-                    flush=True,
-                )
-                await asyncio.sleep(0.6)
-                retry_search_reserved = False
-                retry_search_state = {"did_search": False, "queries": set()}
-                try:
-                    if GOOGLE_SEARCH_ENABLED:
-                        retry_search_reserved = await reserve_search_budget()
-                    retry_search_tools = GOOGLE_SEARCH_TOOLS if retry_search_reserved else None
-                    retry_search_blocked = GOOGLE_SEARCH_ENABLED and not retry_search_reserved
-                    retry_started = time.monotonic()
-                    retry_stream = await client.aio.models.generate_content_stream(
-                        model=MODEL_NAME,
-                        contents=make_gemini_contents(history, wav_bytes),
-                        config=types.GenerateContentConfig(
-                            system_instruction=_build_system_instruction(search_blocked=retry_search_blocked),
-                            max_output_tokens=MAX_OUTPUT_TOKENS,
-                            tools=retry_search_tools,
-                            # Preserve the same reasoning configuration on retry.
-                            thinking_config=types.ThinkingConfig(
-                                thinking_level=THINKING_LEVEL
-                            ),
-                            safety_settings=safety_config,
-                            automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                                disable=True
-                            ),
-                        ),
-                    )
-
-                    retry_parts: list[str] = []
-                    retry_finish_state = {"reason": None, "message": None}
-                    retry_first_text_state = {"ms": None}
-                    retry_chunk_count = 0
-                    retry_usage = None
-
-                    async for chunk in retry_stream:
-                        retry_chunk_count += 1
-                        try:
-                            _read_gemini_chunk(
-                                chunk,
-                                retry_chunk_count,
-                                "retry",
-                                retry_parts,
-                                retry_finish_state,
-                                retry_started,
-                                retry_first_text_state,
-                                retry_search_state,
-                            )
-                        except Exception as chunk_exc:
-                            print(
-                                f"[GEMINI CHUNK ERROR] retry | "
-                                f"chunk={retry_chunk_count} | {str(chunk_exc)[:200]}",
-                                flush=True,
-                            )
-                        try:
-                            if chunk.usage_metadata:
-                                retry_usage = chunk.usage_metadata
-                        except Exception:
-                            pass
-
-                    retry_raw = "".join(retry_parts).strip()
-                    retry_finish = retry_finish_state["reason"]
-                    await finalize_search_budget(
-                        retry_search_reserved,
-                        bool(retry_search_state.get("did_search")),
-                    )
-                    retry_search_reserved = False
-                    if retry_search_state.get("did_search"):
-                        print(
-                            f"[SEARCH] Retry grounding executada | queries={sorted(retry_search_state.get('queries', set()))}",
-                            flush=True,
-                        )
-                    retry_elapsed = int(
-                        (time.monotonic() - retry_started) * 1000
-                    )
-                    _log_gemini_result(
-                        "retry",
-                        retry_raw,
-                        retry_chunk_count,
-                        retry_finish_state,
-                        retry_first_text_state["ms"],
-                        retry_elapsed,
-                    )
-
-                    retry_memory, retry_text, retry_action = parse_tagged_response(
-                        retry_raw
-                    )
-                    if retry_text and (
-                        retry_finish is None
-                        or "STOP" in retry_finish.upper()
-                    ):
-                        CURRENT_KEY_INDEX = key_idx
-                        print(
-                            f"[GEMINI] Retry thanh cong voi Key #{key_idx + 1}.",
-                            flush=True,
-                        )
-                        print(
-                            f"[GEMINI REPLY REPR] {retry_text!r}",
-                            flush=True,
-                        )
-                        if retry_usage:
-                            print(
-                                f"[GEMINI] Retry usage | "
-                                f"prompt={getattr(retry_usage, 'prompt_token_count', None)} | "
-                                f"output={getattr(retry_usage, 'candidates_token_count', None)} | "
-                                f"total={getattr(retry_usage, 'total_token_count', None)}",
-                                flush=True,
-                            )
-                        return (
-                            retry_memory
-                            or "Không trích xuất được tóm tắt lượt này.",
-                            retry_text,
-                            retry_action,
-                        )
-                except Exception as retry_exc:
-                    if retry_search_reserved:
-                        await finalize_search_budget(
-                            retry_search_reserved,
-                            bool(retry_search_state.get("did_search")),
-                        )
-                        retry_search_reserved = False
-                    print(
-                        f"[GEMINI RETRY ERROR] {str(retry_exc)[:220]}",
-                        flush=True,
-                    )
-                    if classify_gemini_error(retry_exc) == "search_quota":
-                        mark_search_quota_exhausted()
-                        return (
-                            "Hết lượt tìm kiếm hôm nay.",
-                            GOOGLE_SEARCH_WARNING_TEXT,
-                            {
-                                "type": "none",
-                                "emotion": "neutral",
-                                "direction": "none",
-                                "degrees": 0,
-                                "distance_cm": 0,
-                                "speed": "normal",
-                            },
-                        )
-
+            # Do not blindly retry timeouts. A voice robot must fail fast and give
+            # the user a spoken status instead of waiting another full timeout.
+            print(
+                f"[GEMINI] Request that bai Key #{key_idx + 1}: {detail}",
+                flush=True,
+            )
             raise RuntimeError(detail) from exc
 
     raise RuntimeError("Khong co Gemini key active")
@@ -1855,17 +1745,28 @@ async def websocket_chat(websocket: WebSocket):
                         conversation_history,
                     )
                 except Exception as exc:
+                    # Never drop the robot into ESP32 ERROR just because Gemini/Search
+                    # is slow or temporarily unavailable. Reuse the normal TTS path
+                    # so the robot can explain what happened instead.
+                    err_text = str(exc)
+                    if err_text.startswith("GOOGLE_SEARCH_QUOTA_EXHAUSTED:"):
+                        answer = GOOGLE_SEARCH_WARNING_TEXT
+                    elif "timeout" in err_text.lower():
+                        answer = "Xin lỗi, hôm nay mạng phản hồi hơi chậm nên mình chưa xử lý kịp. Bạn thử hỏi lại mình nhé."
+                    else:
+                        answer = "Xin lỗi, hiện tại mình đang gặp trục trặc kết nối với bộ não AI. Bạn thử lại mình nhé."
+                    user_memory = "Hệ thống Gemini không hoàn tất được lượt xử lý hiện tại."
+                    action = {
+                        "type": "none",
+                        "emotion": "sad",
+                        "direction": "none",
+                        "degrees": 0,
+                        "distance_cm": 0,
+                        "speed": "normal",
+                    }
+                    print(f"[GEMINI FALLBACK SPEECH] {answer}", flush=True)
+                finally:
                     pcm_buffer.clear()
-                    await websocket.send_text(
-                        json.dumps(
-                            {
-                                "event": "tts_error",
-                                "message": str(exc)[:300],
-                            },
-                            ensure_ascii=False,
-                        )
-                    )
-                    continue
 
             pcm_buffer.clear()
             cleaned = clean_text_for_tts(answer)
