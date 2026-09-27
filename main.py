@@ -1,15 +1,16 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.2 - SEARCH FREE + STABLE BATCH
-# Phiên bản: 4.2
+# ROBOT BÚN ĐẬU SERVER - V4.3 - GEMINI 3.8 LIVE + FREE SEARCH TEST
+# Phiên bản: 4.3
 #
 # - Quay về pipeline audio WAV -> Gemini batch để ưu tiên độ ổn định/độ chính xác.
 # - Thêm Google Search grounding cho câu hỏi cần thông tin hiện tại.
 # - Thêm ngữ cảnh thời gian Việt Nam (Asia/Ho_Chi_Minh) cho câu hỏi "mấy giờ".
 # - Giữ MEMORY / ACTION / REPLY / TTS / Edge-TTS fallback / ToF / sticky key.
-# - Giữ Gemini 2.5 Flash để test Free Tier + Google Search grounding.
-# - Ổn định hóa batch: không stream text, giới hạn timeout Gemini, giảm thinking budget.
+# - Dùng Gemini 3.8 Live làm pipeline hội thoại/âm thanh chính.
+# - Gemini 3.8 Live có Free Tier và Google Search được hỗ trợ trong Free Tier.
+# - Giữ Gemini 3.8 Flash làm batch fallback tùy chọn, mặc định TẮT vì Batch không có Free Tier.
 # - Gemini lỗi/chậm không đẩy ESP32 vào tts_error; robot nói thông báo bằng TTS.
-# - Thêm bộ đếm Search theo ngày và tự chặn Search khi hết 500 lượt local guard.
+# - Thêm bộ đếm local search-intent theo ngày; đây là safety guard cục bộ, không phải quota Google.
 # - Khi hết lượt Search, robot nói rõ phải đợi ngày mai mới tìm kiếm tiếp.
 # - Giới hạn output Gemini được ghi chú rõ tại MAX_OUTPUT_TOKENS bên dưới.
 # ================================================================================
@@ -56,14 +57,13 @@ KEY_STATUS = ["active"] * len(API_KEYS)
 KEY_FAILURE_REASON: list[Optional[str]] = [None] * len(API_KEYS)
 KEY_LOCK = asyncio.Lock()
 
-MODEL_NAME = "gemini-2.5-flash"
-# Test build: intentionally fixed to Gemini 2.5 Flash so an old Render
+MODEL_NAME = "gemini-3.8-flash"
+# Test build: intentionally fixed to Gemini 3.8 Flash so an old Render
 # GEMINI_MODEL=... environment variable cannot silently keep the old model.
 # LOW keeps real reasoning enabled while reducing response latency.
 THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
-# Gemini 2.5 uses a thinking budget in the legacy Generate Content API.
-# Keep the budget small for a voice robot so the ESP32 is not left waiting too long.
-GEMINI_THINKING_BUDGET = max(0, int(os.environ.get("GEMINI_THINKING_BUDGET", "1024")))
+# Batch fallback only. Gemini 3.8 uses thinking_level.
+GEMINI_THINKING_LEVEL_38 = os.environ.get("GEMINI_THINKING_LEVEL_38", "low").strip().lower()
 # Hard cap for one Gemini batch request. This prevents the ESP32 from sitting in
 # THINKING until its own timeout when Google Search/model latency spikes.
 GEMINI_REQUEST_TIMEOUT_SECONDS = max(5.0, float(os.environ.get("GEMINI_REQUEST_TIMEOUT_SECONDS", "18")))
@@ -131,13 +131,13 @@ GEMINI_DEBUG_CHUNKS = (
 # Gemini Live is used for realtime audio input.
 # 3.1 Flash Live keeps TEXT output available, which lets us preserve the current
 # MEMORY/ACTION/REPLY protocol and the existing TTS pipeline without changing the ESP audio contract.
+# V4.3: Gemini 3.8 Live is the default brain path.
 LIVE_ENABLED = (
-    (not STABLE_BATCH_AUDIO_MODE)
-    and os.environ.get("GEMINI_LIVE_ENABLED", "false").strip().lower()
+    os.environ.get("GEMINI_LIVE_ENABLED", "true").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 LIVE_MODEL_NAME = os.environ.get(
-    "GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview"
+    "GEMINI_LIVE_MODEL", "gemini-3.8-live"
 ).strip()
 LIVE_MAX_OUTPUT_TOKENS = int(
     os.environ.get("GEMINI_LIVE_MAX_OUTPUT_TOKENS", "384")
@@ -145,10 +145,14 @@ LIVE_MAX_OUTPUT_TOKENS = int(
 LIVE_THINKING_LEVEL = os.environ.get(
     "GEMINI_LIVE_THINKING_LEVEL", "low"
 ).strip().lower()
+GEMINI_BATCH_FALLBACK_ENABLED = (
+    os.environ.get("GEMINI_BATCH_FALLBACK_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 LIVE_INPUT_MIME = "audio/pcm;rate=16000"
 LIVE_SESSION_CONNECT_RETRIES = max(1, int(os.environ.get("GEMINI_LIVE_CONNECT_RETRIES", "2")))
 LIVE_TRANSCRIPT_LOG = os.environ.get("GEMINI_LIVE_TRANSCRIPT_LOG", "false").strip().lower() in {"1", "true", "yes", "on"}
-LIVE_INPUT_TRANSCRIPTION = os.environ.get("GEMINI_LIVE_INPUT_TRANSCRIPTION", "false").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_INPUT_TRANSCRIPTION = os.environ.get("GEMINI_LIVE_INPUT_TRANSCRIPTION", "true").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_HISTORY_RESET_TURNS = max(10, int(os.environ.get("GEMINI_LIVE_HISTORY_RESET_TURNS", "10")))
 
 SYSTEM_PROMPT = r"""
@@ -351,6 +355,51 @@ def get_search_usage_snapshot() -> dict:
             0, GOOGLE_SEARCH_DAILY_LIMIT - _SEARCH_USED_TODAY - _SEARCH_RESERVED_TODAY
         ),
     }
+
+
+SEARCH_INTENT_PATTERNS = [
+    r"\bth[oơờ]i ti[eếệ]t\b",
+    r"\bgi[aá] x[aă]ng\b",
+    r"\bgi[aá] v[aà]ng\b",
+    r"\bt[yỷ] gi[aá]\b",
+    r"\bbitcoin\b",
+    r"\bcrypto(?:currency)?\b",
+    r"\btin t[uứ]c\b",
+    r"\bm[oớ]i nh[aấ]t\b",
+    r"\bhi[eệ]n t[aạ]i\b",
+    r"\bh[oô]m nay\b",
+    r"\bb[aâ]y gi[oờ]\b",
+    r"\bk[eế]t qu[aả]\b",
+    r"\bt[yỷ] s[oố]\b",
+    r"\bl[iị]ch thi [dđ][aấ]u\b",
+    r"\bl[iị]ch [dđ][aă]ng\b",
+    r"\bs[uự] ki[eệ]n\b",
+]
+
+def looks_like_search_intent(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    return bool(normalized) and any(
+        re.search(pattern, normalized, re.IGNORECASE) for pattern in SEARCH_INTENT_PATTERNS
+    )
+
+
+async def record_local_search_intent(transcript: str) -> bool:
+    """Conservative local guard for likely current-data questions."""
+    global _SEARCH_USED_TODAY
+    if not GOOGLE_SEARCH_ENABLED or not looks_like_search_intent(transcript):
+        return False
+    async with _SEARCH_USAGE_LOCK:
+        _load_search_usage_unlocked()
+        if _SEARCH_USED_TODAY >= GOOGLE_SEARCH_DAILY_LIMIT:
+            return True
+        _SEARCH_USED_TODAY = min(GOOGLE_SEARCH_DAILY_LIMIT, _SEARCH_USED_TODAY + 1)
+        _save_search_usage_unlocked()
+        remaining = max(0, GOOGLE_SEARCH_DAILY_LIMIT - _SEARCH_USED_TODAY)
+        print(
+            f"[SEARCH GUARD] Search-intent turn={_SEARCH_USED_TODAY}/{GOOGLE_SEARCH_DAILY_LIMIT} | remaining={remaining} | transcript={transcript!r}",
+            flush=True,
+        )
+        return _SEARCH_USED_TODAY >= GOOGLE_SEARCH_DAILY_LIMIT
 
 
 GOOGLE_SEARCH_TOOLS = (
@@ -688,7 +737,7 @@ def read_root():
         "tts_streaming": True,
         "tts_output": "PCM16 16kHz mono",
         "gemini_thinking_level": THINKING_LEVEL,
-        "gemini_thinking_budget": GEMINI_THINKING_BUDGET,
+        "gemini_thinking_level_38": GEMINI_THINKING_LEVEL_38,
         "gemini_request_timeout_seconds": GEMINI_REQUEST_TIMEOUT_SECONDS,
         "memory_turns": MEMORY_TURNS,
         "gemini_debug_chunks": GEMINI_DEBUG_CHUNKS,
@@ -703,6 +752,8 @@ def read_root():
         "stable_batch_audio_mode": STABLE_BATCH_AUDIO_MODE,
         "gemini_live_enabled": LIVE_ENABLED,
         "gemini_live_model": LIVE_MODEL_NAME,
+        "gemini_batch_fallback_enabled": GEMINI_BATCH_FALLBACK_ENABLED,
+        "google_search_daily_usage": get_search_usage_snapshot(),
         "gemini_live_audio_input": "PCM16 16kHz mono realtime",
         "tof_sensor": "VL53L0X over shared I2C",
         "robot_command_protocol": "v1",
@@ -1005,7 +1056,7 @@ async def ask_gemini_audio(
                 max_output_tokens=MAX_OUTPUT_TOKENS,
                 tools=search_tools_for_request,
                 thinking_config=types.ThinkingConfig(
-                    thinking_budget=GEMINI_THINKING_BUDGET,
+                    thinking_level=GEMINI_THINKING_LEVEL_38,
                 ),
                 safety_settings=safety_config,
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(
@@ -1015,7 +1066,7 @@ async def ask_gemini_audio(
 
             print(
                 f"[GEMINI] Request batch | model={MODEL_NAME} | "
-                f"thinking_budget={GEMINI_THINKING_BUDGET} | "
+                f"thinking_level={GEMINI_THINKING_LEVEL_38} | "
                 f"search={'ON' if search_tools_for_request else 'OFF'} | "
                 f"timeout={GEMINI_REQUEST_TIMEOUT_SECONDS}s",
                 flush=True,
@@ -1123,7 +1174,7 @@ async def ask_gemini_audio(
 
             CURRENT_KEY_INDEX = key_idx
             print(
-                f"[GEMINI] Ghi nho Key #{key_idx + 1} | thinking_budget={GEMINI_THINKING_BUDGET}.",
+                f"[GEMINI] Ghi nho Key #{key_idx + 1} | thinking_level={GEMINI_THINKING_LEVEL_38}.",
                 flush=True,
             )
             print(f"[GEMINI REPLY REPR] {text!r}", flush=True)
@@ -1178,14 +1229,14 @@ async def ask_gemini_audio(
 # ================================================================================
 # 5. GEMINI LIVE + WEBSOCKET
 # ================================================================================
-def _live_config(safety_config):
-    """Build a LiveConnectConfig that keeps client-side VAD in control."""
-    # Gemini 3.1 Flash Live supports TEXT output and configurable thinking levels.
-    # Automatic activity detection is disabled because the ESP32 already owns VAD/end-of-speech detection.
+def _live_config(safety_config, search_blocked: bool = False):
+    """Build Gemini 3.8 Live config; ESP32 still owns VAD/end-of-speech."""
+    search_tools = None if search_blocked else GOOGLE_SEARCH_TOOLS
     return types.LiveConnectConfig(
         response_modalities=["TEXT"],
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=_build_system_instruction(search_blocked=search_blocked),
         max_output_tokens=LIVE_MAX_OUTPUT_TOKENS,
+        tools=search_tools,
         thinking_config=types.ThinkingConfig(
             thinking_level=LIVE_THINKING_LEVEL,
         ),
@@ -1276,6 +1327,7 @@ async def open_live_handle(
     history: deque,
     safety_config,
     preferred_key_idx: int,
+    search_blocked: bool = False,
 ) -> dict:
     """Connect a persistent Live session using the sticky Gemini key policy."""
     global CURRENT_KEY_INDEX
@@ -1304,7 +1356,7 @@ async def open_live_handle(
             try:
                 session_cm = client.aio.live.connect(
                     model=LIVE_MODEL_NAME,
-                    config=_live_config(safety_config),
+                    config=_live_config(safety_config, search_blocked=search_blocked),
                 )
                 session = await session_cm.__aenter__()
 
@@ -1335,6 +1387,7 @@ async def open_live_handle(
                     "turn_started": None,
                     "last_error": None,
                     "session_turns": 0,
+                    "search_blocked": search_blocked,
                 }
             except Exception as exc:
                 last_exc = exc
@@ -1571,23 +1624,26 @@ async def websocket_chat(websocket: WebSocket):
         ),
     ]
 
-    async def ensure_live() -> Optional[dict]:
+    async def ensure_live(search_blocked: bool = False) -> Optional[dict]:
         nonlocal live_handle
         if not LIVE_ENABLED:
             return None
-        if live_handle and live_handle.get("last_error") is None:
+        if (
+            live_handle
+            and live_handle.get("last_error") is None
+            and bool(live_handle.get("search_blocked", False)) == bool(search_blocked)
+        ):
             return live_handle
         await close_live_handle(live_handle)
         live_handle = None
 
-        # Keep the same sticky key that batch Gemini uses. A Live session remains on this key
-        # until it fails; only then does the shared key state rotate forward.
         preferred = CURRENT_KEY_INDEX if API_KEYS else 0
         try:
             live_handle = await open_live_handle(
                 conversation_history,
                 safety_config,
                 preferred,
+                search_blocked=search_blocked,
             )
             live_handle["receive_task"] = asyncio.create_task(
                 live_receive_loop(live_handle)
@@ -1599,10 +1655,9 @@ async def websocket_chat(websocket: WebSocket):
             return None
 
     try:
-        # Ở V4.0, mặc định dùng pipeline batch ổn định; Live chỉ được bật lại khi
-        # BUN_DAU_STABLE_BATCH_AUDIO_MODE=false và GEMINI_LIVE_ENABLED=true.
-        if not STABLE_BATCH_AUDIO_MODE:
-            await ensure_live()
+        if LIVE_ENABLED:
+            initial_search_blocked = get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT
+            await ensure_live(search_blocked=initial_search_blocked)
 
         while True:
             message = await websocket.receive()
@@ -1653,8 +1708,9 @@ async def websocket_chat(websocket: WebSocket):
                     flush=True,
                 )
 
-                if not STABLE_BATCH_AUDIO_MODE:
-                    live = await ensure_live()
+                if LIVE_ENABLED:
+                    search_blocked_now = get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT
+                    live = await ensure_live(search_blocked=search_blocked_now)
                     if live is not None:
                         try:
                             await live_start_turn(
@@ -1678,7 +1734,7 @@ async def websocket_chat(websocket: WebSocket):
             speech_active = False
             pcm_size = len(pcm_buffer)
             print(
-                f"[WEBSOCKET] ESP32 dung ghi am. PCM={pcm_size} bytes | mode={'batch' if STABLE_BATCH_AUDIO_MODE else 'live'}",
+                f"[WEBSOCKET] ESP32 dung ghi am. PCM={pcm_size} bytes | mode={'live' if LIVE_ENABLED else 'batch'}",
                 flush=True,
             )
 
@@ -1738,24 +1794,37 @@ async def websocket_chat(websocket: WebSocket):
                     live_result = None
 
             if live_result is None:
-                try:
-                    user_memory, answer, action = await process_fallback_batch(
-                        bytes(pcm_buffer),
-                        safety_config,
-                        conversation_history,
-                    )
-                except Exception as exc:
-                    # Never drop the robot into ESP32 ERROR just because Gemini/Search
-                    # is slow or temporarily unavailable. Reuse the normal TTS path
-                    # so the robot can explain what happened instead.
-                    err_text = str(exc)
-                    if err_text.startswith("GOOGLE_SEARCH_QUOTA_EXHAUSTED:"):
+                if GEMINI_BATCH_FALLBACK_ENABLED:
+                    try:
+                        user_memory, answer, action = await process_fallback_batch(
+                            bytes(pcm_buffer),
+                            safety_config,
+                            conversation_history,
+                        )
+                    except Exception as exc:
+                        err_text = str(exc)
+                        if err_text.startswith("GOOGLE_SEARCH_QUOTA_EXHAUSTED:"):
+                            answer = GOOGLE_SEARCH_WARNING_TEXT
+                        elif "timeout" in err_text.lower():
+                            answer = "Xin lỗi, hôm nay mạng phản hồi hơi chậm nên mình chưa xử lý kịp. Bạn thử hỏi lại mình nhé."
+                        else:
+                            answer = "Xin lỗi, hiện tại mình đang gặp trục trặc kết nối với bộ não AI. Bạn thử lại mình nhé."
+                        user_memory = "Hệ thống Gemini không hoàn tất được lượt xử lý hiện tại."
+                        action = {
+                            "type": "none",
+                            "emotion": "sad",
+                            "direction": "none",
+                            "degrees": 0,
+                            "distance_cm": 0,
+                            "speed": "normal",
+                        }
+                        print(f"[GEMINI FALLBACK SPEECH] {answer}", flush=True)
+                else:
+                    if get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT:
                         answer = GOOGLE_SEARCH_WARNING_TEXT
-                    elif "timeout" in err_text.lower():
-                        answer = "Xin lỗi, hôm nay mạng phản hồi hơi chậm nên mình chưa xử lý kịp. Bạn thử hỏi lại mình nhé."
                     else:
                         answer = "Xin lỗi, hiện tại mình đang gặp trục trặc kết nối với bộ não AI. Bạn thử lại mình nhé."
-                    user_memory = "Hệ thống Gemini không hoàn tất được lượt xử lý hiện tại."
+                    user_memory = "Gemini Live không hoàn tất được lượt xử lý hiện tại."
                     action = {
                         "type": "none",
                         "emotion": "sad",
@@ -1765,10 +1834,19 @@ async def websocket_chat(websocket: WebSocket):
                         "speed": "normal",
                     }
                     print(f"[GEMINI FALLBACK SPEECH] {answer}", flush=True)
-                finally:
-                    pcm_buffer.clear()
+                pcm_buffer.clear()
 
             pcm_buffer.clear()
+            if live_result is not None:
+                transcript = (live_result.get("input_transcript") or "").strip()
+                guard_exhausted = await record_local_search_intent(transcript)
+                if guard_exhausted and live_handle is not None:
+                    print(
+                        "[SEARCH GUARD] Đã đạt local daily guard -> lượt tiếp theo sẽ chạy không có Google Search.",
+                        flush=True,
+                    )
+                    await close_live_handle(live_handle)
+                    live_handle = None
             cleaned = clean_text_for_tts(answer)
             print(f"[BUN DAU] {cleaned}", flush=True)
             if GEMINI_DEBUG_CHUNKS:
