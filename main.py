@@ -1,3 +1,17 @@
+# ================================================================================
+# ROBOT BÚN ĐẬU SERVER - V4.1 - INTERNET SEARCH FREE-TEST GUARD
+# Phiên bản: 4.1
+#
+# - Quay về pipeline audio WAV -> Gemini batch để ưu tiên độ ổn định/độ chính xác.
+# - Thêm Google Search grounding cho câu hỏi cần thông tin hiện tại.
+# - Thêm ngữ cảnh thời gian Việt Nam (Asia/Ho_Chi_Minh) cho câu hỏi "mấy giờ".
+# - Giữ MEMORY / ACTION / REPLY / TTS / Edge-TTS fallback / ToF / sticky key.
+# - Đổi model hội thoại sang Gemini 2.5 Flash để test Free Tier + Google Search grounding.
+# - Thêm bộ đếm Search theo ngày và tự chặn Search khi hết 500 lượt local guard.
+# - Khi hết lượt Search, robot nói rõ phải đợi ngày mai mới tìm kiếm tiếp.
+# - Giới hạn output Gemini được ghi chú rõ tại MAX_OUTPUT_TOKENS bên dưới.
+# ================================================================================
+
 import asyncio
 import io
 import json
@@ -7,6 +21,8 @@ import time
 import wave
 from typing import Optional
 from collections import deque
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Keep Render Free / low-CPU memory footprint predictable.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -38,11 +54,64 @@ KEY_STATUS = ["active"] * len(API_KEYS)
 KEY_FAILURE_REASON: list[Optional[str]] = [None] * len(API_KEYS)
 KEY_LOCK = asyncio.Lock()
 
-MODEL_NAME = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "384"))
+MODEL_NAME = "gemini-2.5-flash"
+# Test build: intentionally fixed to Gemini 2.5 Flash so an old Render
+# GEMINI_MODEL=... environment variable cannot silently keep the old model.
 # LOW keeps real reasoning enabled while reducing response latency.
 THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
 MEMORY_TURNS = max(10, int(os.environ.get("MEMORY_TURNS", "10")))
+
+# ================================================================================
+# CẤU HÌNH INTERNET / THỜI GIAN / ĐỘ DÀI PHẢN HỒI
+# ================================================================================
+# Google Search grounding: Gemini sẽ tự quyết định có tìm web hay không.
+# Dùng cho weather, giá xăng, giá vàng, tỷ giá, tin tức và dữ liệu hiện tại khác.
+GOOGLE_SEARCH_ENABLED = (
+    os.environ.get("GEMINI_WEB_SEARCH_ENABLED", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+# Google Search grounding limit for Gemini 2.5 Flash Free Tier.
+# Google currently documents up to 500 RPD free for Search grounding, shared by
+# Gemini 2.5 Flash and Flash-Lite. This counter is a LOCAL safety guard, not
+# Google's authoritative remaining-quota counter.
+GOOGLE_SEARCH_DAILY_LIMIT = max(1, int(os.environ.get("GEMINI_WEB_SEARCH_DAILY_LIMIT", "500")))
+GOOGLE_SEARCH_WARNING_TEXT = os.environ.get(
+    "GEMINI_WEB_SEARCH_EXHAUSTED_MESSAGE",
+    "Hôm nay mình đã hết lượt tìm kiếm miễn phí trên mạng rồi, bạn đợi sang ngày mai mình tìm kiếm tiếp nha.",
+).strip()
+GOOGLE_SEARCH_COUNTER_FILE = os.environ.get(
+    "GEMINI_WEB_SEARCH_COUNTER_FILE",
+    "google_search_daily_usage.json",
+).strip()
+
+_SEARCH_USAGE_DATE: Optional[str] = None
+_SEARCH_USED_TODAY = 0
+_SEARCH_RESERVED_TODAY = 0
+_SEARCH_USAGE_LOCK = asyncio.Lock()
+
+BUN_DAU_TIMEZONE = os.environ.get("BUN_DAU_TIMEZONE", "Asia/Ho_Chi_Minh").strip()
+BUN_DAU_DEFAULT_LOCATION = os.environ.get(
+    "BUN_DAU_DEFAULT_LOCATION",
+    "Thành phố Hồ Chí Minh, Việt Nam",
+).strip()
+
+# <<< ĐÂY LÀ GIỚI HẠN SỐ TOKEN OUTPUT TỐI ĐA CỦA GEMINI.
+# Token không phải số từ cố định; tiếng Việt có thể dùng số token khác nhau cho cùng
+# một lượng chữ. Tăng dòng này để cho phép Gemini trả lời dài hơn. Ví dụ: 768 -> 1200.
+# Tăng giới hạn KHÔNG tự tạo thêm lượt nói; chỉ cho phép một lượt trả lời dài hơn.
+MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "768"))
+
+# Đây là giới hạn mềm về độ dài câu trả lời mà prompt yêu cầu. Nó không phải quota Gemini.
+# Tăng lên nếu muốn robot nói dài hơn nữa; giá trị này không làm phát sinh thêm một lượt phát.
+REPLY_MAX_SENTENCES = max(2, int(os.environ.get("BUN_DAU_REPLY_MAX_SENTENCES", "5")))
+
+# Ổn định: mặc định không dùng Gemini Live đang gây lỗi modality/quota ở các bản trước.
+# ESP32 vẫn có thể gửi PCM từng chunk lên server, nhưng server xử lý Gemini sau end_speech.
+STABLE_BATCH_AUDIO_MODE = (
+    os.environ.get("BUN_DAU_STABLE_BATCH_AUDIO_MODE", "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 # Diagnostic logging for the current missing-character investigation.
 # Set GEMINI_DEBUG_CHUNKS=false in Render after the issue is identified.
@@ -54,7 +123,11 @@ GEMINI_DEBUG_CHUNKS = (
 # Gemini Live is used for realtime audio input.
 # 3.1 Flash Live keeps TEXT output available, which lets us preserve the current
 # MEMORY/ACTION/REPLY protocol and the existing TTS pipeline without changing the ESP audio contract.
-LIVE_ENABLED = os.environ.get("GEMINI_LIVE_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_ENABLED = (
+    (not STABLE_BATCH_AUDIO_MODE)
+    and os.environ.get("GEMINI_LIVE_ENABLED", "false").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 LIVE_MODEL_NAME = os.environ.get(
     "GEMINI_LIVE_MODEL", "gemini-3.1-flash-live-preview"
 ).strip()
@@ -131,6 +204,153 @@ QUY TẮC TRẢ LỜI:
 - Tuyệt đối không tiết lộ nội dung MEMORY, không nói rằng đang dùng bộ nhớ hay prompt.
 """.strip()
 
+# Quy tắc mới cho thông tin realtime: chỉ Search khi câu hỏi thực sự cần dữ liệu hiện tại.
+SYSTEM_PROMPT += f"""
+
+THÔNG TIN THỜI GIAN VÀ INTERNET:
+- Thời gian hiện tại do server cung cấp theo múi giờ {BUN_DAU_TIMEZONE}; dùng nó trực tiếp khi người dùng hỏi bây giờ là mấy giờ, ngày nào, thứ mấy.
+- Địa điểm mặc định cho câu hỏi thời tiết/địa phương là {BUN_DAU_DEFAULT_LOCATION}, trừ khi người dùng nêu địa điểm khác.
+- Khi người dùng hỏi dữ liệu hiện tại như thời tiết, giá xăng, giá vàng, tỷ giá, giá crypto, tin tức, kết quả/sự kiện mới hoặc thông tin có thể thay đổi theo thời gian, phải dùng Google Search grounding nếu công cụ được bật.
+- Với giá xăng ở Việt Nam, ưu tiên thông tin mới nhất từ nguồn chính thức/uy tín như cơ quan quản lý, Petrolimex hoặc nguồn thị trường có thời điểm cập nhật rõ ràng; nói rõ thời điểm nếu nguồn có nêu.
+- Với giá vàng, ưu tiên giá SJC và nêu mua/bán cùng thời điểm nếu tìm được.
+- Với thời tiết, ưu tiên dữ liệu mới nhất và nói rõ địa điểm/ngày khi cần.
+- Không được bịa số liệu hiện tại. Nếu Search không tìm được dữ liệu đủ tin cậy, nói rõ chưa xác minh được thay vì đoán.
+- REPLY thường ngắn gọn, nhưng có thể lên tới khoảng {REPLY_MAX_SENTENCES} câu khi câu hỏi cần nhiều thông tin; không kéo dài chỉ để cho dài.
+""".strip()
+
+
+def _get_local_time_context() -> str:
+    try:
+        now = datetime.now(ZoneInfo(BUN_DAU_TIMEZONE))
+    except (ZoneInfoNotFoundError, ValueError):
+        now = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+    return now.strftime("%Y-%m-%d %H:%M:%S UTC+07:00")
+
+
+def _build_system_instruction(search_blocked: bool = False) -> str:
+    # Chèn thời gian thực tại thời điểm gửi request; không dùng thời gian hard-code.
+    extra = ""
+    if search_blocked and GOOGLE_SEARCH_ENABLED:
+        extra = (
+            "\n[INTERNET_SEARCH_STATUS] Hôm nay server đã hết lượt Google Search miễn phí theo bộ đếm an toàn cục bộ. "
+            "Nếu người dùng hỏi dữ liệu cần Internet/thông tin hiện tại, KHÔNG được bịa hoặc đoán. "
+            f"Trong REPLY phải nói đúng thông báo sau: {GOOGLE_SEARCH_WARNING_TEXT} "
+            "Nếu câu hỏi không cần Internet thì vẫn trả lời bình thường.\n"
+        )
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"[SERVER_TIME_NOW] {_get_local_time_context()}\n"
+        f"[SERVER_DEFAULT_LOCATION] {BUN_DAU_DEFAULT_LOCATION}\n"
+        f"{extra}"
+    )
+
+
+def _search_local_date() -> str:
+    try:
+        return datetime.now(ZoneInfo(BUN_DAU_TIMEZONE)).strftime("%Y-%m-%d")
+    except (ZoneInfoNotFoundError, ValueError):
+        return datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%Y-%m-%d")
+
+
+def _load_search_usage_unlocked() -> None:
+    global _SEARCH_USAGE_DATE, _SEARCH_USED_TODAY, _SEARCH_RESERVED_TODAY
+    today = _search_local_date()
+    if _SEARCH_USAGE_DATE == today:
+        return
+
+    used = 0
+    try:
+        if GOOGLE_SEARCH_COUNTER_FILE and os.path.exists(GOOGLE_SEARCH_COUNTER_FILE):
+            with open(GOOGLE_SEARCH_COUNTER_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if data.get("date") == today:
+                used = max(0, int(data.get("used", 0)))
+    except Exception as exc:
+        print(f"[SEARCH QUOTA] Khong doc duoc counter: {exc}", flush=True)
+
+    _SEARCH_USAGE_DATE = today
+    _SEARCH_USED_TODAY = min(used, GOOGLE_SEARCH_DAILY_LIMIT)
+    _SEARCH_RESERVED_TODAY = 0
+
+
+def _save_search_usage_unlocked() -> None:
+    if not GOOGLE_SEARCH_COUNTER_FILE:
+        return
+    try:
+        payload = {
+            "date": _SEARCH_USAGE_DATE,
+            "used": _SEARCH_USED_TODAY,
+            "limit": GOOGLE_SEARCH_DAILY_LIMIT,
+        }
+        with open(GOOGLE_SEARCH_COUNTER_FILE, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[SEARCH QUOTA] Khong ghi duoc counter: {exc}", flush=True)
+
+
+async def reserve_search_budget() -> bool:
+    global _SEARCH_RESERVED_TODAY
+    async with _SEARCH_USAGE_LOCK:
+        _load_search_usage_unlocked()
+        if _SEARCH_USED_TODAY + _SEARCH_RESERVED_TODAY >= GOOGLE_SEARCH_DAILY_LIMIT:
+            return False
+        _SEARCH_RESERVED_TODAY += 1
+        return True
+
+
+async def finalize_search_budget(reserved: bool, did_search: bool) -> None:
+    global _SEARCH_RESERVED_TODAY, _SEARCH_USED_TODAY
+    if not reserved:
+        return
+    async with _SEARCH_USAGE_LOCK:
+        _load_search_usage_unlocked()
+        _SEARCH_RESERVED_TODAY = max(0, _SEARCH_RESERVED_TODAY - 1)
+        if did_search:
+            _SEARCH_USED_TODAY = min(
+                GOOGLE_SEARCH_DAILY_LIMIT,
+                _SEARCH_USED_TODAY + 1,
+            )
+            _save_search_usage_unlocked()
+            remaining = max(0, GOOGLE_SEARCH_DAILY_LIMIT - _SEARCH_USED_TODAY)
+            print(
+                f"[SEARCH QUOTA] Da dung 1 grounded prompt | "
+                f"today={_SEARCH_USED_TODAY}/{GOOGLE_SEARCH_DAILY_LIMIT} | remaining={remaining}",
+                flush=True,
+            )
+
+
+def mark_search_quota_exhausted() -> None:
+    global _SEARCH_USED_TODAY, _SEARCH_RESERVED_TODAY
+    _load_search_usage_unlocked()
+    _SEARCH_USED_TODAY = GOOGLE_SEARCH_DAILY_LIMIT
+    _SEARCH_RESERVED_TODAY = 0
+    _save_search_usage_unlocked()
+    print(
+        f"[SEARCH QUOTA] Google reported quota exhausted -> block Search until next local day | "
+        f"today={_SEARCH_USED_TODAY}/{GOOGLE_SEARCH_DAILY_LIMIT}",
+        flush=True,
+    )
+
+
+def get_search_usage_snapshot() -> dict:
+    _load_search_usage_unlocked()
+    return {
+        "date": _SEARCH_USAGE_DATE,
+        "used": _SEARCH_USED_TODAY,
+        "reserved": _SEARCH_RESERVED_TODAY,
+        "limit": GOOGLE_SEARCH_DAILY_LIMIT,
+        "remaining_local_guard": max(
+            0, GOOGLE_SEARCH_DAILY_LIMIT - _SEARCH_USED_TODAY - _SEARCH_RESERVED_TODAY
+        ),
+    }
+
+
+GOOGLE_SEARCH_TOOLS = (
+    [types.Tool(google_search=types.GoogleSearch())]
+    if GOOGLE_SEARCH_ENABLED
+    else None
+)
+
 
 def get_genai_client(key_index: int):
     if not API_KEYS:
@@ -154,6 +374,15 @@ def _error_code(exc) -> Optional[int]:
 def classify_gemini_error(exc) -> str:
     code = _error_code(exc)
     text = str(exc).lower()
+    search_quota_markers = (
+        "google search quota",
+        "google search grounding quota",
+        "grounding quota exceeded",
+        "web search quota",
+        "search quota exceeded",
+    )
+    if any(x in text for x in search_quota_markers):
+        return "search_quota"
     if code in (401, 403, 429):
         return "rotate"
     key_markers = (
@@ -203,7 +432,8 @@ PCM_BYTES_PER_SAMPLE = 2
 PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE
 TTS_CHUNK_SIZE = 2048
 TTS_PREBUFFER_MS = max(0, int(os.environ.get("TTS_PREBUFFER_MS", "320")))
-TTS_TIMEOUT_SECONDS = float(os.environ.get("TTS_TIMEOUT_SECONDS", "25"))
+# Thời gian tối đa cho một lần tổng hợp TTS; tăng nếu cho phép câu trả lời rất dài.
+TTS_TIMEOUT_SECONDS = float(os.environ.get("TTS_TIMEOUT_SECONDS", "40"))
 TTS_RETRIES_PER_VOICE = max(1, int(os.environ.get("TTS_RETRIES_PER_VOICE", "2")))
 EDGE_TTS_ENABLED = os.environ.get("EDGE_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "vi-VN-HoaiMyNeural").strip()
@@ -452,6 +682,15 @@ def read_root():
         "gemini_thinking_level": THINKING_LEVEL,
         "memory_turns": MEMORY_TURNS,
         "gemini_debug_chunks": GEMINI_DEBUG_CHUNKS,
+        "google_search_enabled": GOOGLE_SEARCH_ENABLED,
+        "google_search_daily_limit": GOOGLE_SEARCH_DAILY_LIMIT,
+        "google_search_usage": get_search_usage_snapshot(),
+        "google_search_exhausted_warning": GOOGLE_SEARCH_WARNING_TEXT,
+        "timezone": BUN_DAU_TIMEZONE,
+        "default_location": BUN_DAU_DEFAULT_LOCATION,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "reply_max_sentences": REPLY_MAX_SENTENCES,
+        "stable_batch_audio_mode": STABLE_BATCH_AUDIO_MODE,
         "gemini_live_enabled": LIVE_ENABLED,
         "gemini_live_model": LIVE_MODEL_NAME,
         "gemini_live_audio_input": "PCM16 16kHz mono realtime",
@@ -618,12 +857,22 @@ def _read_gemini_chunk(
     finish_state: dict,
     gemini_started: float,
     first_text_state: dict,
+    search_state: Optional[dict] = None,
 ) -> None:
     candidates = getattr(chunk, "candidates", None) or []
     if not candidates:
         return
 
     candidate = candidates[0]
+
+    if search_state is not None:
+        grounding_metadata = getattr(candidate, "grounding_metadata", None)
+        if grounding_metadata is not None:
+            queries = getattr(grounding_metadata, "web_search_queries", None) or []
+            chunks = getattr(grounding_metadata, "grounding_chunks", None) or []
+            if queries or chunks:
+                search_state["did_search"] = True
+                search_state.setdefault("queries", set()).update(str(q) for q in queries)
 
     finish_reason = getattr(candidate, "finish_reason", None)
     if finish_reason is not None:
@@ -716,7 +965,21 @@ async def ask_gemini_audio(
             key_idx = next_active_key_after(key_idx)
             continue
 
+        search_reserved = False
+        search_state = {"did_search": False, "queries": set()}
         try:
+            if GOOGLE_SEARCH_ENABLED:
+                search_reserved = await reserve_search_budget()
+            search_tools_for_request = GOOGLE_SEARCH_TOOLS if search_reserved else None
+            search_blocked = GOOGLE_SEARCH_ENABLED and not search_reserved
+
+            if search_blocked:
+                print(
+                    f"[SEARCH QUOTA] Het luot hom nay -> tat Google Search cho request nay | "
+                    f"used={get_search_usage_snapshot()['used']}/{GOOGLE_SEARCH_DAILY_LIMIT}",
+                    flush=True,
+                )
+
             # ================================================================
             # FIRST REQUEST
             # ================================================================
@@ -724,8 +987,9 @@ async def ask_gemini_audio(
                 model=MODEL_NAME,
                 contents=make_gemini_contents(history, wav_bytes),
                 config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
+                    system_instruction=_build_system_instruction(search_blocked=search_blocked),
                     max_output_tokens=MAX_OUTPUT_TOKENS,
+                    tools=search_tools_for_request,
                     thinking_config=types.ThinkingConfig(
                         thinking_level=THINKING_LEVEL
                     ),
@@ -753,6 +1017,7 @@ async def ask_gemini_audio(
                         finish_state,
                         gemini_started,
                         first_text_state,
+                        search_state,
                     )
                 except Exception as chunk_exc:
                     print(
@@ -790,6 +1055,17 @@ async def ask_gemini_audio(
                     flush=True,
                 )
 
+            await finalize_search_budget(
+                search_reserved,
+                bool(search_state.get("did_search")),
+            )
+            search_reserved = False
+            if search_state.get("did_search"):
+                print(
+                    f"[SEARCH] Grounding executada | queries={sorted(search_state.get('queries', set()))}",
+                    flush=True,
+                )
+
             bad_reasons = (
                 "MAX_TOKENS",
                 "SAFETY",
@@ -820,9 +1096,30 @@ async def ask_gemini_audio(
             return memory_text, text, action
 
         except Exception as exc:
+            if search_reserved:
+                await finalize_search_budget(
+                    search_reserved,
+                    bool(search_state.get("did_search")),
+                )
+                search_reserved = False
             kind = classify_gemini_error(exc)
             code = _error_code(exc)
             detail = str(exc).replace("\n", " ")[:220]
+
+            if kind == "search_quota":
+                mark_search_quota_exhausted()
+                return (
+                    "Hết lượt tìm kiếm hôm nay.",
+                    GOOGLE_SEARCH_WARNING_TEXT,
+                    {
+                        "type": "none",
+                        "emotion": "neutral",
+                        "direction": "none",
+                        "degrees": 0,
+                        "distance_cm": 0,
+                        "speed": "normal",
+                    },
+                )
 
             if kind == "rotate":
                 mark_key_disabled(key_idx, detail)
@@ -846,14 +1143,21 @@ async def ask_gemini_audio(
                     flush=True,
                 )
                 await asyncio.sleep(0.6)
+                retry_search_reserved = False
+                retry_search_state = {"did_search": False, "queries": set()}
                 try:
+                    if GOOGLE_SEARCH_ENABLED:
+                        retry_search_reserved = await reserve_search_budget()
+                    retry_search_tools = GOOGLE_SEARCH_TOOLS if retry_search_reserved else None
+                    retry_search_blocked = GOOGLE_SEARCH_ENABLED and not retry_search_reserved
                     retry_started = time.monotonic()
                     retry_stream = await client.aio.models.generate_content_stream(
                         model=MODEL_NAME,
                         contents=make_gemini_contents(history, wav_bytes),
                         config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
+                            system_instruction=_build_system_instruction(search_blocked=retry_search_blocked),
                             max_output_tokens=MAX_OUTPUT_TOKENS,
+                            tools=retry_search_tools,
                             # Preserve the same reasoning configuration on retry.
                             thinking_config=types.ThinkingConfig(
                                 thinking_level=THINKING_LEVEL
@@ -882,6 +1186,7 @@ async def ask_gemini_audio(
                                 retry_finish_state,
                                 retry_started,
                                 retry_first_text_state,
+                                retry_search_state,
                             )
                         except Exception as chunk_exc:
                             print(
@@ -897,6 +1202,16 @@ async def ask_gemini_audio(
 
                     retry_raw = "".join(retry_parts).strip()
                     retry_finish = retry_finish_state["reason"]
+                    await finalize_search_budget(
+                        retry_search_reserved,
+                        bool(retry_search_state.get("did_search")),
+                    )
+                    retry_search_reserved = False
+                    if retry_search_state.get("did_search"):
+                        print(
+                            f"[SEARCH] Retry grounding executada | queries={sorted(retry_search_state.get('queries', set()))}",
+                            flush=True,
+                        )
                     retry_elapsed = int(
                         (time.monotonic() - retry_started) * 1000
                     )
@@ -940,10 +1255,30 @@ async def ask_gemini_audio(
                             retry_action,
                         )
                 except Exception as retry_exc:
+                    if retry_search_reserved:
+                        await finalize_search_budget(
+                            retry_search_reserved,
+                            bool(retry_search_state.get("did_search")),
+                        )
+                        retry_search_reserved = False
                     print(
                         f"[GEMINI RETRY ERROR] {str(retry_exc)[:220]}",
                         flush=True,
                     )
+                    if classify_gemini_error(retry_exc) == "search_quota":
+                        mark_search_quota_exhausted()
+                        return (
+                            "Hết lượt tìm kiếm hôm nay.",
+                            GOOGLE_SEARCH_WARNING_TEXT,
+                            {
+                                "type": "none",
+                                "emotion": "neutral",
+                                "direction": "none",
+                                "degrees": 0,
+                                "distance_cm": 0,
+                                "speed": "normal",
+                            },
+                        )
 
             raise RuntimeError(detail) from exc
 
@@ -1374,9 +1709,10 @@ async def websocket_chat(websocket: WebSocket):
             return None
 
     try:
-        # Establish the Live session while the robot is idle so the first audio chunk
-        # does not have to wait for the Gemini WebSocket handshake.
-        await ensure_live()
+        # Ở V4.0, mặc định dùng pipeline batch ổn định; Live chỉ được bật lại khi
+        # BUN_DAU_STABLE_BATCH_AUDIO_MODE=false và GEMINI_LIVE_ENABLED=true.
+        if not STABLE_BATCH_AUDIO_MODE:
+            await ensure_live()
 
         while True:
             message = await websocket.receive()
@@ -1427,22 +1763,23 @@ async def websocket_chat(websocket: WebSocket):
                     flush=True,
                 )
 
-                live = await ensure_live()
-                if live is not None:
-                    try:
-                        await live_start_turn(
-                            live,
-                            conversation_history,
-                            latest_tof_cm,
-                        )
-                    except Exception as exc:
-                        live["last_error"] = exc
-                        handle_live_key_error(live["key_idx"], exc)
-                        await live_abort_turn(live)
-                        print(
-                            f"[LIVE] Khong bat dau duoc luot realtime: {str(exc)[:220]}",
-                            flush=True,
-                        )
+                if not STABLE_BATCH_AUDIO_MODE:
+                    live = await ensure_live()
+                    if live is not None:
+                        try:
+                            await live_start_turn(
+                                live,
+                                conversation_history,
+                                latest_tof_cm,
+                            )
+                        except Exception as exc:
+                            live["last_error"] = exc
+                            handle_live_key_error(live["key_idx"], exc)
+                            await live_abort_turn(live)
+                            print(
+                                f"[LIVE] Khong bat dau duoc luot realtime: {str(exc)[:220]}",
+                                flush=True,
+                            )
                 continue
 
             if text != '{"event":"end_speech"}':
@@ -1451,7 +1788,7 @@ async def websocket_chat(websocket: WebSocket):
             speech_active = False
             pcm_size = len(pcm_buffer)
             print(
-                f"[WEBSOCKET] ESP32 dung ghi am. PCM={pcm_size} bytes",
+                f"[WEBSOCKET] ESP32 dung ghi am. PCM={pcm_size} bytes | mode={'batch' if STABLE_BATCH_AUDIO_MODE else 'live'}",
                 flush=True,
             )
 
