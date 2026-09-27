@@ -1,5 +1,5 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.3 - GEMINI 3.8 LIVE + FREE SEARCH TEST
+# ROBOT BÚN ĐẬU SERVER - V4.4 - GEMINI 3.8 LIVE + FREE SEARCH TEST
 # Phiên bản: 4.3
 #
 # - Quay về pipeline audio WAV -> Gemini batch để ưu tiên độ ổn định/độ chính xác.
@@ -62,7 +62,7 @@ MODEL_NAME = "gemini-3.8-flash"
 # GEMINI_MODEL=... environment variable cannot silently keep the old model.
 # LOW keeps real reasoning enabled while reducing response latency.
 THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low").strip().lower()
-# Batch fallback only. Gemini 3.8 uses thinking_level.
+# Batch fallback only. Kept for compatibility with environment variables; Live 3.8 ignores thinking level.
 GEMINI_THINKING_LEVEL_38 = os.environ.get("GEMINI_THINKING_LEVEL_38", "low").strip().lower()
 # Hard cap for one Gemini batch request. This prevents the ESP32 from sitting in
 # THINKING until its own timeout when Google Search/model latency spikes.
@@ -131,7 +131,7 @@ GEMINI_DEBUG_CHUNKS = (
 # Gemini Live is used for realtime audio input.
 # 3.1 Flash Live keeps TEXT output available, which lets us preserve the current
 # MEMORY/ACTION/REPLY protocol and the existing TTS pipeline without changing the ESP audio contract.
-# V4.3: Gemini 3.8 Live is the default brain path.
+# V4.4: Gemini 3.8 Live is the default brain path. Current Live setup schema fixes applied.
 LIVE_ENABLED = (
     os.environ.get("GEMINI_LIVE_ENABLED", "true").strip().lower()
     in {"1", "true", "yes", "on"}
@@ -142,6 +142,7 @@ LIVE_MODEL_NAME = os.environ.get(
 LIVE_MAX_OUTPUT_TOKENS = int(
     os.environ.get("GEMINI_LIVE_MAX_OUTPUT_TOKENS", "384")
 )
+# Gemini 3.8 Live stable does not support thinking_level; kept only for backward compatibility.
 LIVE_THINKING_LEVEL = os.environ.get(
     "GEMINI_LIVE_THINKING_LEVEL", "low"
 ).strip().lower()
@@ -1229,18 +1230,19 @@ async def ask_gemini_audio(
 # ================================================================================
 # 5. GEMINI LIVE + WEBSOCKET
 # ================================================================================
-def _live_config(safety_config, search_blocked: bool = False):
-    """Build Gemini 3.8 Live config; ESP32 still owns VAD/end-of-speech."""
+def _live_config(search_blocked: bool = False):
+    """Build a Gemini 3.8 Live setup compatible with the current Live API."""
+    # IMPORTANT for Gemini 3.8 Live:
+    # - thinking_config/thinking_level is NOT supported on the stable 3.8 Live model.
+    # - safety_settings is accepted by parts of the SDK type surface, but the current
+    #   Live setup endpoint rejects it for this model with 1007/Unknown field safetySettings.
+    #   Therefore we intentionally omit both fields here.
     search_tools = None if search_blocked else GOOGLE_SEARCH_TOOLS
     return types.LiveConnectConfig(
         response_modalities=["TEXT"],
         system_instruction=_build_system_instruction(search_blocked=search_blocked),
         max_output_tokens=LIVE_MAX_OUTPUT_TOKENS,
         tools=search_tools,
-        thinking_config=types.ThinkingConfig(
-            thinking_level=LIVE_THINKING_LEVEL,
-        ),
-        safety_settings=safety_config,
         realtime_input_config=types.RealtimeInputConfig(
             automatic_activity_detection=types.AutomaticActivityDetection(
                 disabled=True,
@@ -1325,7 +1327,6 @@ def handle_live_key_error(key_idx: int, exc: Exception) -> Optional[int]:
 
 async def open_live_handle(
     history: deque,
-    safety_config,
     preferred_key_idx: int,
     search_blocked: bool = False,
 ) -> dict:
@@ -1356,7 +1357,7 @@ async def open_live_handle(
             try:
                 session_cm = client.aio.live.connect(
                     model=LIVE_MODEL_NAME,
-                    config=_live_config(safety_config, search_blocked=search_blocked),
+                    config=_live_config(search_blocked=search_blocked),
                 )
                 session = await session_cm.__aenter__()
 
@@ -1641,7 +1642,6 @@ async def websocket_chat(websocket: WebSocket):
         try:
             live_handle = await open_live_handle(
                 conversation_history,
-                safety_config,
                 preferred,
                 search_blocked=search_blocked,
             )
