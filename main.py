@@ -1,17 +1,17 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.4 - GEMINI 3.8 LIVE + FREE SEARCH TEST
-# Phiên bản: 4.3
+# ROBOT BÚN ĐẬU SERVER - V4.5 - GEMINI 3.8 LIVE + QUOTA GUARD
+# Phiên bản: 4.5
 #
 # - Quay về pipeline audio WAV -> Gemini batch để ưu tiên độ ổn định/độ chính xác.
 # - Thêm Google Search grounding cho câu hỏi cần thông tin hiện tại.
 # - Thêm ngữ cảnh thời gian Việt Nam (Asia/Ho_Chi_Minh) cho câu hỏi "mấy giờ".
 # - Giữ MEMORY / ACTION / REPLY / TTS / Edge-TTS fallback / ToF / sticky key.
 # - Dùng Gemini 3.8 Live làm pipeline hội thoại/âm thanh chính.
-# - Gemini 3.8 Live có Free Tier và Google Search được hỗ trợ trong Free Tier.
-# - Giữ Gemini 3.8 Flash làm batch fallback tùy chọn, mặc định TẮT vì Batch không có Free Tier.
+# - Dùng Gemini 3.8 Live làm pipeline hội thoại/âm thanh chính.
 # - Gemini lỗi/chậm không đẩy ESP32 vào tts_error; robot nói thông báo bằng TTS.
-# - Thêm bộ đếm local search-intent theo ngày; đây là safety guard cục bộ, không phải quota Google.
-# - Khi hết lượt Search, robot nói rõ phải đợi ngày mai mới tìm kiếm tiếp.
+# - Phát hiện quota thật từ lỗi của Gemini Live và khóa Live đến ngày hôm sau.
+# - Khi hết quota AI, robot nói rõ đã hết lượt miễn phí và sẽ thử lại ngày mai.
+# - Giữ bộ đếm local Search chỉ như safety guard cục bộ, không coi đó là quota Google thật.
 # - Giới hạn output Gemini được ghi chú rõ tại MAX_OUTPUT_TOKENS bên dưới.
 # ================================================================================
 
@@ -79,10 +79,8 @@ GOOGLE_SEARCH_ENABLED = (
     in {"1", "true", "yes", "on"}
 )
 
-# Google Search grounding limit for Gemini 2.5 Flash Free Tier.
-# Google currently documents up to 500 RPD free for Search grounding, shared by
-# Gemini 2.5 Flash and Flash-Lite. This counter is a LOCAL safety guard, not
-# Google's authoritative remaining-quota counter.
+# Local Search safety guard. This is NOT Google's authoritative quota.
+# Gemini 3.8 Live quota is detected from Google's actual API error responses below.
 GOOGLE_SEARCH_DAILY_LIMIT = max(1, int(os.environ.get("GEMINI_WEB_SEARCH_DAILY_LIMIT", "500")))
 GOOGLE_SEARCH_WARNING_TEXT = os.environ.get(
     "GEMINI_WEB_SEARCH_EXHAUSTED_MESSAGE",
@@ -97,6 +95,21 @@ _SEARCH_USAGE_DATE: Optional[str] = None
 _SEARCH_USED_TODAY = 0
 _SEARCH_RESERVED_TODAY = 0
 _SEARCH_USAGE_LOCK = asyncio.Lock()
+
+# Gemini Live quota guard: this is driven by Google's actual quota error response.
+# Once a quota-exhausted error is observed, the server stops reconnect attempts
+# for the rest of the local Vietnam day, then automatically clears on the next day.
+LIVE_QUOTA_COUNTER_FILE = os.environ.get(
+    "GEMINI_LIVE_QUOTA_COUNTER_FILE",
+    "gemini_live_quota_daily_state.json",
+).strip()
+LIVE_QUOTA_EXHAUSTED_MESSAGE = os.environ.get(
+    "GEMINI_LIVE_QUOTA_EXHAUSTED_MESSAGE",
+    "Hôm nay mình đã hết lượt AI miễn phí rồi, mình sẽ thử lại vào ngày mai nhé.",
+).strip()
+_LIVE_QUOTA_DATE: Optional[str] = None
+_LIVE_QUOTA_EXHAUSTED = False
+_LIVE_QUOTA_LOCK = asyncio.Lock()
 
 BUN_DAU_TIMEZONE = os.environ.get("BUN_DAU_TIMEZONE", "Asia/Ho_Chi_Minh").strip()
 BUN_DAU_DEFAULT_LOCATION = os.environ.get(
@@ -301,6 +314,67 @@ def _save_search_usage_unlocked() -> None:
         print(f"[SEARCH QUOTA] Khong ghi duoc counter: {exc}", flush=True)
 
 
+def _load_live_quota_state_unlocked() -> None:
+    global _LIVE_QUOTA_DATE, _LIVE_QUOTA_EXHAUSTED
+    today = _search_local_date()
+    if _LIVE_QUOTA_DATE == today:
+        return
+
+    exhausted = False
+    try:
+        if LIVE_QUOTA_COUNTER_FILE and os.path.exists(LIVE_QUOTA_COUNTER_FILE):
+            with open(LIVE_QUOTA_COUNTER_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if data.get("date") == today:
+                exhausted = bool(data.get("exhausted", False))
+    except Exception as exc:
+        print(f"[LIVE QUOTA] Khong doc duoc state: {exc}", flush=True)
+
+    _LIVE_QUOTA_DATE = today
+    _LIVE_QUOTA_EXHAUSTED = exhausted
+
+
+def _save_live_quota_state_unlocked() -> None:
+    if not LIVE_QUOTA_COUNTER_FILE:
+        return
+    try:
+        payload = {
+            "date": _LIVE_QUOTA_DATE,
+            "exhausted": _LIVE_QUOTA_EXHAUSTED,
+        }
+        with open(LIVE_QUOTA_COUNTER_FILE, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[LIVE QUOTA] Khong ghi duoc state: {exc}", flush=True)
+
+
+def is_live_quota_exhausted() -> bool:
+    _load_live_quota_state_unlocked()
+    return _LIVE_QUOTA_EXHAUSTED
+
+
+def mark_live_quota_exhausted(reason: str = "") -> None:
+    global _LIVE_QUOTA_EXHAUSTED
+    _load_live_quota_state_unlocked()
+    _LIVE_QUOTA_EXHAUSTED = True
+    _save_live_quota_state_unlocked()
+    detail = (reason or "quota exceeded").replace("\n", " ")[:220]
+    print(
+        f"[LIVE QUOTA] Google reported quota exhausted -> block Live until next local day | "
+        f"date={_LIVE_QUOTA_DATE} | reason={detail}",
+        flush=True,
+    )
+
+
+def get_live_quota_status() -> dict:
+    _load_live_quota_state_unlocked()
+    return {
+        "date": _LIVE_QUOTA_DATE,
+        "exhausted": _LIVE_QUOTA_EXHAUSTED,
+        "message": LIVE_QUOTA_EXHAUSTED_MESSAGE,
+    }
+
+
 async def reserve_search_budget() -> bool:
     global _SEARCH_RESERVED_TODAY
     async with _SEARCH_USAGE_LOCK:
@@ -441,6 +515,23 @@ def classify_gemini_error(exc) -> str:
     )
     if any(x in text for x in search_quota_markers):
         return "search_quota"
+
+    # Gemini Live can return a WebSocket 1011 while the actual payload says
+    # the project has exceeded its current quota. Do NOT disable/rotate the key
+    # for this case; it is a project-level quota condition.
+    live_quota_markers = (
+        "you exceeded your current quota",
+        "exceeded your current quota",
+        "gemini live quota",
+        "live quota exceeded",
+        "live_api_quota",
+    )
+    if any(x in text for x in live_quota_markers):
+        return "live_quota"
+
+    if code in (1011,) and ("quota" in text or "resource_exhausted" in text):
+        return "live_quota"
+
     if code in (401, 403, 429):
         return "rotate"
     key_markers = (
@@ -746,6 +837,8 @@ def read_root():
         "google_search_daily_limit": GOOGLE_SEARCH_DAILY_LIMIT,
         "google_search_usage": get_search_usage_snapshot(),
         "google_search_exhausted_warning": GOOGLE_SEARCH_WARNING_TEXT,
+        "gemini_live_quota": get_live_quota_status(),
+        "gemini_live_quota_warning": LIVE_QUOTA_EXHAUSTED_MESSAGE,
         "timezone": BUN_DAU_TIMEZONE,
         "default_location": BUN_DAU_DEFAULT_LOCATION,
         "max_output_tokens": MAX_OUTPUT_TOKENS,
@@ -1304,11 +1397,14 @@ async def close_live_handle(live_handle: Optional[dict]) -> None:
 
 
 def handle_live_key_error(key_idx: int, exc: Exception) -> Optional[int]:
-    """Apply the same sticky-key rules to errors that happen after a Live session is open."""
+    """Handle a Live-session error without spinning on project quota exhaustion."""
     global CURRENT_KEY_INDEX
     kind = classify_gemini_error(exc)
     detail = str(exc).replace("\n", " ")[:220]
     code = _error_code(exc)
+    if kind == "live_quota":
+        mark_live_quota_exhausted(detail)
+        return None
     if kind != "rotate":
         return None
     mark_key_disabled(
@@ -1335,6 +1431,8 @@ async def open_live_handle(
 
     if not LIVE_ENABLED:
         raise RuntimeError("Gemini Live dang tat")
+    if is_live_quota_exhausted():
+        raise RuntimeError("GEMINI_LIVE_QUOTA_EXHAUSTED: " + LIVE_QUOTA_EXHAUSTED_MESSAGE)
     if not API_KEYS:
         raise RuntimeError("Khong co GEMINI_API_KEY")
 
@@ -1401,6 +1499,10 @@ async def open_live_handle(
                 kind = classify_gemini_error(exc)
                 code = _error_code(exc)
                 detail = str(exc).replace("\n", " ")[:220]
+                if kind == "live_quota":
+                    mark_live_quota_exhausted(detail)
+                    raise RuntimeError("GEMINI_LIVE_QUOTA_EXHAUSTED: " + LIVE_QUOTA_EXHAUSTED_MESSAGE) from exc
+
                 if kind == "rotate":
                     mark_key_disabled(key_idx, detail)
                     nxt = next_active_key_after(key_idx)
@@ -1469,6 +1571,8 @@ async def live_receive_loop(live_handle: dict) -> None:
         raise
     except Exception as exc:
         live_handle["last_error"] = exc
+        if classify_gemini_error(exc) == "live_quota":
+            mark_live_quota_exhausted(str(exc))
         waiter = live_handle.get("turn_waiter")
         if waiter and not waiter.done():
             waiter.set_exception(exc)
@@ -1650,14 +1754,32 @@ async def websocket_chat(websocket: WebSocket):
             )
             return live_handle
         except Exception as exc:
-            print(f"[LIVE] Khong khoi tao duoc: {str(exc)[:240]}", flush=True)
+            detail = str(exc)
+            if detail.startswith("GEMINI_LIVE_QUOTA_EXHAUSTED:"):
+                print(
+                    f"[LIVE QUOTA] Da khoa Live den ngay mai | {LIVE_QUOTA_EXHAUSTED_MESSAGE}",
+                    flush=True,
+                )
+            else:
+                print(f"[LIVE] Khong khoi tao duoc: {detail[:240]}", flush=True)
             live_handle = None
             return None
 
     try:
         if LIVE_ENABLED:
+            live_quota_status = get_live_quota_status()
+            print(
+                f"[LIVE QUOTA] date={live_quota_status['date']} | exhausted={live_quota_status['exhausted']}",
+                flush=True,
+            )
             initial_search_blocked = get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT
-            await ensure_live(search_blocked=initial_search_blocked)
+            if live_quota_status["exhausted"]:
+                print(
+                    f"[LIVE QUOTA] Live dang bi khoa den ngay mai | {LIVE_QUOTA_EXHAUSTED_MESSAGE}",
+                    flush=True,
+                )
+            else:
+                await ensure_live(search_blocked=initial_search_blocked)
 
         while True:
             message = await websocket.receive()
@@ -1708,7 +1830,7 @@ async def websocket_chat(websocket: WebSocket):
                     flush=True,
                 )
 
-                if LIVE_ENABLED:
+                if LIVE_ENABLED and not is_live_quota_exhausted():
                     search_blocked_now = get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT
                     live = await ensure_live(search_blocked=search_blocked_now)
                     if live is not None:
@@ -1820,11 +1942,19 @@ async def websocket_chat(websocket: WebSocket):
                         }
                         print(f"[GEMINI FALLBACK SPEECH] {answer}", flush=True)
                 else:
-                    if get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT:
+                    if is_live_quota_exhausted():
+                        answer = LIVE_QUOTA_EXHAUSTED_MESSAGE
+                        user_memory = "Gemini Live đã vượt quota; server khóa Live đến ngày mai."
+                        print(
+                            f"[LIVE QUOTA] Robot sẽ đọc cảnh báo: {LIVE_QUOTA_EXHAUSTED_MESSAGE}",
+                            flush=True,
+                        )
+                    elif get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT:
                         answer = GOOGLE_SEARCH_WARNING_TEXT
+                        user_memory = "Bộ đếm Search cục bộ đã đạt giới hạn trong ngày."
                     else:
                         answer = "Xin lỗi, hiện tại mình đang gặp trục trặc kết nối với bộ não AI. Bạn thử lại mình nhé."
-                    user_memory = "Gemini Live không hoàn tất được lượt xử lý hiện tại."
+                        user_memory = "Gemini Live không hoàn tất được lượt xử lý hiện tại."
                     action = {
                         "type": "none",
                         "emotion": "sad",
