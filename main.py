@@ -145,6 +145,14 @@ BUN_DAU_DEFAULT_LOCATION = os.environ.get(
     "Thành phố Hồ Chí Minh, Việt Nam",
 ).strip()
 
+
+def local_today_str() -> str:
+    """Return the current local calendar date used by all daily quota guards."""
+    try:
+        return datetime.now(ZoneInfo(BUN_DAU_TIMEZONE)).strftime("%Y-%m-%d")
+    except (ZoneInfoNotFoundError, ValueError):
+        return datetime.now(ZoneInfo("Asia/Ho_Chi_Minh")).strftime("%Y-%m-%d")
+
 # <<< ĐÂY LÀ GIỚI HẠN SỐ TOKEN OUTPUT TỐI ĐA CỦA GEMINI.
 # Token không phải số từ cố định; tiếng Việt có thể dùng số token khác nhau cho cùng
 # một lượng chữ. Tăng dòng này để cho phép Gemini trả lời dài hơn. Ví dụ: 768 -> 1200.
