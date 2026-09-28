@@ -973,9 +973,9 @@ def read_root():
         "tts_fallback_voice": EDGE_TTS_VOICE,
         "tts_streaming": True,
         "tts_output": "PCM16 16kHz mono",
-        "gemini_thinking_level": THINKING_LEVEL,
-        "gemini_thinking_level_38": GEMINI_THINKING_LEVEL_38,
-        "gemini_request_timeout_seconds": GEMINI_REQUEST_TIMEOUT_SECONDS,
+        # Gemini 3.8 Live does not use the legacy batch thinking/request-timeout fields.
+        "gemini_live_thinking": "not_configured_for_3.8_live",
+        "gemini_fallback_timeout_seconds": GEMINI_FALLBACK_TIMEOUT_SECONDS,
         "memory_turns": MEMORY_TURNS,
         "gemini_debug_chunks": GEMINI_DEBUG_CHUNKS,
         "google_search_enabled": GOOGLE_SEARCH_ENABLED,
