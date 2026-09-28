@@ -1,17 +1,23 @@
-ROBOT BÚN ĐẬU SERVER V4.10.2
+ROBOT BÚN ĐẬU SERVER V4.10.2.1 - QUOTA DATE HOTFIX
 
-Được xây trên V4.10.1, không đổi giao thức ESP32.
-
-Sửa chính:
-1) TTS/Edge-TTS không còn làm sập WebSocket khi ESP32 đã ngắt.
-2) Nếu socket đã đóng, Edge-TTS dừng retry ngay thay vì gửi tiếp vào socket chết.
-3) Nếu Gemini TTS + Edge-TTS đều thất bại nhưng ESP32 còn kết nối, server gửi tts_done thất bại để kết thúc state SPEAKING an toàn và giữ WebSocket sống.
-4) Có dùng TTS semaphore để tránh nhiều phiên TTS chồng nhau.
-5) Gemini 3.6 gặp 429/quota sẽ thử Key active tiếp theo. Khi tất cả Key đều hết quota, server ghi daily guard và không gọi lại 3.6 liên tục cho tới ngày kế tiếp theo giờ Việt Nam. Đây là guard dựa trên lỗi quota thật, không phải khẳng định một quota cố định của Google.
+Fixes:
+- Defines local_today_str() used by Gemini 3.6 quota state and the root status endpoint.
+- Removes the V4.10/V4.10.1 Local STT/Whisper path; fallback remains direct audio -> Gemini 3.6.
+- Preserves V4.10.2 TTS/WebSocket disconnect handling and quota guards.
+- Root endpoint no longer raises NameError from the missing date helper.
 
 Render Start Command:
 uvicorn main:app --host 0.0.0.0 --port $PORT
 
-Health:
-/
-/healthz
+After deploy:
+GET / -> HTTP 200
+GET /healthz -> HTTP 200
+
+Expected when Live is quota-blocked and 3.6 is still available:
+[FALLBACK 3.6] Live unavailable -> direct audio fallback (no local STT)
+[FALLBACK 3.6] Dung Key #N | model=gemini-3.6-flash | search=OFF
+[FALLBACK 3.6] Hoan tat ...
+
+Expected when 3.6 is also quota exhausted:
+[GEMINI 3.6 QUOTA] Block 3.6 den ngay mai ...
+Then the robot speaks the configured quota message.
