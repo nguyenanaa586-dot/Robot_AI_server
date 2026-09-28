@@ -1,6 +1,6 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.9 - LOCAL STT FALLBACK + TIME/DATE INTERNAL
-# Phiên bản: 4.9
+# ROBOT BÚN ĐẬU SERVER - V4.10 - STABLE AUDIO FALLBACK + TIME/DATE INTERNAL
+# Phiên bản: 4.10
 #
 # - Gemini 3.8 Live là não chính cho hội thoại realtime và Google Search.
 # - Gemini 3.6 Flash là não dự phòng khi Gemini 3.8 Live hết quota/lỗi.
@@ -13,11 +13,9 @@
 # - Phát hiện quota thật từ lỗi của Gemini Live và khóa Live đến ngày hôm sau.
 # - Khi hết quota AI, robot nói rõ đã hết lượt miễn phí và sẽ thử lại ngày mai.
 # - Giữ bộ đếm local Search chỉ như safety guard cục bộ, không coi đó là quota Google thật.
-# - Thêm faster-whisper tiny CPU/int8 làm STT dự phòng khi Gemini 3.8 Live unavailable.
-# - STT dự phòng không dùng VAD của Whisper; ESP32 đã tự đóng khung đoạn nói.
-# - Khi STT nhận diện được câu hỏi giờ/ngày/thứ: server trả lời trực tiếp, không gọi Gemini 3.6.
-# - Câu thường sau STT được gửi dạng text cho Gemini 3.6 Flash thay vì gửi lại audio.
-# - Nếu STT local thất bại, mới fallback về Gemini 3.6 xử lý audio như phương án cuối.
+# - KHÔNG dùng local STT/Whisper trong đường nghe fallback; giữ nguyên audio -> Gemini 3.6 như V4.8.
+# - Khi Gemini 3.8 Live unavailable/quota, Gemini 3.6 nhận trực tiếp cùng WAV 16 kHz từ ESP32 để giữ độ chính xác nghe.
+# - Giữ giờ/ngày/thứ nội bộ server khi Live cung cấp transcript; fallback 3.6 vẫn nhận trực tiếp audio và được cấp SERVER_TIME_NOW trong system prompt.
 # - Thêm TTS quota guard: sau 429/quota của Gemini TTS, dùng Edge-TTS ngay để tránh chờ/retry dài.
 # - Giới hạn output Gemini được ghi chú rõ tại MAX_OUTPUT_TOKENS bên dưới.
 # ================================================================================
@@ -67,25 +65,8 @@ KEY_LOCK = asyncio.Lock()
 PRIMARY_MODEL_NAME = "gemini-3.8-live"
 FALLBACK_MODEL_NAME = "gemini-3.6-flash"
 
-# ================================================================================
-# LOCAL STT FALLBACK (faster-whisper)
-# ================================================================================
-# Lazy-load only when Gemini 3.8 Live is unavailable. This keeps Render startup
-# lighter and avoids loading Whisper into memory while Live is healthy.
-LOCAL_STT_ENABLED = os.environ.get("LOCAL_STT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-LOCAL_STT_MODEL = os.environ.get("LOCAL_STT_MODEL", "tiny").strip()
-LOCAL_STT_LANGUAGE = os.environ.get("LOCAL_STT_LANGUAGE", "vi").strip()
-LOCAL_STT_COMPUTE_TYPE = os.environ.get("LOCAL_STT_COMPUTE_TYPE", "int8").strip()
-LOCAL_STT_BEAM_SIZE = max(1, int(os.environ.get("LOCAL_STT_BEAM_SIZE", "1")))
-LOCAL_STT_CPU_THREADS = max(1, int(os.environ.get("LOCAL_STT_CPU_THREADS", "1")))
-LOCAL_STT_NUM_WORKERS = max(1, int(os.environ.get("LOCAL_STT_NUM_WORKERS", "1")))
-LOCAL_STT_MAX_AUDIO_SECONDS = max(1, float(os.environ.get("LOCAL_STT_MAX_AUDIO_SECONDS", "20")))
-LOCAL_STT_CACHE_DIR = os.environ.get("LOCAL_STT_CACHE_DIR", "whisper_cache").strip()
-LOCAL_STT_MODEL_LOCK = asyncio.Lock()
-_LOCAL_STT_MODEL = None
-_LOCAL_STT_LOAD_FAILED = False
+# Gemini TTS quota guard.
 
-# Gemini TTS quota guard. A 429 should not be retried on every robot turn.
 _GEMINI_TTS_QUOTA_BLOCKED = False
 _GEMINI_TTS_QUOTA_REASON = ""
 # Fallback is deliberately fixed in code so an old Render GEMINI_MODEL variable
@@ -740,107 +721,6 @@ def key_status_summary() -> str:
 
 
 # ================================================================================
-# LOCAL STT IMPLEMENTATION
-# ================================================================================
-def _decode_pcm16_to_float32(pcm_bytes: bytes):
-    import numpy as np
-    if not pcm_bytes:
-        return np.array([], dtype=np.float32)
-    usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
-    samples = np.frombuffer(pcm_bytes[:usable], dtype=np.int16)
-    return (samples.astype(np.float32) / 32768.0)
-
-
-async def _get_local_stt_model():
-    """Lazy-load faster-whisper tiny once; keep only one model in memory."""
-    global _LOCAL_STT_MODEL, _LOCAL_STT_LOAD_FAILED
-    if not LOCAL_STT_ENABLED or _LOCAL_STT_LOAD_FAILED:
-        return None
-    if _LOCAL_STT_MODEL is not None:
-        return _LOCAL_STT_MODEL
-
-    async with LOCAL_STT_MODEL_LOCK:
-        if _LOCAL_STT_MODEL is not None:
-            return _LOCAL_STT_MODEL
-        try:
-            from faster_whisper import WhisperModel
-            print(
-                f"[LOCAL STT] Dang tai model={LOCAL_STT_MODEL} | device=cpu | "
-                f"compute={LOCAL_STT_COMPUTE_TYPE} | cache={LOCAL_STT_CACHE_DIR or 'default'}",
-                flush=True,
-            )
-            kwargs = {
-                "device": "cpu",
-                "compute_type": LOCAL_STT_COMPUTE_TYPE,
-                "cpu_threads": LOCAL_STT_CPU_THREADS,
-                "num_workers": LOCAL_STT_NUM_WORKERS,
-            }
-            if LOCAL_STT_CACHE_DIR:
-                os.makedirs(LOCAL_STT_CACHE_DIR, exist_ok=True)
-                kwargs["download_root"] = LOCAL_STT_CACHE_DIR
-            _LOCAL_STT_MODEL = await asyncio.to_thread(WhisperModel, LOCAL_STT_MODEL, **kwargs)
-            print("[LOCAL STT] Model san sang.", flush=True)
-            return _LOCAL_STT_MODEL
-        except Exception as exc:
-            _LOCAL_STT_LOAD_FAILED = True
-            print(f"[LOCAL STT ERROR] Khong tai duoc faster-whisper: {str(exc)[:320]}", flush=True)
-            return None
-
-
-def _transcribe_local_stt_sync(model, pcm_bytes: bytes) -> str:
-    import numpy as np
-    audio = _decode_pcm16_to_float32(pcm_bytes)
-    if audio.size == 0:
-        return ""
-    max_samples = int(PCM_SAMPLE_RATE * LOCAL_STT_MAX_AUDIO_SECONDS)
-    if audio.size > max_samples:
-        audio = audio[:max_samples]
-
-    segments, info = model.transcribe(
-        audio,
-        language=LOCAL_STT_LANGUAGE,
-        task="transcribe",
-        beam_size=LOCAL_STT_BEAM_SIZE,
-        best_of=1,
-        temperature=0.0,
-        vad_filter=False,
-        condition_on_previous_text=False,
-        word_timestamps=False,
-    )
-    parts = []
-    for segment in segments:
-        t = (segment.text or "").strip()
-        if t:
-            parts.append(t)
-    transcript = " ".join(parts).strip()
-    detected = getattr(info, "language", None)
-    print(
-        f"[LOCAL STT] Hoan tat | language={detected!r} | chars={len(transcript)} | transcript={transcript!r}",
-        flush=True,
-    )
-    return transcript
-
-
-async def transcribe_local_stt(pcm_bytes: bytes) -> str:
-    if not pcm_bytes or not LOCAL_STT_ENABLED:
-        return ""
-    model = await _get_local_stt_model()
-    if model is None:
-        return ""
-    started = time.monotonic()
-    try:
-        transcript = await asyncio.to_thread(_transcribe_local_stt_sync, model, pcm_bytes)
-        print(
-            f"[LOCAL STT] Total={int((time.monotonic() - started) * 1000)} ms",
-            flush=True,
-        )
-        return transcript
-    except Exception as exc:
-        print(f"[LOCAL STT ERROR] Transcribe that bai: {str(exc)[:320]}", flush=True)
-        return ""
-
-
-# ================================================================================
 # 2. GEMINI 3.1 FLASH TTS + EDGE-TTS FALLBACK
 # ================================================================================
 # Gemini 3.1 Flash TTS is the primary TTS path. It supports streaming audio,
@@ -1368,145 +1248,6 @@ def _log_gemini_result(
         f"chars={len(raw_text)} | first_text={first_text_ms} ms | total={total_ms} ms",
         flush=True,
     )
-
-
-async def ask_gemini_36_fallback_text(
-    transcript: str,
-    safety_config,
-    history: deque,
-) -> tuple[str, str, dict]:
-    """Gemini 3.6 fallback after local STT. Text-only request avoids decoding audio twice."""
-    global CURRENT_KEY_INDEX
-    if not API_KEYS:
-        raise RuntimeError("Khong co GEMINI_API_KEY")
-    transcript = (transcript or "").strip()
-    if not transcript:
-        raise RuntimeError("STT local khong co transcript")
-
-    fallback_system = f"""{_build_system_instruction(search_blocked=True)}
-
-[BACKUP_AI_MODE]
-- Bạn đang là AI dự phòng bằng {FALLBACK_MODEL_NAME}.
-- Trong chế độ này KHÔNG có Google Search và KHÔNG được sử dụng công cụ Internet.
-- Với câu hỏi cần thông tin hiện tại, ví dụ thời tiết, giá vàng/xăng/tỷ giá hiện tại, tin tức mới, kết quả mới hoặc dữ liệu có thể thay đổi, tuyệt đối không được đoán.
-- Với câu hỏi realtime như vậy, trong REPLY hãy nói ngắn gọn rằng chức năng tìm kiếm mạng đang tạm hết quota và sẽ thử lại sau khi AI chính có lại quyền Internet.
-- Câu hỏi giờ/ngày/thứ phải dùng [SERVER_TIME_NOW] và KHÔNG được nói rằng cần Search.
-- Các câu hỏi trò chuyện thông thường, kiến thức không phụ thuộc thời gian và lệnh robot vẫn phải xử lý bình thường.
-- Giữ nguyên định dạng MEMORY/ACTION/REPLY và tính cách Bún Đậu.
-"""
-
-    key_idx: Optional[int] = CURRENT_KEY_INDEX if CURRENT_KEY_INDEX < len(API_KEYS) else 0
-    last_exc: Optional[Exception] = None
-    while key_idx is not None:
-        if KEY_STATUS[key_idx] != "active":
-            key_idx = next_active_key_after(key_idx)
-            continue
-        client = get_genai_client(key_idx)
-        if client is None:
-            mark_key_disabled(key_idx, "Client unavailable")
-            key_idx = next_active_key_after(key_idx)
-            continue
-        started = time.monotonic()
-        try:
-            print(
-                f"[FALLBACK 3.6 TEXT] Dung Key #{key_idx + 1} | model={FALLBACK_MODEL_NAME} | "
-                f"search=OFF | timeout={GEMINI_FALLBACK_TIMEOUT_SECONDS}s | transcript={transcript!r}",
-                flush=True,
-            )
-            history_contents = build_history_contents(history)
-            history_contents.append(
-                types.Content(
-                    role="user",
-                    parts=[types.Part(text=f"Lời nói hiện tại của người dùng: {transcript}")],
-                )
-            )
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=FALLBACK_MODEL_NAME,
-                    contents=history_contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=fallback_system,
-                        max_output_tokens=MAX_OUTPUT_TOKENS,
-                        safety_settings=safety_config,
-                    ),
-                ),
-                timeout=GEMINI_FALLBACK_TIMEOUT_SECONDS,
-            )
-            candidates = getattr(response, "candidates", None) or []
-            parts: list[str] = []
-            finish_reason = "UNKNOWN"
-            finish_message = None
-            usage = getattr(response, "usage_metadata", None)
-            if candidates:
-                candidate = candidates[0]
-                finish_value = getattr(candidate, "finish_reason", None)
-                if finish_value is not None:
-                    finish_reason = str(finish_value)
-                finish_message_value = getattr(candidate, "finish_message", None)
-                if finish_message_value:
-                    finish_message = str(finish_message_value)
-                content = getattr(candidate, "content", None)
-                response_parts = getattr(content, "parts", None) if content is not None else None
-                for part in response_parts or []:
-                    if getattr(part, "thought", False):
-                        continue
-                    part_text = getattr(part, "text", None)
-                    if part_text:
-                        parts.append(str(part_text))
-            raw_text = "".join(parts).strip()
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-            print(
-                f"[FALLBACK 3.6 TEXT] Hoan tat | chars={len(raw_text)} | "
-                f"finish_reason={finish_reason!r} | total={elapsed_ms} ms",
-                flush=True,
-            )
-            if usage:
-                print(
-                    f"[FALLBACK 3.6 TEXT] Usage | prompt={getattr(usage, 'prompt_token_count', None)} | "
-                    f"output={getattr(usage, 'candidates_token_count', None)} | "
-                    f"total={getattr(usage, 'total_token_count', None)}",
-                    flush=True,
-                )
-            upper = finish_reason.upper()
-            if any(x in upper for x in ("MAX_TOKENS", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "INCOMPLETE")):
-                raise RuntimeError(
-                    f"Gemini 3.6 response khong hoan chinh: {finish_reason}"
-                    + (f" | {finish_message}" if finish_message else "")
-                )
-            if not raw_text:
-                raise RuntimeError("Gemini 3.6 tra ve rong")
-            memory_text, reply_text, action = parse_tagged_response(raw_text)
-            if not reply_text:
-                raise RuntimeError("Gemini 3.6 tra ve rong REPLY")
-            if not memory_text:
-                memory_text = "Không trích xuất được tóm tắt lượt này."
-            CURRENT_KEY_INDEX = key_idx
-            print(f"[FALLBACK 3.6 TEXT REPLY] {reply_text!r}", flush=True)
-            return memory_text, reply_text, action
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"Gemini 3.6 text timeout sau {GEMINI_FALLBACK_TIMEOUT_SECONDS:.0f}s"
-            ) from exc
-        except Exception as exc:
-            last_exc = exc
-            code = _error_code(exc)
-            detail = str(exc).replace("\n", " ")[:260]
-            if code == 429 or "quota" in detail.lower() or "resource_exhausted" in detail.lower():
-                raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: " + detail) from exc
-            if classify_gemini_error(exc) == "rotate":
-                mark_key_disabled(key_idx, detail)
-                nxt = next_active_key_after(key_idx)
-                if nxt is None:
-                    break
-                print(
-                    f"[FALLBACK 3.6 TEXT] Key #{key_idx + 1} khong dung duoc -> Key #{nxt + 1}",
-                    flush=True,
-                )
-                key_idx = nxt
-                continue
-            print(f"[FALLBACK 3.6 TEXT] Loi Key #{key_idx + 1}: {detail}", flush=True)
-            raise RuntimeError(detail) from exc
-    raise RuntimeError(str(last_exc) if last_exc else "Khong con Gemini 3.6 key active")
 
 
 async def ask_gemini_36_fallback_audio(
@@ -2282,94 +2023,44 @@ async def websocket_chat(websocket: WebSocket):
                     await live_abort_turn(live_handle)
                     live_result = None
 
-            fallback_used = False
-            local_stt_used = False
             if live_result is None:
-                fallback_used = True
+                # IMPORTANT: restore the V4.8 audio path.
+                # Do not transcribe with local Whisper first. Gemini 3.6 receives
+                # the exact same PCM/WAV that the robot recorded, minimizing
+                # recognition changes introduced by an extra STT layer.
                 raw_pcm_for_fallback = bytes(pcm_buffer)
-                transcript = ""
-
-                # First choice when Live is unavailable: local STT.
-                transcript = await transcribe_local_stt(raw_pcm_for_fallback)
-                if transcript:
-                    local_stt_used = True
-
-                    # Local deterministic time/date/weekday path. No Gemini call.
-                    local_clock_result = build_local_time_date_reply(transcript)
-                    if local_clock_result is not None:
-                        user_memory, answer, action = local_clock_result
-                        print(
-                            f"[LOCAL TIME][STT] Khong dung Gemini/Search | transcript={transcript!r} | answer={answer!r}",
-                            flush=True,
-                        )
-                    elif is_search_quota_exhausted() or get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT:
-                        if looks_like_search_intent(transcript):
-                            user_memory = "Người dùng hỏi thông tin Internet trong lúc Gemini Live/Search đang hết quota."
-                            answer = GOOGLE_SEARCH_WARNING_TEXT
-                            action = {
-                                "type": "none",
-                                "emotion": "neutral",
-                                "direction": "none",
-                                "degrees": 0,
-                                "distance_cm": 0,
-                                "speed": "normal",
-                            }
-                            print(
-                                f"[SEARCH BLOCKED][STT] transcript={transcript!r} -> {answer}",
-                                flush=True,
-                            )
-                        else:
-                            user_memory, answer, action = await ask_gemini_36_fallback_text(
-                                transcript,
-                                safety_config,
-                                conversation_history,
-                            )
-                    elif is_live_quota_exhausted():
-                        # Live quota may be exhausted even when the local Search guard is not.
-                        # 3.6 can still answer ordinary conversation, but current-data questions
-                        # are blocked explicitly in its system prompt.
-                        user_memory, answer, action = await ask_gemini_36_fallback_text(
-                            transcript,
-                            safety_config,
-                            conversation_history,
-                        )
+                print(
+                    "[FALLBACK 3.6] Live unavailable -> direct audio fallback (no local STT)",
+                    flush=True,
+                )
+                try:
+                    user_memory, answer, action = await ask_gemini_36_fallback_audio(
+                        create_wav_bytes(raw_pcm_for_fallback),
+                        safety_config,
+                        conversation_history,
+                    )
+                except Exception as fallback_exc:
+                    err_text = str(fallback_exc)
+                    if err_text.startswith("GEMINI_36_QUOTA_EXHAUSTED:"):
+                        answer = "Hôm nay mình đang hết lượt AI dự phòng miễn phí luôn rồi, mình sẽ thử lại vào ngày mai nhé."
+                        user_memory = "Gemini 3.8 Live và Gemini 3.6 Flash dự phòng đều vượt quota."
+                    elif "timeout" in err_text.lower():
+                        answer = "Xin lỗi, cả bộ não chính và bộ não dự phòng hôm nay đều phản hồi hơi chậm. Bạn thử lại mình nhé."
+                        user_memory = "Gemini Live lỗi và Gemini 3.6 Flash dự phòng timeout."
                     else:
-                        user_memory, answer, action = await ask_gemini_36_fallback_text(
-                            transcript,
-                            safety_config,
-                            conversation_history,
-                        )
-                    print(f"[FALLBACK LOCAL STT SPEECH] {answer}", flush=True)
-                else:
-                    # Last resort only: send the original audio to Gemini 3.6.
-                    print("[LOCAL STT] Khong lay duoc transcript -> fallback 3.6 audio.", flush=True)
-                    try:
-                        user_memory, answer, action = await ask_gemini_36_fallback_audio(
-                            create_wav_bytes(raw_pcm_for_fallback),
-                            safety_config,
-                            conversation_history,
-                        )
-                    except Exception as fallback_exc:
-                        err_text = str(fallback_exc)
-                        if err_text.startswith("GEMINI_36_QUOTA_EXHAUSTED:"):
-                            answer = "Hôm nay mình đang hết lượt AI dự phòng miễn phí luôn rồi, mình sẽ thử lại vào ngày mai nhé."
-                            user_memory = "Gemini 3.8 Live và Gemini 3.6 Flash dự phòng đều vượt quota."
-                        elif "timeout" in err_text.lower():
-                            answer = "Xin lỗi, cả bộ não chính và bộ não dự phòng hôm nay đều phản hồi hơi chậm. Bạn thử lại mình nhé."
-                            user_memory = "Gemini Live lỗi và Gemini 3.6 Flash dự phòng timeout."
-                        else:
-                            answer = "Xin lỗi, mình chưa nghe rõ câu này. Bạn nói lại mình một chút nhé."
-                            user_memory = "STT local thất bại và Gemini 3.6 audio fallback cũng lỗi."
-                        action = {
-                            "type": "none",
-                            "emotion": "neutral",
-                            "direction": "none",
-                            "degrees": 0,
-                            "distance_cm": 0,
-                            "speed": "normal",
-                        }
-                        print(f"[FALLBACK AUDIO ERROR] {err_text[:260]}", flush=True)
+                        answer = "Xin lỗi, mình chưa nghe rõ câu này. Bạn nói lại mình một chút nhé."
+                        user_memory = "Gemini Live không khả dụng và Gemini 3.6 audio fallback gặp lỗi."
+                    action = {
+                        "type": "none",
+                        "emotion": "neutral",
+                        "direction": "none",
+                        "degrees": 0,
+                        "distance_cm": 0,
+                        "speed": "normal",
+                    }
+                    print(f"[FALLBACK AUDIO ERROR] {err_text[:260]}", flush=True)
                 pcm_buffer.clear()
+
 
             pcm_buffer.clear()
             if live_result is not None:
