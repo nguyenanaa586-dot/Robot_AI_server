@@ -1,6 +1,6 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.10 - STABLE AUDIO FALLBACK + TIME/DATE INTERNAL
-# Phiên bản: 4.10
+# ROBOT BÚN ĐẬU SERVER - V4.10.1 - HOTFIX ROOT 500 + STABLE AUDIO FALLBACK
+# Phiên bản: 4.10.1
 #
 # - Gemini 3.8 Live là não chính cho hội thoại realtime và Google Search.
 # - Gemini 3.6 Flash là não dự phòng khi Gemini 3.8 Live hết quota/lỗi.
@@ -972,12 +972,16 @@ async def send_edge_fallback_to_esp(
 # ================================================================================
 @app.get("/")
 def read_root():
+    # V4.10.1 hotfix: Local STT/Whisper was removed in V4.10, so the root
+    # endpoint must not reference the old LOCAL_STT_* variables.
     return {
         "status": "Robot Bun Dau Server OK",
+        "version": "4.10.1",
         "gemini_keys": len(API_KEYS),
-        "local_stt_enabled": LOCAL_STT_ENABLED,
-        "local_stt_model": LOCAL_STT_MODEL,
-        "local_stt_compute_type": LOCAL_STT_COMPUTE_TYPE,
+        "local_stt_enabled": False,
+        "local_stt_model": None,
+        "local_stt_compute_type": None,
+        "audio_fallback": "gemini-3.6-flash-direct-audio",
         "gemini_tts_quota_blocked": _GEMINI_TTS_QUOTA_BLOCKED,
         "current_gemini_key": CURRENT_KEY_INDEX + 1 if API_KEYS else None,
         "key_status": key_status_summary(),
@@ -1013,6 +1017,12 @@ def read_root():
         "robot_command_protocol": "v1",
         "robot_command_calibration": "ESP32-local timing calibration",
     }
+
+
+@app.get("/healthz")
+def healthz():
+    # Minimal Render/monitoring health endpoint; never calls Gemini or STT.
+    return {"status": "ok", "version": "4.10.1"}
 
 
 # ================================================================================
