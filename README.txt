@@ -1,15 +1,17 @@
-ROBOT BÚN ĐẬU SERVER V4.10
+ROBOT BÚN ĐẬU SERVER V4.10.1
 
-Mục tiêu bản này: khôi phục đường fallback nhận dạng đã hoạt động ổn định ở V4.8.
+HOTFIX:
+- Sửa HTTP 500 tại GET / do V4.10 còn tham chiếu LOCAL_STT_ENABLED/LOCAL_STT_MODEL/LOCAL_STT_COMPUTE_TYPE sau khi Local STT/Whisper đã bị loại bỏ.
+- GET /healthz trả 200 ổn định cho Render/monitoring.
+- Giữ Gemini 3.8 Live làm não chính.
+- Khi Live hết quota/lỗi: chuyển sang Gemini 3.6 Flash và gửi trực tiếp cùng audio WAV từ ESP32; KHÔNG dùng Whisper/local STT.
+- Giữ quota guard Live/Search/TTS và Edge-TTS fallback.
 
-Luồng chính:
-- Gemini 3.8 Live: não chính + Google Search.
-- Khi 3.8 Live hết quota/lỗi: Gemini 3.6 Flash nhận TRỰC TIẾP WAV 16 kHz từ ESP32.
-- Không chạy faster-whisper/local STT trong đường fallback.
-- Giữ quota guard, MEMORY/ACTION/REPLY, ToF và TTS/Edge-TTS fallback của V4.9.
-- Giờ/ngày/thứ vẫn có ngữ cảnh SERVER_TIME_NOW trong system prompt.
+RENDER START COMMAND:
+uvicorn main:app --host 0.0.0.0 --port $PORT
 
-Render:
-Start Command: uvicorn main:app --host 0.0.0.0 --port $PORT
-Environment Variables hiện tại vẫn đủ với GEMINI_API_KEY và các biến TTS bạn đang dùng.
-Không cần cài faster-whisper cho V4.10.
+KIỂM TRA SAU DEPLOY:
+- GET / -> HTTP 200
+- GET /healthz -> HTTP 200
+- Khi Live quota exhausted và robot nói xong, log phải xuất hiện:
+  [FALLBACK 3.6] Live unavailable -> direct audio fallback (no local STT)
