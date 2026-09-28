@@ -1,6 +1,6 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.10.1 - HOTFIX ROOT 500 + STABLE AUDIO FALLBACK
-# Phiên bản: 4.10.1
+# ROBOT BÚN ĐẬU SERVER - V4.10.2 - STABLE TTS + QUOTA FALLBACK
+# Phiên bản: 4.10.2
 #
 # - Gemini 3.8 Live là não chính cho hội thoại realtime và Google Search.
 # - Gemini 3.6 Flash là não dự phòng khi Gemini 3.8 Live hết quota/lỗi.
@@ -40,6 +40,7 @@ os.environ.setdefault("ORT_NUM_THREADS", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 from google import genai
 from google.genai import types
 
@@ -69,6 +70,19 @@ FALLBACK_MODEL_NAME = "gemini-3.6-flash"
 
 _GEMINI_TTS_QUOTA_BLOCKED = False
 _GEMINI_TTS_QUOTA_REASON = ""
+
+# Gemini 3.6 Flash daily quota guard. This state is only a local cache of a real 429/quota response.
+GEMINI_36_QUOTA_STATE_FILE = os.environ.get(
+    "GEMINI_36_QUOTA_STATE_FILE",
+    "gemini_36_quota_daily_state_v4_10_2.json",
+).strip()
+GEMINI_36_QUOTA_MESSAGE = os.environ.get(
+    "GEMINI_36_QUOTA_MESSAGE",
+    "Hôm nay mình đang hết lượt AI dự phòng miễn phí luôn rồi, mình sẽ thử lại vào ngày mai nhé.",
+).strip()
+_GEMINI_36_QUOTA_DATE: Optional[str] = None
+_GEMINI_36_QUOTA_EXHAUSTED = False
+_GEMINI_36_QUOTA_REASON = ""
 # Fallback is deliberately fixed in code so an old Render GEMINI_MODEL variable
 # cannot silently switch the backup brain to a paid/unsupported model.
 GEMINI_FALLBACK_TIMEOUT_SECONDS = max(5.0, float(os.environ.get("GEMINI_FALLBACK_TIMEOUT_SECONDS", "18")))
@@ -448,6 +462,109 @@ def get_live_quota_status() -> dict:
         "exhausted": _LIVE_QUOTA_EXHAUSTED,
         "message": LIVE_QUOTA_EXHAUSTED_MESSAGE,
     }
+
+
+def _load_gemini_36_quota_unlocked() -> None:
+    global _GEMINI_36_QUOTA_DATE, _GEMINI_36_QUOTA_EXHAUSTED, _GEMINI_36_QUOTA_REASON
+    today = local_today_str()
+    if _GEMINI_36_QUOTA_DATE == today:
+        return
+
+    # A key disabled only because Gemini 3.6 returned a daily quota/429 must be
+    # eligible again on the next local day. Keep other permanent/auth failures disabled.
+    for idx, reason in enumerate(KEY_FAILURE_REASON):
+        if (
+            KEY_STATUS[idx] == "disabled"
+            and reason
+            and reason.startswith("Gemini 3.6 quota/429:")
+        ):
+            KEY_STATUS[idx] = "active"
+            KEY_FAILURE_REASON[idx] = None
+
+    exhausted = False
+    reason = ""
+    if GEMINI_36_QUOTA_STATE_FILE and os.path.exists(GEMINI_36_QUOTA_STATE_FILE):
+        try:
+            with open(GEMINI_36_QUOTA_STATE_FILE, "r", encoding="utf-8") as fh:
+                state = json.load(fh)
+            if state.get("date") == today:
+                exhausted = bool(state.get("exhausted", False))
+                reason = str(state.get("reason", ""))
+        except Exception as exc:
+            print(f"[GEMINI 3.6 QUOTA] Khong doc duoc state: {exc}", flush=True)
+    _GEMINI_36_QUOTA_DATE = today
+    _GEMINI_36_QUOTA_EXHAUSTED = exhausted
+    _GEMINI_36_QUOTA_REASON = reason
+
+
+def _save_gemini_36_quota_unlocked() -> None:
+    if not GEMINI_36_QUOTA_STATE_FILE:
+        return
+    try:
+        with open(GEMINI_36_QUOTA_STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "date": _GEMINI_36_QUOTA_DATE,
+                    "exhausted": _GEMINI_36_QUOTA_EXHAUSTED,
+                    "reason": _GEMINI_36_QUOTA_REASON,
+                },
+                fh,
+                ensure_ascii=False,
+            )
+    except Exception as exc:
+        print(f"[GEMINI 3.6 QUOTA] Khong ghi duoc state: {exc}", flush=True)
+
+
+def get_gemini_36_quota_status() -> dict:
+    _load_gemini_36_quota_unlocked()
+    return {
+        "date": _GEMINI_36_QUOTA_DATE,
+        "exhausted": _GEMINI_36_QUOTA_EXHAUSTED,
+        "message": GEMINI_36_QUOTA_MESSAGE,
+    }
+
+
+def is_gemini_36_quota_exhausted() -> bool:
+    _load_gemini_36_quota_unlocked()
+    return _GEMINI_36_QUOTA_EXHAUSTED
+
+
+def mark_gemini_36_quota_exhausted(reason: str = "") -> None:
+    global _GEMINI_36_QUOTA_EXHAUSTED, _GEMINI_36_QUOTA_REASON
+    _load_gemini_36_quota_unlocked()
+    _GEMINI_36_QUOTA_EXHAUSTED = True
+    _GEMINI_36_QUOTA_REASON = (reason or "quota exceeded").replace("\n", " ")[:220]
+    _save_gemini_36_quota_unlocked()
+    print(
+        f"[GEMINI 3.6 QUOTA] Block 3.6 den ngay mai | date={_GEMINI_36_QUOTA_DATE} | "
+        f"reason={_GEMINI_36_QUOTA_REASON}",
+        flush=True,
+    )
+
+
+class RobotClientDisconnected(RuntimeError):
+    """ESP32 has disconnected; TTS must not retry against a dead socket."""
+
+
+def websocket_is_connected(websocket: WebSocket) -> bool:
+    return (
+        getattr(websocket, "application_state", None) == WebSocketState.CONNECTED
+        and getattr(websocket, "client_state", None) == WebSocketState.CONNECTED
+    )
+
+
+async def safe_ws_send_text(websocket: WebSocket, payload: dict) -> None:
+    if not websocket_is_connected(websocket):
+        raise RobotClientDisconnected("ESP32 WebSocket da dong")
+    try:
+        await websocket.send_text(json.dumps(payload, ensure_ascii=False))
+    except WebSocketDisconnect as exc:
+        raise RobotClientDisconnected("ESP32 WebSocket da ngat") from exc
+    except RuntimeError as exc:
+        detail = str(exc).lower()
+        if "close message" in detail or ("websocket" in detail and "disconnected" in detail):
+            raise RobotClientDisconnected(str(exc)) from exc
+        raise
 
 
 async def reserve_search_budget() -> bool:
@@ -836,12 +953,22 @@ async def _send_pcm_paced(websocket: WebSocket, pcm: bytes, state: dict) -> int:
         return 0
     state.setdefault("next_deadline", time.monotonic())
     for i in range(0, len(pcm), TTS_CHUNK_SIZE):
+        if not websocket_is_connected(websocket):
+            raise RobotClientDisconnected("ESP32 WebSocket da dong trong luc gui audio")
         chunk = pcm[i:i + TTS_CHUNK_SIZE]
         if len(chunk) % 2:
             chunk = chunk[:-1]
         if not chunk:
             continue
-        await websocket.send_bytes(chunk)
+        try:
+            await websocket.send_bytes(chunk)
+        except WebSocketDisconnect as exc:
+            raise RobotClientDisconnected("ESP32 WebSocket da ngat trong luc gui audio") from exc
+        except RuntimeError as exc:
+            detail = str(exc).lower()
+            if "close message" in detail or ("websocket" in detail and "disconnected" in detail):
+                raise RobotClientDisconnected(str(exc)) from exc
+            raise
         total += len(chunk)
         state["next_deadline"] += len(chunk) / PCM_BYTES_PER_SECOND
         delay = state["next_deadline"] - time.monotonic()
@@ -929,38 +1056,39 @@ async def send_edge_fallback_to_esp(
 ) -> tuple[int, int, str]:
     if not EDGE_TTS_ENABLED:
         raise RuntimeError("Gemini TTS loi va Edge-TTS fallback dang tat")
-    voices = [
-        v for v in (EDGE_TTS_VOICE, EDGE_TTS_FALLBACK_VOICE)
-        if v
-    ]
+    voices = [v for v in (EDGE_TTS_VOICE, EDGE_TTS_FALLBACK_VOICE) if v]
     last = None
     for voice in dict.fromkeys(voices):
         for attempt in range(1, TTS_RETRIES_PER_VOICE + 1):
+            if not websocket_is_connected(websocket):
+                raise RobotClientDisconnected("ESP32 WebSocket da dong truoc khi TTS fallback")
             started = time.monotonic()
             try:
                 print(
-                    f"[TTS] Edge fallback voice={voice} | lan "
-                    f"{attempt}/{TTS_RETRIES_PER_VOICE}",
+                    f"[TTS] Edge fallback voice={voice} | lan {attempt}/{TTS_RETRIES_PER_VOICE}",
                     flush=True,
                 )
-                pcm = await asyncio.wait_for(
-                    _edge_tts_pcm(text, voice),
-                    timeout=TTS_TIMEOUT_SECONDS,
-                )
+                async with _tts_semaphore:
+                    pcm = await asyncio.wait_for(
+                        _edge_tts_pcm(text, voice),
+                        timeout=TTS_TIMEOUT_SECONDS,
+                    )
+                if not websocket_is_connected(websocket):
+                    raise RobotClientDisconnected("ESP32 WebSocket da dong sau khi synth Edge-TTS")
                 state = {"next_deadline": time.monotonic()}
                 sent = await _send_pcm_paced(websocket, pcm, state)
                 elapsed = int((time.monotonic() - started) * 1000)
                 print(
-                    f"[TTS] Edge fallback thanh cong | voice={voice} | "
-                    f"PCM={sent} bytes | synth={elapsed} ms",
+                    f"[TTS] Edge fallback thanh cong | voice={voice} | PCM={sent} bytes | synth={elapsed} ms",
                     flush=True,
                 )
                 return sent, elapsed, voice
+            except RobotClientDisconnected:
+                raise
             except Exception as exc:
                 last = exc
                 print(
-                    f"[EDGE-TTS Error] voice={voice} | lan {attempt}: "
-                    f"{str(exc)[:260]}",
+                    f"[EDGE-TTS Error] voice={voice} | lan {attempt}: {str(exc)[:260]}",
                     flush=True,
                 )
                 if attempt < TTS_RETRIES_PER_VOICE:
@@ -976,13 +1104,14 @@ def read_root():
     # endpoint must not reference the old LOCAL_STT_* variables.
     return {
         "status": "Robot Bun Dau Server OK",
-        "version": "4.10.1",
+        "version": "4.10.2",
         "gemini_keys": len(API_KEYS),
         "local_stt_enabled": False,
         "local_stt_model": None,
         "local_stt_compute_type": None,
         "audio_fallback": "gemini-3.6-flash-direct-audio",
         "gemini_tts_quota_blocked": _GEMINI_TTS_QUOTA_BLOCKED,
+        "gemini_36_quota": get_gemini_36_quota_status(),
         "current_gemini_key": CURRENT_KEY_INDEX + 1 if API_KEYS else None,
         "key_status": key_status_summary(),
         "tts_provider": "gemini-3.1-flash-tts-preview",
@@ -1022,7 +1151,7 @@ def read_root():
 @app.get("/healthz")
 def healthz():
     # Minimal Render/monitoring health endpoint; never calls Gemini or STT.
-    return {"status": "ok", "version": "4.10.1"}
+    return {"status": "ok", "version": "4.10.2"}
 
 
 # ================================================================================
@@ -1278,6 +1407,9 @@ async def ask_gemini_36_fallback_audio(
     if not wav_bytes:
         raise RuntimeError("Audio fallback rong")
 
+    if is_gemini_36_quota_exhausted():
+        raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: daily guard")
+
     fallback_system = f"""{_build_system_instruction(search_blocked=True)}
 
 [BACKUP_AI_MODE]
@@ -1388,7 +1520,22 @@ async def ask_gemini_36_fallback_audio(
             last_exc = exc
             code = _error_code(exc)
             detail = str(exc).replace("\n", " ")[:260]
-            if code == 429 or "quota" in detail.lower() or "resource_exhausted" in detail.lower():
+            quota_hit = (
+                code == 429
+                or "quota" in detail.lower()
+                or "resource_exhausted" in detail.lower()
+            )
+            if quota_hit:
+                mark_key_disabled(key_idx, "Gemini 3.6 quota/429: " + detail)
+                nxt = next_active_key_after(key_idx)
+                if nxt is not None:
+                    print(
+                        f"[FALLBACK 3.6] Key #{key_idx + 1} het quota/429 -> thu Key #{nxt + 1}",
+                        flush=True,
+                    )
+                    key_idx = nxt
+                    continue
+                mark_gemini_36_quota_exhausted(detail)
                 raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: " + detail) from exc
             if classify_gemini_error(exc) == "rotate":
                 mark_key_disabled(key_idx, detail)
@@ -1407,6 +1554,11 @@ async def ask_gemini_36_fallback_audio(
             )
             raise RuntimeError(detail) from exc
 
+    if last_exc:
+        detail = str(last_exc)
+        if classify_gemini_error(last_exc) == "quota" or "quota" in detail.lower() or "resource_exhausted" in detail.lower():
+            mark_gemini_36_quota_exhausted(detail)
+            raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: " + detail) from last_exc
     raise RuntimeError(str(last_exc) if last_exc else "Khong con Gemini 3.6 key active")
 
 
@@ -2112,6 +2264,7 @@ async def websocket_chat(websocket: WebSocket):
             sent = 0
             used_voice = ""
             first_audio_ms = None
+            tts_failed = False
             try:
                 global _GEMINI_TTS_QUOTA_BLOCKED, _GEMINI_TTS_QUOTA_REASON
                 if GEMINI_TTS_ENABLED and not _GEMINI_TTS_QUOTA_BLOCKED:
@@ -2126,6 +2279,8 @@ async def websocket_chat(websocket: WebSocket):
                             timeout=TTS_TIMEOUT_SECONDS
                             + max(5, int(len(cleaned) / 20)),
                         )
+                    except RobotClientDisconnected:
+                        raise
                     except Exception as tts_exc:
                         kind = classify_gemini_error(tts_exc)
                         detail = str(tts_exc).replace("\n", " ")[:240]
@@ -2146,23 +2301,45 @@ async def websocket_chat(websocket: WebSocket):
                     if _GEMINI_TTS_QUOTA_BLOCKED:
                         print("[GEMINI TTS] Dang bi khoa do quota -> Edge-TTS ngay.", flush=True)
                     raise RuntimeError("Gemini TTS disabled or quota blocked")
+            except RobotClientDisconnected:
+                print("[WEBSOCKET] ESP32 da ngat trong luc TTS; dung moi retry.", flush=True)
+                raise
             except Exception as exc:
                 print(
-                    f"[TTS] Gemini TTS that bai -> Edge-TTS fallback: "
-                    f"{str(exc)[:260]}",
+                    f"[TTS] Gemini TTS that bai -> Edge-TTS fallback: {str(exc)[:260]}",
                     flush=True,
                 )
-                sent, _, used_voice = await send_edge_fallback_to_esp(
-                    websocket,
-                    cleaned,
-                )
-                first_audio_ms = int(
-                    (time.monotonic() - tts_started) * 1000
-                )
+                try:
+                    sent, _, used_voice = await send_edge_fallback_to_esp(
+                        websocket,
+                        cleaned,
+                    )
+                    first_audio_ms = int((time.monotonic() - tts_started) * 1000)
+                except RobotClientDisconnected:
+                    print("[WEBSOCKET] ESP32 da ngat trong Edge-TTS; dung moi retry.", flush=True)
+                    raise
+                except Exception as edge_exc:
+                    tts_failed = True
+                    print(
+                        f"[TTS FATAL] Gemini + Edge-TTS deu that bai, giu WebSocket song: {str(edge_exc)[:260]}",
+                        flush=True,
+                    )
 
-            tts_total_ms = int(
-                (time.monotonic() - tts_started) * 1000
-            )
+            tts_total_ms = int((time.monotonic() - tts_started) * 1000)
+            if tts_failed:
+                if websocket_is_connected(websocket):
+                    try:
+                        await safe_ws_send_text(
+                            websocket,
+                            {"event": "tts_done", "tts_failed": True, "audio_bytes": 0},
+                        )
+                    except RobotClientDisconnected:
+                        print("[WEBSOCKET] ESP32 da ngat truoc khi gui tts_done sau TTS failure.", flush=True)
+                        raise
+                conversation_history.append(
+                    {"user_memory": user_memory, "assistant_reply": cleaned}
+                )
+                continue
             print(
                 f"[PERF] TTS first_audio={first_audio_ms} ms | "
                 f"total={tts_total_ms} ms | voice={used_voice}",
@@ -2193,7 +2370,7 @@ async def websocket_chat(websocket: WebSocket):
                     await close_live_handle(live_handle)
                     live_handle = None
 
-            await websocket.send_text(json.dumps({"event": "tts_done"}))
+            await safe_ws_send_text(websocket, {"event": "tts_done"})
             print(
                 f"[WEBSOCKET] Da gui xong audio | PCM={sent} bytes | "
                 f"TTS_total={tts_total_ms} ms | "
@@ -2201,7 +2378,7 @@ async def websocket_chat(websocket: WebSocket):
                 flush=True,
             )
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RobotClientDisconnected):
         print("[WEBSOCKET] ESP32 ngat ket noi.", flush=True)
     except Exception as exc:
         print(f"[WEBSOCKET ERROR] {exc}", flush=True)
