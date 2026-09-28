@@ -1,11 +1,11 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.6 - GEMINI 3.8 LIVE + 3.6 FLASH FALLBACK
-# Phiên bản: 4.6
+# ROBOT BÚN ĐẬU SERVER - V4.7 - TIME/DATE INTERNAL + 3.8 LIVE + 3.6 FALLBACK
+# Phiên bản: 4.7
 #
 # - Gemini 3.8 Live là não chính cho hội thoại realtime và Google Search.
 # - Gemini 3.6 Flash là não dự phòng khi Gemini 3.8 Live hết quota/lỗi.
 # - Thêm Google Search grounding cho câu hỏi cần thông tin hiện tại.
-# - Thêm ngữ cảnh thời gian Việt Nam (Asia/Ho_Chi_Minh) cho câu hỏi "mấy giờ".
+# - Giữ giờ/ngày/thứ là dữ liệu nội bộ server; tuyệt đối không dùng Google Search cho nhóm này.
 # - Giữ MEMORY / ACTION / REPLY / TTS / Edge-TTS fallback / ToF / sticky key.
 # - Dùng Gemini 3.8 Live làm pipeline hội thoại/âm thanh chính.
 # - Khi Live lỗi/hết quota, lượt đó chuyển sang Gemini 3.6 Flash để robot vẫn trò chuyện.
@@ -84,7 +84,7 @@ GOOGLE_SEARCH_WARNING_TEXT = os.environ.get(
 ).strip()
 GOOGLE_SEARCH_COUNTER_FILE = os.environ.get(
     "GEMINI_WEB_SEARCH_COUNTER_FILE",
-    "google_search_daily_usage.json",
+    "google_search_daily_usage_v4_7.json",
 ).strip()
 
 _SEARCH_USAGE_DATE: Optional[str] = None
@@ -95,7 +95,7 @@ _SEARCH_USAGE_LOCK = asyncio.Lock()
 # Google may report Search-specific quota exhaustion separately from overall Live quota.
 SEARCH_QUOTA_STATE_FILE = os.environ.get(
     "GEMINI_SEARCH_QUOTA_STATE_FILE",
-    "google_search_quota_daily_state.json",
+    "google_search_quota_daily_state_v4_7.json",
 ).strip()
 _SEARCH_QUOTA_DATE: Optional[str] = None
 _SEARCH_QUOTA_EXHAUSTED = False
@@ -106,7 +106,7 @@ _SEARCH_QUOTA_LOCK = asyncio.Lock()
 # for the rest of the local Vietnam day, then automatically clears on the next day.
 LIVE_QUOTA_COUNTER_FILE = os.environ.get(
     "GEMINI_LIVE_QUOTA_COUNTER_FILE",
-    "gemini_live_quota_daily_state.json",
+    "gemini_live_quota_daily_state_v4_7.json",
 ).strip()
 LIVE_QUOTA_EXHAUSTED_MESSAGE = os.environ.get(
     "GEMINI_LIVE_QUOTA_EXHAUSTED_MESSAGE",
@@ -162,7 +162,7 @@ LIVE_MAX_OUTPUT_TOKENS = int(
 LIVE_THINKING_LEVEL = os.environ.get(
     "GEMINI_LIVE_THINKING_LEVEL", "low"
 ).strip().lower()
-# Legacy batch fallback switch intentionally ignored in V4.6.
+# Legacy batch fallback switch intentionally ignored in V4.7.
 GEMINI_BATCH_FALLBACK_ENABLED = False
 LIVE_INPUT_MIME = "audio/pcm;rate=16000"
 LIVE_SESSION_CONNECT_RETRIES = max(1, int(os.environ.get("GEMINI_LIVE_CONNECT_RETRIES", "2")))
@@ -237,7 +237,8 @@ SYSTEM_PROMPT += f"""
 THÔNG TIN THỜI GIAN VÀ INTERNET:
 - Thời gian hiện tại do server cung cấp theo múi giờ {BUN_DAU_TIMEZONE}; dùng nó trực tiếp khi người dùng hỏi bây giờ là mấy giờ, ngày nào, thứ mấy.
 - Địa điểm mặc định cho câu hỏi thời tiết/địa phương là {BUN_DAU_DEFAULT_LOCATION}, trừ khi người dùng nêu địa điểm khác.
-- Khi người dùng hỏi dữ liệu hiện tại như thời tiết, giá xăng, giá vàng, tỷ giá, giá crypto, tin tức, kết quả/sự kiện mới hoặc thông tin có thể thay đổi theo thời gian, phải dùng Google Search grounding nếu công cụ được bật.
+- CÁC CÂU HỎI GIỜ/NGÀY/THỨ LÀ NỘI BỘ, KHÔNG ĐƯỢC DÙNG GOOGLE SEARCH. Các cách hỏi như "bây giờ là mấy giờ", "mấy giờ rồi", "giờ hiện tại", "hôm nay ngày mấy", "hôm nay thứ mấy" phải dùng trực tiếp [SERVER_TIME_NOW] do server cung cấp.
+- Chỉ dùng Google Search cho dữ liệu bên ngoài thực sự cần Internet như thời tiết, giá xăng, giá vàng, tỷ giá, giá crypto, tin tức, kết quả/sự kiện mới hoặc thông tin có thể thay đổi theo thời gian.
 - Với giá xăng ở Việt Nam, ưu tiên thông tin mới nhất từ nguồn chính thức/uy tín như cơ quan quản lý, Petrolimex hoặc nguồn thị trường có thời điểm cập nhật rõ ràng; nói rõ thời điểm nếu nguồn có nêu.
 - Với giá vàng, ưu tiên giá SJC và nêu mua/bán cùng thời điểm nếu tìm được.
 - Với thời tiết, ưu tiên dữ liệu mới nhất và nói rõ địa điểm/ngày khi cần.
@@ -257,6 +258,10 @@ def _get_local_time_context() -> str:
 def _build_system_instruction(search_blocked: bool = False) -> str:
     # Chèn thời gian thực tại thời điểm gửi request; không dùng thời gian hard-code.
     extra = ""
+    extra += (
+        "\n[TIME_DATE_RULE] Câu hỏi về giờ, ngày, thứ là dữ liệu nội bộ. Không dùng Google Search. "
+        "Luôn dùng trực tiếp [SERVER_TIME_NOW] được cung cấp bên dưới; không đi tìm trên Internet.\n"
+    )
     if search_blocked and GOOGLE_SEARCH_ENABLED:
         extra = (
             "\n[INTERNET_SEARCH_STATUS] Hôm nay server đã hết lượt Google Search miễn phí theo bộ đếm an toàn cục bộ. "
@@ -502,15 +507,90 @@ SEARCH_INTENT_PATTERNS = [
     r"\bcrypto(?:currency)?\b",
     r"\btin t[uứ]c\b",
     r"\bm[oớ]i nh[aấ]t\b",
-    r"\bhi[eệ]n t[aạ]i\b",
-    r"\bh[oô]m nay\b",
-    r"\bb[aâ]y gi[oờ]\b",
     r"\bk[eế]t qu[aả]\b",
     r"\bt[yỷ] s[oố]\b",
     r"\bl[iị]ch thi [dđ][aấ]u\b",
     r"\bl[iị]ch [dđ][aă]ng\b",
     r"\bs[uự] ki[eệ]n\b",
 ]
+
+TIME_DATE_INTENT_PATTERNS = [
+    r"\b(?:b[aâ]y|bao) gi[oờ] (?:l[aà]|r[oồ]i) m[aầ]y gi[oờ]\b",
+    r"\bm[aấ]y gi[oờ] (?:r[oồ]i|hi[eệ]n t[aạ]i)\b",
+    r"\bgi[oờ] hi[eệ]n t[aạ]i\b",
+    r"\bb[aâ]y gi[oờ]\b",
+    r"\bh[oô]m nay (?:l[aà] )?(?:ng[aà]y|th[uứ])\b",
+    r"\bh[oô]m nay ng[aà]y m[aấ]y\b",
+    r"\bh[oô]m nay th[uứ] m[aấ]y\b",
+]
+
+def looks_like_time_date_intent(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return False
+    return any(re.search(pattern, normalized, re.IGNORECASE) for pattern in TIME_DATE_INTENT_PATTERNS)
+
+
+def build_local_time_date_reply(transcript: str) -> Optional[tuple[str, str, dict]]:
+    """Return a deterministic local-time/date answer without Gemini Search.
+
+    This is deliberately server-side so questions about clock/date/weekday never
+    depend on network data, Search quota, or model interpretation.
+    """
+    if not looks_like_time_date_intent(transcript):
+        return None
+
+    try:
+        now = datetime.now(ZoneInfo(BUN_DAU_TIMEZONE))
+    except (ZoneInfoNotFoundError, ValueError):
+        now = datetime.now(ZoneInfo("Asia/Ho_Chi_Minh"))
+
+    weekday_names = [
+        "thứ Hai", "thứ Ba", "thứ Tư", "thứ Năm",
+        "thứ Sáu", "thứ Bảy", "Chủ nhật",
+    ]
+    normalized = (transcript or "").strip().lower()
+
+    asks_time = any(re.search(p, normalized, re.IGNORECASE) for p in [
+        r"\b[bâ]y gi[oờ]\b",
+        r"\bm[aấ]y gi[oờ]\b",
+        r"\bgi[oờ] hi[eệ]n t[aạ]i\b",
+    ])
+    asks_date = any(re.search(p, normalized, re.IGNORECASE) for p in [
+        r"\bh[oô]m nay ng[aà]y m[aấ]y\b",
+        r"\bh[oô]m nay\s+l[aà]\s*ng[aà]y\b",
+    ])
+    asks_weekday = any(re.search(p, normalized, re.IGNORECASE) for p in [
+        r"\bh[oô]m nay th[uứ] m[aấ]y\b",
+        r"\bh[oô]m nay\s+l[aà]\s*th[uứ]\b",
+    ])
+
+    if asks_time and not asks_date and not asks_weekday:
+        reply = f"Bây giờ là {now.hour:02d} giờ {now.minute:02d} phút nhé."
+        memory = "Người dùng hỏi giờ hiện tại."
+    elif asks_weekday and not asks_time:
+        reply = f"Hôm nay là {weekday_names[now.weekday()]} nhé."
+        memory = "Người dùng hỏi hôm nay là thứ mấy."
+    elif asks_date and not asks_time:
+        reply = f"Hôm nay là ngày {now.day:02d} tháng {now.month:02d} năm {now.year} nhé."
+        memory = "Người dùng hỏi ngày hiện tại."
+    else:
+        reply = (
+            f"Bây giờ là {now.hour:02d} giờ {now.minute:02d} phút, "
+            f"{weekday_names[now.weekday()]}, ngày {now.day:02d} tháng {now.month:02d} năm {now.year} nhé."
+        )
+        memory = "Người dùng hỏi thông tin giờ và ngày hiện tại."
+
+    action = {
+        "type": "none",
+        "emotion": "neutral",
+        "direction": "none",
+        "degrees": 0,
+        "distance_cm": 0,
+        "speed": "normal",
+    }
+    return memory, reply, action
+
 
 def looks_like_search_intent(text: str) -> bool:
     normalized = (text or "").strip().lower()
@@ -522,7 +602,9 @@ def looks_like_search_intent(text: str) -> bool:
 async def record_local_search_intent(transcript: str) -> bool:
     """Conservative local guard for likely current-data questions."""
     global _SEARCH_USED_TODAY
-    if not GOOGLE_SEARCH_ENABLED or not looks_like_search_intent(transcript):
+    if not GOOGLE_SEARCH_ENABLED or looks_like_time_date_intent(transcript) or not looks_like_search_intent(transcript):
+        if looks_like_time_date_intent(transcript):
+            print(f"[SEARCH GUARD] Bo qua Search quota cho cau hoi gio/ngay/thu | transcript={transcript!r}", flush=True)
         return False
     async with _SEARCH_USAGE_LOCK:
         _load_search_usage_unlocked()
@@ -1173,13 +1255,14 @@ async def ask_gemini_36_fallback_audio(
     if not wav_bytes:
         raise RuntimeError("Audio fallback rong")
 
-    fallback_system = f"""{SYSTEM_PROMPT}
+    fallback_system = f"""{_build_system_instruction(search_blocked=True)}
 
 [BACKUP_AI_MODE]
 - Bạn đang là AI dự phòng bằng {FALLBACK_MODEL_NAME}.
 - Trong chế độ này KHÔNG có Google Search và KHÔNG được sử dụng công cụ Internet.
 - Với câu hỏi cần thông tin hiện tại, ví dụ thời tiết hôm nay, giá vàng/xăng/tỷ giá hiện tại, tin tức mới, kết quả mới hoặc dữ liệu có thể thay đổi, tuyệt đối không được đoán.
 - Với câu hỏi realtime như vậy, trong REPLY hãy nói ngắn gọn rằng chức năng tìm kiếm mạng đang tạm hết quota và sẽ thử lại vào ngày mai.
+- Câu hỏi giờ/ngày/thứ phải dùng [SERVER_TIME_NOW] và KHÔNG được nói rằng cần Search.
 - Các câu hỏi trò chuyện thông thường, kiến thức không phụ thuộc thời gian và lệnh robot vẫn phải xử lý bình thường.
 - Giữ nguyên định dạng MEMORY/ACTION/REPLY và tính cách Bún Đậu."""
 
@@ -1680,7 +1763,7 @@ async def process_fallback_batch(
     safety_config,
     conversation_history: deque,
 ) -> tuple[str, str, dict]:
-    # Compatibility wrapper: V4.6 fallback is always Gemini 3.6 Flash and NEVER Search.
+    # Compatibility wrapper: V4.7 fallback is always Gemini 3.6 Flash and NEVER Search.
     if len(pcm_bytes) < 3200:
         raise RuntimeError("Audio qua ngan")
     wav_bytes = create_wav_bytes(pcm_bytes)
@@ -1893,11 +1976,20 @@ async def websocket_chat(websocket: WebSocket):
                     live_result = await live_end_turn(live_handle, timeout_seconds=20.0)
                     raw_live = (live_result.get("raw_text") or "").strip()
                     if raw_live:
-                        user_memory, answer, action = parse_tagged_response(raw_live)
-                        if not answer:
-                            raise RuntimeError("Gemini Live tra ve nhung khong co REPLY")
-                        if not user_memory:
-                            user_memory = "Không trích xuất được tóm tắt lượt này."
+                        transcript = (live_result.get("input_transcript") or "").strip()
+                        local_clock_result = build_local_time_date_reply(transcript)
+                        if local_clock_result is not None:
+                            user_memory, answer, action = local_clock_result
+                            print(
+                                f"[LOCAL TIME] Khong dung Gemini/Search cho cau hoi gio-ngay-thu | transcript={transcript!r} | answer={answer!r}",
+                                flush=True,
+                            )
+                        else:
+                            user_memory, answer, action = parse_tagged_response(raw_live)
+                            if not answer:
+                                raise RuntimeError("Gemini Live tra ve nhung khong co REPLY")
+                            if not user_memory:
+                                user_memory = "Không trích xuất được tóm tắt lượt này."
 
                         live_ms = int(
                             (time.monotonic() - (live_handle.get("turn_started") or time.monotonic())) * 1000
