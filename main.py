@@ -124,20 +124,20 @@ _SEARCH_QUOTA_DATE: Optional[str] = None
 _SEARCH_QUOTA_EXHAUSTED = False
 _SEARCH_QUOTA_LOCK = asyncio.Lock()
 
-# Gemini Live quota guard: this is driven by Google's actual quota error response.
-# Once a quota-exhausted error is observed, the server stops reconnect attempts
-# for the rest of the local Vietnam day, then automatically clears on the next day.
-LIVE_QUOTA_COUNTER_FILE = os.environ.get(
-    "GEMINI_LIVE_QUOTA_COUNTER_FILE",
-    "gemini_live_quota_daily_state_v4_9.json",
-).strip()
+# Gemini Live guard.
+# IMPORTANT: a generic Live WebSocket 1011 + "You exceeded your current quota"
+# does NOT tell us that a daily quota was consumed or that it will reset at
+# midnight Vietnam time. Google states that limits are project-level and that
+# RPD resets at midnight Pacific; other limits can be RPM/TPM/concurrency.
+# Therefore we only use a short in-process cooldown after a real quota/rate-limit
+# response. We deliberately do NOT persist a "daily exhausted" state for Live.
+LIVE_QUOTA_COOLDOWN_SECONDS = max(30, float(os.environ.get("GEMINI_LIVE_QUOTA_COOLDOWN_SECONDS", "600")))
 LIVE_QUOTA_EXHAUSTED_MESSAGE = os.environ.get(
     "GEMINI_LIVE_QUOTA_EXHAUSTED_MESSAGE",
-    "Hôm nay mình đã hết lượt AI miễn phí rồi, mình sẽ thử lại vào ngày mai nhé.",
+    "Gemini Live đang tạm thời không khả dụng do giới hạn quota/tốc độ. Mình sẽ thử lại sau ít phút nhé.",
 ).strip()
-_LIVE_QUOTA_DATE: Optional[str] = None
-_LIVE_QUOTA_EXHAUSTED = False
-_LIVE_QUOTA_LOCK = asyncio.Lock()
+_LIVE_QUOTA_BLOCK_UNTIL = 0.0
+_LIVE_QUOTA_LAST_REASON = ""
 
 BUN_DAU_TIMEZONE = os.environ.get("BUN_DAU_TIMEZONE", "Asia/Ho_Chi_Minh").strip()
 BUN_DAU_DEFAULT_LOCATION = os.environ.get(
@@ -239,7 +239,7 @@ Tính cách cốt lõi:
 - Phong cách nói chuyện giống content creator làm vlog: tự nhiên, thoải mái, dễ thương, không quá formal.
 - Luôn mang cảm giác nhẹ nhàng, thư thái, hơi thở nhẹ (breathy), giọng rất mềm và ấm.
 - Vui vẻ, tích cực, sáng sủa nhưng không ồn ào hay quá năng động.
-- Thân mật, gần gũi, hay dùng từ ngữ dễ thương và ấm áp.
+- Thân mật, gần gũi, hay dùng từ ngữ đời thường, trẻ trung, câu từ của gen Z.
 
 Cách nói chuyện bắt buộc:
 - Giọng nói: Soft, slightly breathy, very soft tone, very warm, sweet, relaxed delivery.
@@ -411,66 +411,48 @@ def get_search_quota_status() -> dict:
     }
 
 
-def _load_live_quota_state_unlocked() -> None:
-    global _LIVE_QUOTA_DATE, _LIVE_QUOTA_EXHAUSTED
-    today = _search_local_date()
-    if _LIVE_QUOTA_DATE == today:
-        return
-
-    exhausted = False
-    try:
-        if LIVE_QUOTA_COUNTER_FILE and os.path.exists(LIVE_QUOTA_COUNTER_FILE):
-            with open(LIVE_QUOTA_COUNTER_FILE, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            if data.get("date") == today:
-                exhausted = bool(data.get("exhausted", False))
-    except Exception as exc:
-        print(f"[LIVE QUOTA] Khong doc duoc state: {exc}", flush=True)
-
-    _LIVE_QUOTA_DATE = today
-    _LIVE_QUOTA_EXHAUSTED = exhausted
-
-
-def _save_live_quota_state_unlocked() -> None:
-    if not LIVE_QUOTA_COUNTER_FILE:
-        return
-    try:
-        payload = {
-            "date": _LIVE_QUOTA_DATE,
-            "exhausted": _LIVE_QUOTA_EXHAUSTED,
-        }
-        with open(LIVE_QUOTA_COUNTER_FILE, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
-    except Exception as exc:
-        print(f"[LIVE QUOTA] Khong ghi duoc state: {exc}", flush=True)
+def _refresh_live_cooldown_state() -> None:
+    """Clear the short-lived Live cooldown when its timer expires."""
+    global _LIVE_QUOTA_BLOCK_UNTIL, _LIVE_QUOTA_LAST_REASON
+    if _LIVE_QUOTA_BLOCK_UNTIL > 0 and time.monotonic() >= _LIVE_QUOTA_BLOCK_UNTIL:
+        _LIVE_QUOTA_BLOCK_UNTIL = 0.0
+        _LIVE_QUOTA_LAST_REASON = ""
 
 
 def is_live_quota_exhausted() -> bool:
-    _load_live_quota_state_unlocked()
-    return _LIVE_QUOTA_EXHAUSTED
+    """Compatibility helper: True only while the temporary cooldown is active."""
+    _refresh_live_cooldown_state()
+    return _LIVE_QUOTA_BLOCK_UNTIL > time.monotonic()
 
 
 def mark_live_quota_exhausted(reason: str = "") -> None:
-    global _LIVE_QUOTA_EXHAUSTED
-    _load_live_quota_state_unlocked()
-    _LIVE_QUOTA_EXHAUSTED = True
-    _save_live_quota_state_unlocked()
-    detail = (reason or "quota exceeded").replace("\n", " ")[:220]
+    """Temporarily back off after a real Live quota/rate-limit response.
+
+    This is intentionally NOT a daily quota counter. The API error alone does not
+    identify which limit was exceeded or its reset time, so persisting a local-day
+    lock would create false "hết quota đến ngày mai" states.
+    """
+    global _LIVE_QUOTA_BLOCK_UNTIL, _LIVE_QUOTA_LAST_REASON
+    _LIVE_QUOTA_LAST_REASON = (reason or "quota/rate limit exceeded").replace("\n", " ")[:220]
+    _LIVE_QUOTA_BLOCK_UNTIL = time.monotonic() + LIVE_QUOTA_COOLDOWN_SECONDS
     print(
-        f"[LIVE QUOTA] Google reported quota exhausted -> block Live until next local day | "
-        f"date={_LIVE_QUOTA_DATE} | reason={detail}",
+        f"[LIVE QUOTA] Live tam thoi bi khoa {LIVE_QUOTA_COOLDOWN_SECONDS:.0f}s | "
+        f"khong xac nhan daily quota | reason={_LIVE_QUOTA_LAST_REASON}",
         flush=True,
     )
 
 
 def get_live_quota_status() -> dict:
-    _load_live_quota_state_unlocked()
+    _refresh_live_cooldown_state()
+    remaining = max(0, int(_LIVE_QUOTA_BLOCK_UNTIL - time.monotonic())) if _LIVE_QUOTA_BLOCK_UNTIL else 0
     return {
-        "date": _LIVE_QUOTA_DATE,
-        "exhausted": _LIVE_QUOTA_EXHAUSTED,
+        "date": local_today_str(),
+        "exhausted": False,
+        "temporarily_blocked": remaining > 0,
+        "retry_after_seconds": remaining,
+        "reason": _LIVE_QUOTA_LAST_REASON,
         "message": LIVE_QUOTA_EXHAUSTED_MESSAGE,
     }
-
 
 def _load_gemini_36_quota_unlocked() -> None:
     global _GEMINI_36_QUOTA_DATE, _GEMINI_36_QUOTA_EXHAUSTED, _GEMINI_36_QUOTA_REASON
@@ -1686,7 +1668,11 @@ async def open_live_handle(
     if not LIVE_ENABLED:
         raise RuntimeError("Gemini Live dang tat")
     if is_live_quota_exhausted():
-        raise RuntimeError("GEMINI_LIVE_QUOTA_EXHAUSTED: " + LIVE_QUOTA_EXHAUSTED_MESSAGE)
+        status = get_live_quota_status()
+        raise RuntimeError(
+            "GEMINI_LIVE_COOLDOWN: "
+            f"retry_after={status['retry_after_seconds']}s"
+        )
     if not API_KEYS:
         raise RuntimeError("Khong co GEMINI_API_KEY")
 
@@ -1755,7 +1741,10 @@ async def open_live_handle(
                 detail = str(exc).replace("\n", " ")[:220]
                 if kind == "live_quota":
                     mark_live_quota_exhausted(detail)
-                    raise RuntimeError("GEMINI_LIVE_QUOTA_EXHAUSTED: " + LIVE_QUOTA_EXHAUSTED_MESSAGE) from exc
+                    raise RuntimeError(
+                        "GEMINI_LIVE_COOLDOWN: "
+                        f"retry_after={int(LIVE_QUOTA_COOLDOWN_SECONDS)}s"
+                    ) from exc
 
                 if kind == "rotate":
                     mark_key_disabled(key_idx, detail)
@@ -2013,9 +2002,9 @@ async def websocket_chat(websocket: WebSocket):
             return live_handle
         except Exception as exc:
             detail = str(exc)
-            if detail.startswith("GEMINI_LIVE_QUOTA_EXHAUSTED:"):
+            if detail.startswith("GEMINI_LIVE_COOLDOWN:"):
                 print(
-                    f"[LIVE QUOTA] Da khoa Live den ngay mai | {LIVE_QUOTA_EXHAUSTED_MESSAGE}",
+                    f"[LIVE] Dang trong cooldown tam thoi | {detail}",
                     flush=True,
                 )
             else:
@@ -2027,7 +2016,9 @@ async def websocket_chat(websocket: WebSocket):
         if LIVE_ENABLED:
             live_quota_status = get_live_quota_status()
             print(
-                f"[LIVE QUOTA] date={live_quota_status['date']} | exhausted={live_quota_status['exhausted']}",
+                f"[LIVE QUOTA] date={live_quota_status['date']} | "
+                f"temporarily_blocked={live_quota_status['temporarily_blocked']} | "
+                f"retry_after={live_quota_status['retry_after_seconds']}s",
                 flush=True,
             )
             search_quota_status = get_search_quota_status()
