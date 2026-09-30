@@ -1,6 +1,6 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.10.2 - STABLE TTS + QUOTA FALLBACK
-# Phiên bản: 4.10.2
+# ROBOT BÚN ĐẬU SERVER - V4.10.3 - STABLE TTS + QUOTA FALLBACK
+# Phiên bản: 4.10.3
 #
 # - Gemini 3.8 Live là não chính cho hội thoại realtime và Google Search.
 # - Gemini 3.6 Flash là não dự phòng khi Gemini 3.8 Live hết quota/lỗi.
@@ -64,7 +64,6 @@ KEY_FAILURE_REASON: list[Optional[str]] = [None] * len(API_KEYS)
 KEY_LOCK = asyncio.Lock()
 
 PRIMARY_MODEL_NAME = "gemini-3.8-live"
-SECONDARY_LIVE_MODEL_NAME = os.environ.get("GEMINI_SECONDARY_LIVE_MODEL", "gemini-3.1-flash-live-preview").strip()
 FALLBACK_MODEL_NAME = "gemini-3.6-flash"
 
 # Gemini TTS quota guard.
@@ -86,8 +85,7 @@ _GEMINI_36_QUOTA_EXHAUSTED = False
 _GEMINI_36_QUOTA_REASON = ""
 # Fallback is deliberately fixed in code so an old Render GEMINI_MODEL variable
 # cannot silently switch the backup brain to a paid/unsupported model.
-GEMINI_FALLBACK_TIMEOUT_SECONDS = max(5.0, float(os.environ.get("GEMINI_FALLBACK_TIMEOUT_SECONDS", "14")))
-GEMINI_FALLBACK_THINKING_LEVEL = os.environ.get("GEMINI_FALLBACK_THINKING_LEVEL", "minimal").strip().lower()
+GEMINI_FALLBACK_TIMEOUT_SECONDS = max(5.0, float(os.environ.get("GEMINI_FALLBACK_TIMEOUT_SECONDS", "18")))
 MEMORY_TURNS = max(10, int(os.environ.get("MEMORY_TURNS", "10")))
 
 # ================================================================================
@@ -102,10 +100,6 @@ GOOGLE_SEARCH_ENABLED = (
 
 # Local Search safety guard. This is NOT Google's authoritative quota.
 # Gemini 3.8 Live quota is detected from Google's actual API error responses below.
-LOCAL_SEARCH_GUARD_ENABLED = (
-    os.environ.get("GEMINI_WEB_SEARCH_LOCAL_GUARD", "false").strip().lower()
-    in {"1", "true", "yes", "on"}
-)
 GOOGLE_SEARCH_DAILY_LIMIT = max(1, int(os.environ.get("GEMINI_WEB_SEARCH_DAILY_LIMIT", "500")))
 GOOGLE_SEARCH_WARNING_TEXT = os.environ.get(
     "GEMINI_WEB_SEARCH_EXHAUSTED_MESSAGE",
@@ -163,11 +157,11 @@ def local_today_str() -> str:
 # Token không phải số từ cố định; tiếng Việt có thể dùng số token khác nhau cho cùng
 # một lượng chữ. Tăng dòng này để cho phép Gemini trả lời dài hơn. Ví dụ: 768 -> 1200.
 # Tăng giới hạn KHÔNG tự tạo thêm lượt nói; chỉ cho phép một lượt trả lời dài hơn.
-MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "384"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "768"))
 
 # Đây là giới hạn mềm về độ dài câu trả lời mà prompt yêu cầu. Nó không phải quota Gemini.
 # Tăng lên nếu muốn robot nói dài hơn nữa; giá trị này không làm phát sinh thêm một lượt phát.
-REPLY_MAX_SENTENCES = max(2, int(os.environ.get("BUN_DAU_REPLY_MAX_SENTENCES", "3")))
+REPLY_MAX_SENTENCES = max(2, int(os.environ.get("BUN_DAU_REPLY_MAX_SENTENCES", "5")))
 
 # Ổn định: mặc định không dùng Gemini Live đang gây lỗi modality/quota ở các bản trước.
 # ESP32 vẫn có thể gửi PCM từng chunk lên server, nhưng server xử lý Gemini sau end_speech.
@@ -357,42 +351,65 @@ def _save_search_usage_unlocked() -> None:
         print(f"[SEARCH QUOTA] Khong ghi duoc counter: {exc}", flush=True)
 
 
-_SEARCH_QUOTA_BLOCK_UNTIL = 0.0
-_SEARCH_QUOTA_LAST_REASON = ""
-SEARCH_QUOTA_COOLDOWN_SECONDS = max(30, float(os.environ.get("GEMINI_SEARCH_QUOTA_COOLDOWN_SECONDS", "600")))
+def _load_search_quota_state_unlocked() -> None:
+    global _SEARCH_QUOTA_DATE, _SEARCH_QUOTA_EXHAUSTED
+    today = _search_local_date()
+    if _SEARCH_QUOTA_DATE == today:
+        return
 
-def _refresh_search_quota_cooldown() -> None:
-    global _SEARCH_QUOTA_BLOCK_UNTIL, _SEARCH_QUOTA_LAST_REASON
-    if _SEARCH_QUOTA_BLOCK_UNTIL > 0 and time.monotonic() >= _SEARCH_QUOTA_BLOCK_UNTIL:
-        _SEARCH_QUOTA_BLOCK_UNTIL = 0.0
-        _SEARCH_QUOTA_LAST_REASON = ""
+    exhausted = False
+    try:
+        if SEARCH_QUOTA_STATE_FILE and os.path.exists(SEARCH_QUOTA_STATE_FILE):
+            with open(SEARCH_QUOTA_STATE_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if data.get("date") == today:
+                exhausted = bool(data.get("exhausted", False))
+    except Exception as exc:
+        print(f"[SEARCH QUOTA] Khong doc duoc quota state: {exc}", flush=True)
+
+    _SEARCH_QUOTA_DATE = today
+    _SEARCH_QUOTA_EXHAUSTED = exhausted
+
+
+def _save_search_quota_state_unlocked() -> None:
+    if not SEARCH_QUOTA_STATE_FILE:
+        return
+    try:
+        payload = {
+            "date": _SEARCH_QUOTA_DATE,
+            "exhausted": _SEARCH_QUOTA_EXHAUSTED,
+        }
+        with open(SEARCH_QUOTA_STATE_FILE, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        print(f"[SEARCH QUOTA] Khong ghi duoc quota state: {exc}", flush=True)
+
 
 def is_search_quota_exhausted() -> bool:
-    """Temporary in-process Search backoff; never trust stale local-day state."""
-    _refresh_search_quota_cooldown()
-    return _SEARCH_QUOTA_BLOCK_UNTIL > time.monotonic()
+    _load_search_quota_state_unlocked()
+    return _SEARCH_QUOTA_EXHAUSTED
+
 
 def mark_search_quota_exhausted(reason: str = "") -> None:
-    global _SEARCH_QUOTA_BLOCK_UNTIL, _SEARCH_QUOTA_LAST_REASON
-    _SEARCH_QUOTA_LAST_REASON = (reason or "search quota/rate limit exceeded").replace("\n", " ")[:220]
-    _SEARCH_QUOTA_BLOCK_UNTIL = time.monotonic() + SEARCH_QUOTA_COOLDOWN_SECONDS
+    global _SEARCH_QUOTA_EXHAUSTED
+    _load_search_quota_state_unlocked()
+    _SEARCH_QUOTA_EXHAUSTED = True
+    _save_search_quota_state_unlocked()
+    detail = (reason or "search quota exceeded").replace("\n", " ")[:220]
     print(
-        f"[SEARCH QUOTA] Search tam thoi bi khoa {SEARCH_QUOTA_COOLDOWN_SECONDS:.0f}s | "
-        f"khong xac nhan daily quota | reason={_SEARCH_QUOTA_LAST_REASON}",
+        f"[SEARCH QUOTA] Google reported Search quota exhausted -> disable Search until next local day | "
+        f"date={_SEARCH_QUOTA_DATE} | reason={detail}",
         flush=True,
     )
 
+
 def get_search_quota_status() -> dict:
-    _refresh_search_quota_cooldown()
-    remaining = max(0, int(_SEARCH_QUOTA_BLOCK_UNTIL - time.monotonic())) if _SEARCH_QUOTA_BLOCK_UNTIL else 0
+    _load_search_quota_state_unlocked()
     return {
-        "date": _search_local_date(),
-        "exhausted": False,
-        "temporarily_blocked": remaining > 0,
-        "retry_after_seconds": remaining,
-        "reason": _SEARCH_QUOTA_LAST_REASON,
-        "local_guard_enabled": LOCAL_SEARCH_GUARD_ENABLED,
+        "date": _SEARCH_QUOTA_DATE,
+        "exhausted": _SEARCH_QUOTA_EXHAUSTED,
     }
+
 
 def _refresh_live_cooldown_state() -> None:
     """Clear the short-lived Live cooldown when its timer expires."""
@@ -699,10 +716,8 @@ def looks_like_search_intent(text: str) -> bool:
 
 
 async def record_local_search_intent(transcript: str) -> bool:
-    """Optional local safety guard. Disabled by default because it is not Google's quota."""
+    """Conservative local guard for likely current-data questions."""
     global _SEARCH_USED_TODAY
-    if not LOCAL_SEARCH_GUARD_ENABLED:
-        return False
     if not GOOGLE_SEARCH_ENABLED or looks_like_time_date_intent(transcript) or not looks_like_search_intent(transcript):
         if looks_like_time_date_intent(transcript):
             print(f"[SEARCH GUARD] Bo qua Search quota cho cau hoi gio/ngay/thu | transcript={transcript!r}", flush=True)
@@ -826,7 +841,7 @@ PCM_CHANNELS = 1
 PCM_BYTES_PER_SAMPLE = 2
 PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE
 TTS_CHUNK_SIZE = 2048
-TTS_PREBUFFER_MS = max(0, int(os.environ.get("TTS_PREBUFFER_MS", "192")))
+TTS_PREBUFFER_MS = max(0, int(os.environ.get("TTS_PREBUFFER_MS", "320")))
 # Thời gian tối đa cho một lần tổng hợp TTS; tăng nếu cho phép câu trả lời rất dài.
 TTS_TIMEOUT_SECONDS = float(os.environ.get("TTS_TIMEOUT_SECONDS", "40"))
 TTS_RETRIES_PER_VOICE = max(1, int(os.environ.get("TTS_RETRIES_PER_VOICE", "2")))
@@ -835,7 +850,7 @@ EDGE_TTS_VOICE = os.environ.get("EDGE_TTS_VOICE", "vi-VN-HoaiMyNeural").strip()
 EDGE_TTS_FALLBACK_VOICE = os.environ.get("EDGE_TTS_FALLBACK_VOICE", "vi-VN-NamMinhNeural").strip()
 EDGE_TTS_RATE = os.environ.get("EDGE_TTS_RATE", "+10%").strip()
 GEMINI_TTS_ENABLED = os.environ.get("GEMINI_TTS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
-GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts").strip()
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview").strip()
 GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE", "Sulafat").strip()
 GEMINI_TTS_LANGUAGE = os.environ.get("GEMINI_TTS_LANGUAGE", "vi-VN").strip()
 GEMINI_TTS_STYLE = os.environ.get(
@@ -1079,7 +1094,7 @@ def read_root():
     # endpoint must not reference the old LOCAL_STT_* variables.
     return {
         "status": "Robot Bun Dau Server OK",
-        "version": "4.10.4",
+        "version": "4.10.2",
         "gemini_keys": len(API_KEYS),
         "local_stt_enabled": False,
         "local_stt_model": None,
@@ -1089,7 +1104,7 @@ def read_root():
         "gemini_36_quota": get_gemini_36_quota_status(),
         "current_gemini_key": CURRENT_KEY_INDEX + 1 if API_KEYS else None,
         "key_status": key_status_summary(),
-        "tts_provider": GEMINI_TTS_MODEL,
+        "tts_provider": "gemini-3.1-flash-tts-preview",
         "tts_voice": GEMINI_TTS_VOICE if GEMINI_TTS_ENABLED else EDGE_TTS_VOICE,
         "tts_fallback_voice": EDGE_TTS_VOICE,
         "tts_streaming": True,
@@ -1101,7 +1116,6 @@ def read_root():
         "gemini_debug_chunks": GEMINI_DEBUG_CHUNKS,
         "google_search_enabled": GOOGLE_SEARCH_ENABLED,
         "google_search_daily_limit": GOOGLE_SEARCH_DAILY_LIMIT,
-        "google_search_local_guard_enabled": LOCAL_SEARCH_GUARD_ENABLED,
         "google_search_usage": get_search_usage_snapshot(),
         "google_search_exhausted_warning": GOOGLE_SEARCH_WARNING_TEXT,
         "gemini_live_quota": get_live_quota_status(),
@@ -1114,7 +1128,6 @@ def read_root():
         "gemini_live_enabled": LIVE_ENABLED,
         "search_quota_status": get_search_quota_status(),
         "gemini_live_model": LIVE_MODEL_NAME,
-        "gemini_live_secondary_model": SECONDARY_LIVE_MODEL_NAME,
         "gemini_fallback_model": FALLBACK_MODEL_NAME,
         "gemini_batch_fallback_enabled": GEMINI_BATCH_FALLBACK_ENABLED,
         "google_search_daily_usage": get_search_usage_snapshot(),
@@ -1128,7 +1141,7 @@ def read_root():
 @app.get("/healthz")
 def healthz():
     # Minimal Render/monitoring health endpoint; never calls Gemini or STT.
-    return {"status": "ok", "version": "4.10.4"}
+    return {"status": "ok", "version": "4.10.2"}
 
 
 # ================================================================================
@@ -1426,9 +1439,6 @@ async def ask_gemini_36_fallback_audio(
                     config=types.GenerateContentConfig(
                         system_instruction=fallback_system,
                         max_output_tokens=MAX_OUTPUT_TOKENS,
-                        thinking_config=types.ThinkingConfig(
-                            thinking_level=GEMINI_FALLBACK_THINKING_LEVEL
-                        ),
                         safety_settings=safety_config,
                     ),
                 ),
@@ -1500,58 +1510,6 @@ async def ask_gemini_36_fallback_audio(
             last_exc = exc
             code = _error_code(exc)
             detail = str(exc).replace("\n", " ")[:260]
-            if code in (500, 502, 503, 504):
-                print(
-                    f"[FALLBACK 3.6] Loi tam thoi HTTP {code} -> retry 1 lan sau 0.25s",
-                    flush=True,
-                )
-                await asyncio.sleep(0.25)
-                try:
-                    retry_started = time.monotonic()
-                    response = await asyncio.wait_for(
-                        client.aio.models.generate_content(
-                            model=FALLBACK_MODEL_NAME,
-                            contents=make_gemini_contents(history, wav_bytes),
-                            config=types.GenerateContentConfig(
-                                system_instruction=fallback_system,
-                                max_output_tokens=MAX_OUTPUT_TOKENS,
-                                thinking_config=types.ThinkingConfig(
-                                    thinking_level=GEMINI_FALLBACK_THINKING_LEVEL
-                                ),
-                                safety_settings=safety_config,
-                            ),
-                        ),
-                        timeout=GEMINI_FALLBACK_TIMEOUT_SECONDS,
-                    )
-                    candidates = getattr(response, "candidates", None) or []
-                    parts = []
-                    finish_reason = "UNKNOWN"
-                    if candidates:
-                        candidate = candidates[0]
-                        finish_value = getattr(candidate, "finish_reason", None)
-                        if finish_value is not None:
-                            finish_reason = str(finish_value)
-                        content = getattr(candidate, "content", None)
-                        for part in (getattr(content, "parts", None) or []):
-                            if getattr(part, "thought", False):
-                                continue
-                            part_text = getattr(part, "text", None)
-                            if part_text:
-                                parts.append(str(part_text))
-                    raw_text = "".join(parts).strip()
-                    print(
-                        f"[FALLBACK 3.6] Retry hoan tat | chars={len(raw_text)} | "
-                        f"finish_reason={finish_reason!r} | total={int((time.monotonic()-retry_started)*1000)} ms",
-                        flush=True,
-                    )
-                    if raw_text:
-                        memory_text, reply_text, action = parse_tagged_response(raw_text)
-                        if reply_text:
-                            CURRENT_KEY_INDEX = key_idx
-                            return memory_text or "Không trích xuất được tóm tắt lượt này.", reply_text, action
-                except Exception as retry_exc:
-                    print(f"[FALLBACK 3.6] Retry 503 that bai: {str(retry_exc)[:220]}", flush=True)
-
             quota_hit = (
                 code == 429
                 or "quota" in detail.lower()
@@ -1597,8 +1555,8 @@ async def ask_gemini_36_fallback_audio(
 # ================================================================================
 # 5. GEMINI LIVE + WEBSOCKET
 # ================================================================================
-def _live_config(search_blocked: bool = False, model_name: str = LIVE_MODEL_NAME):
-    """Build a Live setup shared by 3.8 Live and the 3.1 Live compatibility fallback."""
+def _live_config(search_blocked: bool = False):
+    """Build a Gemini 3.8 Live setup compatible with the current Live API."""
     search_blocked = bool(search_blocked or is_search_quota_exhausted())
     # IMPORTANT for Gemini 3.8 Live:
     # - thinking_config/thinking_level is NOT supported on the stable 3.8 Live model.
@@ -1703,15 +1661,13 @@ async def open_live_handle(
     history: deque,
     preferred_key_idx: int,
     search_blocked: bool = False,
-    model_name: str = LIVE_MODEL_NAME,
-    bypass_cooldown: bool = False,
 ) -> dict:
     """Connect a persistent Live session using the sticky Gemini key policy."""
     global CURRENT_KEY_INDEX
 
     if not LIVE_ENABLED:
         raise RuntimeError("Gemini Live dang tat")
-    if is_live_quota_exhausted() and not bypass_cooldown:
+    if is_live_quota_exhausted():
         status = get_live_quota_status()
         raise RuntimeError(
             "GEMINI_LIVE_COOLDOWN: "
@@ -1738,8 +1694,8 @@ async def open_live_handle(
             session_cm = None
             try:
                 session_cm = client.aio.live.connect(
-                    model=model_name,
-                    config=_live_config(search_blocked=search_blocked, model_name=model_name),
+                    model=LIVE_MODEL_NAME,
+                    config=_live_config(search_blocked=search_blocked),
                 )
                 session = await session_cm.__aenter__()
 
@@ -1752,7 +1708,7 @@ async def open_live_handle(
 
                 CURRENT_KEY_INDEX = key_idx
                 print(
-                    f"[LIVE] Session san sang | model={model_name} | Key #{key_idx + 1}",
+                    f"[LIVE] Session san sang | model={LIVE_MODEL_NAME} | Key #{key_idx + 1}",
                     flush=True,
                 )
                 return {
@@ -1771,8 +1727,6 @@ async def open_live_handle(
                     "last_error": None,
                     "session_turns": 0,
                     "search_blocked": search_blocked,
-                    "model": model_name,
-                    "is_primary": model_name == PRIMARY_MODEL_NAME,
                 }
             except Exception as exc:
                 last_exc = exc
@@ -2032,49 +1986,31 @@ async def websocket_chat(websocket: WebSocket):
             and bool(live_handle.get("search_blocked", False)) == bool(search_blocked)
         ):
             return live_handle
-
         await close_live_handle(live_handle)
         live_handle = None
-        preferred = CURRENT_KEY_INDEX if API_KEYS else 0
-        candidates = []
-        if not is_live_quota_exhausted():
-            candidates.append((PRIMARY_MODEL_NAME, False))
-        if SECONDARY_LIVE_MODEL_NAME and SECONDARY_LIVE_MODEL_NAME != PRIMARY_MODEL_NAME:
-            candidates.append((SECONDARY_LIVE_MODEL_NAME, True))
 
-        for model_name, bypass_cooldown in candidates:
-            try:
-                if model_name == PRIMARY_MODEL_NAME:
-                    print(f"[LIVE] Thu model chinh {model_name}", flush=True)
-                else:
-                    print(f"[LIVE FALLBACK] Thu model realtime phu {model_name}", flush=True)
-                live_handle = await open_live_handle(
-                    conversation_history,
-                    preferred,
-                    search_blocked=search_blocked,
-                    model_name=model_name,
-                    bypass_cooldown=bypass_cooldown,
+        preferred = CURRENT_KEY_INDEX if API_KEYS else 0
+        try:
+            live_handle = await open_live_handle(
+                conversation_history,
+                preferred,
+                search_blocked=search_blocked,
+            )
+            live_handle["receive_task"] = asyncio.create_task(
+                live_receive_loop(live_handle)
+            )
+            return live_handle
+        except Exception as exc:
+            detail = str(exc)
+            if detail.startswith("GEMINI_LIVE_COOLDOWN:"):
+                print(
+                    f"[LIVE] Dang trong cooldown tam thoi | {detail}",
+                    flush=True,
                 )
-                live_handle["receive_task"] = asyncio.create_task(
-                    live_receive_loop(live_handle)
-                )
-                if model_name != PRIMARY_MODEL_NAME:
-                    print(
-                        f"[LIVE FALLBACK] 3.8 khong kha dung -> dang dung {model_name} (Search capable)",
-                        flush=True,
-                    )
-                return live_handle
-            except Exception as exc:
-                detail = str(exc)
-                if detail.startswith("GEMINI_LIVE_COOLDOWN:"):
-                    print(f"[LIVE] {model_name} dang cooldown | {detail}", flush=True)
-                else:
-                    print(
-                        f"[LIVE] Khong khoi tao duoc model={model_name}: {detail[:240]}",
-                        flush=True,
-                    )
-                live_handle = None
-        return None
+            else:
+                print(f"[LIVE] Khong khoi tao duoc: {detail[:240]}", flush=True)
+            live_handle = None
+            return None
 
     try:
         if LIVE_ENABLED:
@@ -2090,8 +2026,17 @@ async def websocket_chat(websocket: WebSocket):
                 f"[SEARCH QUOTA] date={search_quota_status['date']} | exhausted={search_quota_status['exhausted']}",
                 flush=True,
             )
-            initial_search_blocked = is_search_quota_exhausted()
-            await ensure_live(search_blocked=initial_search_blocked)
+            initial_search_blocked = (
+                get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT
+                or is_search_quota_exhausted()
+            )
+            if live_quota_status["exhausted"]:
+                print(
+                    f"[LIVE QUOTA] Live dang bi khoa den ngay mai | {LIVE_QUOTA_EXHAUSTED_MESSAGE}",
+                    flush=True,
+                )
+            else:
+                await ensure_live(search_blocked=initial_search_blocked)
 
         while True:
             message = await websocket.receive()
@@ -2142,8 +2087,11 @@ async def websocket_chat(websocket: WebSocket):
                     flush=True,
                 )
 
-                if LIVE_ENABLED:
-                    search_blocked_now = is_search_quota_exhausted()
+                if LIVE_ENABLED and not is_live_quota_exhausted():
+                    search_blocked_now = (
+                        get_search_usage_snapshot()["used"] >= GOOGLE_SEARCH_DAILY_LIMIT
+                        or is_search_quota_exhausted()
+                    )
                     live = await ensure_live(search_blocked=search_blocked_now)
                     if live is not None:
                         try:
