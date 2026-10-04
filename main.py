@@ -1,6 +1,6 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.10.3 - STABLE TTS + QUOTA FALLBACK
-# Phiên bản: 4.10.3
+# ROBOT BÚN ĐẬU SERVER - V4.10.4 - AUDIO PRESERVE + STABLE TTS + QUOTA FALLBACK
+# Phiên bản: 4.10.4
 #
 # - Gemini 3.8 Live là não chính cho hội thoại realtime và Google Search.
 # - Gemini 3.6 Flash là não dự phòng khi Gemini 3.8 Live hết quota/lỗi.
@@ -842,6 +842,13 @@ TTS_SOURCE_SAMPLE_RATE = 24000
 PCM_CHANNELS = 1
 PCM_BYTES_PER_SAMPLE = 2
 PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * PCM_BYTES_PER_SAMPLE
+
+# Audio contract from ESP32: raw PCM16, mono, 16 kHz.
+# The server must not resample, normalize, gate, or otherwise alter incoming mic audio.
+AUDIO_INPUT_SAMPLE_RATE = 16000
+AUDIO_INPUT_CHANNELS = 1
+AUDIO_INPUT_BYTES_PER_SAMPLE = 2
+AUDIO_MIN_TURN_BYTES = 3200
 TTS_CHUNK_SIZE = 2048
 TTS_PREBUFFER_MS = max(0, int(os.environ.get("TTS_PREBUFFER_MS", "320")))
 # Thời gian tối đa cho một lần tổng hợp TTS; tăng nếu cho phép câu trả lời rất dài.
@@ -1096,7 +1103,7 @@ def read_root():
     # endpoint must not reference the old LOCAL_STT_* variables.
     return {
         "status": "Robot Bun Dau Server OK",
-        "version": "4.10.2",
+        "version": "4.10.4",
         "gemini_keys": len(API_KEYS),
         "local_stt_enabled": False,
         "local_stt_model": None,
@@ -1134,6 +1141,7 @@ def read_root():
         "gemini_batch_fallback_enabled": GEMINI_BATCH_FALLBACK_ENABLED,
         "google_search_daily_usage": get_search_usage_snapshot(),
         "gemini_live_audio_input": "PCM16 16kHz mono realtime",
+        "audio_input_preserve_mode": "exact_pcm16_no_resample_no_gate",
         "tof_sensor": "VL53L0X over shared I2C",
         "robot_command_protocol": "v1",
         "robot_command_calibration": "ESP32-local timing calibration",
@@ -1143,7 +1151,7 @@ def read_root():
 @app.get("/healthz")
 def healthz():
     # Minimal Render/monitoring health endpoint; never calls Gemini or STT.
-    return {"status": "ok", "version": "4.10.2"}
+    return {"status": "ok", "version": "4.10.4"}
 
 
 # ================================================================================
@@ -2050,8 +2058,15 @@ async def websocket_chat(websocket: WebSocket):
                 if not speech_active:
                     continue
 
+                # Preserve the exact ESP32 PCM16 stream. The only sanitation allowed is
+                # removing one impossible trailing byte when a malformed WebSocket chunk
+                # arrives, because PCM16 samples must always be 2-byte aligned.
+                binary_data = sanitize_pcm16_chunk(binary_data)
+                if not binary_data:
+                    continue
+
                 # Always preserve the PCM locally so a transient Live failure can fall back
-                # to the existing batch Gemini pipeline without asking the ESP32 to re-record.
+                # to Gemini 3.6 using the exact same recorded audio without re-recording.
                 pcm_buffer.extend(binary_data)
 
                 if live_handle and live_handle.get("last_error") is None:
@@ -2121,8 +2136,14 @@ async def websocket_chat(websocket: WebSocket):
                 f"[WEBSOCKET] ESP32 dung ghi am. PCM={pcm_size} bytes | mode={'live' if LIVE_ENABLED else 'batch'}",
                 flush=True,
             )
+            audio_diag = diagnose_pcm16(bytes(pcm_buffer))
+            print(
+                f"[AUDIO RX] bytes={audio_diag['bytes']} | duration={audio_diag['duration_ms']} ms | "
+                f"rms={audio_diag['rms']:.1f} | peak={audio_diag['peak']} | clipped={audio_diag['clipped']}",
+                flush=True,
+            )
 
-            if pcm_size < 3200:
+            if pcm_size < AUDIO_MIN_TURN_BYTES:
                 pcm_buffer.clear()
                 await websocket.send_text(
                     json.dumps(
@@ -2386,6 +2407,59 @@ async def websocket_chat(websocket: WebSocket):
     finally:
         pcm_buffer.clear()
         await close_live_handle(live_handle)
+
+def sanitize_pcm16_chunk(data: bytes) -> bytes:
+    """Keep the ESP32 PCM byte stream intact; only drop one trailing invalid byte."""
+    if not data:
+        return b""
+    if len(data) % AUDIO_INPUT_BYTES_PER_SAMPLE != 0:
+        print(
+            f"[AUDIO RX] Chunk co {len(data)} bytes le -> bo 1 byte le de giu PCM16 hop le.",
+            flush=True,
+        )
+        return data[:-1]
+    return data
+
+
+def diagnose_pcm16(pcm_data: bytes) -> dict:
+    """Measure received PCM without modifying it, for mic/Gemini path diagnosis."""
+    data = sanitize_pcm16_chunk(pcm_data)
+    if not data:
+        return {"bytes": 0, "duration_ms": 0, "rms": 0.0, "peak": 0, "clipped": 0}
+
+    import array
+    samples = array.array("h")
+    samples.frombytes(data)
+    if samples.itemsize != 2:
+        return {"bytes": len(data), "duration_ms": int(len(data) * 1000 / PCM_BYTES_PER_SECOND), "rms": 0.0, "peak": 0, "clipped": 0}
+
+    if samples and __import__("sys").byteorder != "little":
+        samples.byteswap()
+
+    n = len(samples)
+    if n == 0:
+        return {"bytes": len(data), "duration_ms": 0, "rms": 0.0, "peak": 0, "clipped": 0}
+
+    total_sq = 0.0
+    peak = 0
+    clipped = 0
+    for sample in samples:
+        value = int(sample)
+        magnitude = abs(value)
+        if magnitude > peak:
+            peak = magnitude
+        if magnitude >= 32767:
+            clipped += 1
+        total_sq += float(value * value)
+
+    return {
+        "bytes": len(data),
+        "duration_ms": int(n * 1000 / AUDIO_INPUT_SAMPLE_RATE),
+        "rms": (total_sq / n) ** 0.5,
+        "peak": peak,
+        "clipped": clipped,
+    }
+
 
 def create_wav_bytes(
     pcm_data: bytes,
