@@ -1,6 +1,6 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.10.4 - AUDIO PRESERVE + STABLE TTS + QUOTA FALLBACK
-# Phiên bản: 4.10.4
+# ROBOT BÚN ĐẬU SERVER - V4.10.5 - AUDIO PRESERVE + STABLE TTS + ROBUST AI FALLBACK
+# Phiên bản: 4.10.5
 #
 # - Gemini 3.8 Live là não chính cho hội thoại realtime và Google Search.
 # - Gemini 3.6 Flash là não dự phòng khi Gemini 3.8 Live hết quota/lỗi.
@@ -10,7 +10,8 @@
 # - Dùng Gemini 3.8 Live làm pipeline hội thoại/âm thanh chính.
 # - Khi Live lỗi/hết quota, lượt đó chuyển sang Gemini 3.6 Flash để robot vẫn trò chuyện.
 # - Gemini lỗi/chậm không đẩy ESP32 vào tts_error; robot nói thông báo bằng TTS.
-# - Phát hiện quota thật từ lỗi của Gemini Live và khóa Live đến ngày hôm sau.
+# - Gemini 3.6 fallback retry lỗi 503/5xx/timeout ngắn hạn trước khi báo lỗi, không vô hiệu hóa key vì lỗi máy chủ tạm thời.
+# - Phát hiện quota/rate-limit của Gemini Live và cooldown tạm thời; không giả định daily quota.
 # - Khi hết quota AI, robot nói rõ đã hết lượt miễn phí và sẽ thử lại ngày mai.
 # - Giữ bộ đếm local Search chỉ như safety guard cục bộ, không coi đó là quota Google thật.
 # - KHÔNG dùng local STT/Whisper trong đường nghe fallback; giữ nguyên audio -> Gemini 3.6 như V4.8.
@@ -85,7 +86,16 @@ _GEMINI_36_QUOTA_EXHAUSTED = False
 _GEMINI_36_QUOTA_REASON = ""
 # Fallback is deliberately fixed in code so an old Render GEMINI_MODEL variable
 # cannot silently switch the backup brain to a paid/unsupported model.
-GEMINI_FALLBACK_TIMEOUT_SECONDS = max(5.0, float(os.environ.get("GEMINI_FALLBACK_TIMEOUT_SECONDS", "18")))
+GEMINI_FALLBACK_TIMEOUT_SECONDS = max(5.0, float(os.environ.get("GEMINI_FALLBACK_TIMEOUT_SECONDS", "30")))
+# Each attempt has its own timeout so a transient timeout can be retried inside the total budget.
+GEMINI_FALLBACK_ATTEMPT_TIMEOUT_SECONDS = max(
+    5.0, float(os.environ.get("GEMINI_FALLBACK_ATTEMPT_TIMEOUT_SECONDS", "14"))
+)
+# Retry only transient service failures. 503/5xx/timeout must NOT disable a valid key.
+GEMINI_FALLBACK_MAX_ATTEMPTS = max(1, int(os.environ.get("GEMINI_FALLBACK_MAX_ATTEMPTS", "2")))
+GEMINI_FALLBACK_RETRY_BACKOFF_SECONDS = max(
+    0.2, float(os.environ.get("GEMINI_FALLBACK_RETRY_BACKOFF_SECONDS", "0.8"))
+)
 MEMORY_TURNS = max(10, int(os.environ.get("MEMORY_TURNS", "10")))
 
 # ================================================================================
@@ -793,22 +803,31 @@ def classify_gemini_error(exc) -> str:
     if code in (1011,) and ("quota" in text or "resource_exhausted" in text):
         return "live_quota"
 
+    # HTTP status codes are more trustworthy than message keywords. In particular,
+    # a 503 that happens to contain words like "rate limit" must remain transient
+    # and must never disable a healthy API key.
+    if code == 429:
+        return "quota"
+    if code in (500, 502, 503, 504):
+        return "transient"
     if code in (401, 403):
         return "rotate"
     key_markers = (
         "api key not valid", "api_key_invalid", "invalid api key", "invalid_api_key",
-        "unauthenticated", "permission denied", "permission_denied", "quota exceeded",
-        "quota_exceeded", "resource_exhausted", "rate limit", "ratelimit",
+        "unauthenticated", "permission denied", "permission_denied",
     )
     if any(x in text for x in key_markers):
         return "rotate"
-    if code == 429:
+    quota_markers = (
+        "quota exceeded", "quota_exceeded", "resource_exhausted", "rate limit", "ratelimit",
+    )
+    if any(x in text for x in quota_markers):
         return "quota"
     transient_markers = (
         "service unavailable", "internal server error", "bad gateway", "gateway timeout",
         "deadline exceeded", "timeout", "timed out", "connection reset", "temporarily unavailable",
     )
-    if code in (500, 502, 503, 504) or any(x in text for x in transient_markers):
+    if any(x in text for x in transient_markers):
         return "transient"
     return "fatal"
 
@@ -1103,7 +1122,7 @@ def read_root():
     # endpoint must not reference the old LOCAL_STT_* variables.
     return {
         "status": "Robot Bun Dau Server OK",
-        "version": "4.10.4",
+        "version": "4.10.5",
         "gemini_keys": len(API_KEYS),
         "local_stt_enabled": False,
         "local_stt_model": None,
@@ -1121,6 +1140,9 @@ def read_root():
         # Gemini 3.8 Live does not use the legacy batch thinking/request-timeout fields.
         "gemini_live_thinking": "not_configured_for_3.8_live",
         "gemini_fallback_timeout_seconds": GEMINI_FALLBACK_TIMEOUT_SECONDS,
+        "gemini_fallback_attempt_timeout_seconds": GEMINI_FALLBACK_ATTEMPT_TIMEOUT_SECONDS,
+        "gemini_fallback_max_attempts": GEMINI_FALLBACK_MAX_ATTEMPTS,
+        "gemini_fallback_retry_backoff_seconds": GEMINI_FALLBACK_RETRY_BACKOFF_SECONDS,
         "memory_turns": MEMORY_TURNS,
         "gemini_debug_chunks": GEMINI_DEBUG_CHUNKS,
         "google_search_enabled": GOOGLE_SEARCH_ENABLED,
@@ -1151,7 +1173,7 @@ def read_root():
 @app.get("/healthz")
 def healthz():
     # Minimal Render/monitoring health endpoint; never calls Gemini or STT.
-    return {"status": "ok", "version": "4.10.4"}
+    return {"status": "ok", "version": "4.10.5"}
 
 
 # ================================================================================
@@ -1394,11 +1416,14 @@ async def ask_gemini_36_fallback_audio(
     safety_config,
     history: deque,
 ) -> tuple[str, str, dict]:
-    """Gemini 3.6 Flash fallback for ordinary conversation when 3.8 Live is unavailable.
+    """Gemini 3.6 Flash fallback with bounded retry for transient service failures.
 
-    Deliberately no Google Search tool is attached. If the user asks for realtime/current
-    information while 3.8 Live is unavailable, the model must say that web access is
-    unavailable instead of guessing stale/current data.
+    503/500/502/504 and request timeouts are treated as temporary service problems:
+    retry the same active key before trying another active key. These failures do NOT
+    disable the key and do NOT mark the daily quota as exhausted.
+
+    Real 429/quota/auth failures still follow the existing key rotation/quota guard.
+    The exact WAV recorded by ESP32 is preserved; no local STT is introduced.
     """
     global CURRENT_KEY_INDEX
 
@@ -1416,13 +1441,14 @@ async def ask_gemini_36_fallback_audio(
 - Bạn đang là AI dự phòng bằng {FALLBACK_MODEL_NAME}.
 - Trong chế độ này KHÔNG có Google Search và KHÔNG được sử dụng công cụ Internet.
 - Với câu hỏi cần thông tin hiện tại, ví dụ thời tiết hôm nay, giá vàng/xăng/tỷ giá hiện tại, tin tức mới, kết quả mới hoặc dữ liệu có thể thay đổi, tuyệt đối không được đoán.
-- Với câu hỏi realtime như vậy, trong REPLY hãy nói ngắn gọn rằng chức năng tìm kiếm mạng đang tạm hết quota và sẽ thử lại vào ngày mai.
+- Với câu hỏi realtime như vậy, trong REPLY hãy nói ngắn gọn rằng chức năng tìm kiếm mạng đang tạm không khả dụng và sẽ thử lại sau.
 - Câu hỏi giờ/ngày/thứ phải dùng [SERVER_TIME_NOW] và KHÔNG được nói rằng cần Search.
 - Các câu hỏi trò chuyện thông thường, kiến thức không phụ thuộc thời gian và lệnh robot vẫn phải xử lý bình thường.
 - Giữ nguyên định dạng MEMORY/ACTION/REPLY và tính cách Bún Đậu."""
 
     key_idx: Optional[int] = CURRENT_KEY_INDEX if CURRENT_KEY_INDEX < len(API_KEYS) else 0
     last_exc: Optional[Exception] = None
+    overall_deadline = time.monotonic() + GEMINI_FALLBACK_TIMEOUT_SECONDS
 
     while key_idx is not None:
         if KEY_STATUS[key_idx] != "active":
@@ -1435,131 +1461,208 @@ async def ask_gemini_36_fallback_audio(
             key_idx = next_active_key_after(key_idx)
             continue
 
-        started = time.monotonic()
-        try:
-            print(
-                f"[FALLBACK 3.6] Dung Key #{key_idx + 1} | model={FALLBACK_MODEL_NAME} | search=OFF | "
-                f"timeout={GEMINI_FALLBACK_TIMEOUT_SECONDS}s",
-                flush=True,
-            )
-            response = await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=FALLBACK_MODEL_NAME,
-                    contents=make_gemini_contents(history, wav_bytes),
-                    config=types.GenerateContentConfig(
-                        system_instruction=fallback_system,
-                        max_output_tokens=MAX_OUTPUT_TOKENS,
-                        safety_settings=safety_config,
-                    ),
-                ),
-                timeout=GEMINI_FALLBACK_TIMEOUT_SECONDS,
-            )
+        for attempt in range(1, GEMINI_FALLBACK_MAX_ATTEMPTS + 1):
+            remaining = overall_deadline - time.monotonic()
+            if remaining <= 0:
+                break
 
-            candidates = getattr(response, "candidates", None) or []
-            parts: list[str] = []
-            finish_reason = "UNKNOWN"
-            finish_message = None
-            usage = getattr(response, "usage_metadata", None)
-
-            if candidates:
-                candidate = candidates[0]
-                finish_value = getattr(candidate, "finish_reason", None)
-                if finish_value is not None:
-                    finish_reason = str(finish_value)
-                finish_message_value = getattr(candidate, "finish_message", None)
-                if finish_message_value:
-                    finish_message = str(finish_message_value)
-                content = getattr(candidate, "content", None)
-                response_parts = getattr(content, "parts", None) if content is not None else None
-                for part in response_parts or []:
-                    if getattr(part, "thought", False):
-                        continue
-                    part_text = getattr(part, "text", None)
-                    if part_text:
-                        parts.append(str(part_text))
-
-            raw_text = "".join(parts).strip()
-            elapsed_ms = int((time.monotonic() - started) * 1000)
-            print(
-                f"[FALLBACK 3.6] Hoan tat | chars={len(raw_text)} | "
-                f"finish_reason={finish_reason!r} | total={elapsed_ms} ms",
-                flush=True,
-            )
-            if usage:
+            started = time.monotonic()
+            attempt_timeout = min(GEMINI_FALLBACK_ATTEMPT_TIMEOUT_SECONDS, remaining)
+            try:
                 print(
-                    f"[FALLBACK 3.6] Usage | prompt={getattr(usage, 'prompt_token_count', None)} | "
-                    f"output={getattr(usage, 'candidates_token_count', None)} | "
-                    f"total={getattr(usage, 'total_token_count', None)}",
+                    f"[FALLBACK 3.6] Dung Key #{key_idx + 1} | model={FALLBACK_MODEL_NAME} | search=OFF | "
+                    f"attempt={attempt}/{GEMINI_FALLBACK_MAX_ATTEMPTS} | timeout={attempt_timeout:.1f}s | "
+                    f"total_remaining={remaining:.1f}s",
                     flush=True,
                 )
 
-            upper = finish_reason.upper()
-            if any(x in upper for x in ("MAX_TOKENS", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "INCOMPLETE")):
-                raise RuntimeError(
-                    f"Gemini 3.6 response khong hoan chinh: {finish_reason}"
-                    + (f" | {finish_message}" if finish_message else "")
+                response = await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=FALLBACK_MODEL_NAME,
+                        contents=make_gemini_contents(history, wav_bytes),
+                        config=types.GenerateContentConfig(
+                            system_instruction=fallback_system,
+                            max_output_tokens=MAX_OUTPUT_TOKENS,
+                            safety_settings=safety_config,
+                        ),
+                    ),
+                    timeout=attempt_timeout,
                 )
-            if not raw_text:
-                raise RuntimeError("Gemini 3.6 tra ve rong")
 
-            memory_text, reply_text, action = parse_tagged_response(raw_text)
-            if not reply_text:
-                raise RuntimeError("Gemini 3.6 tra ve rong REPLY")
-            if not memory_text:
-                memory_text = "Không trích xuất được tóm tắt lượt này."
+                candidates = getattr(response, "candidates", None) or []
+                parts: list[str] = []
+                finish_reason = "UNKNOWN"
+                finish_message = None
+                usage = getattr(response, "usage_metadata", None)
 
-            CURRENT_KEY_INDEX = key_idx
-            print(f"[FALLBACK 3.6 REPLY] {reply_text!r}", flush=True)
-            return memory_text, reply_text, action
+                if candidates:
+                    candidate = candidates[0]
+                    finish_value = getattr(candidate, "finish_reason", None)
+                    if finish_value is not None:
+                        finish_reason = str(finish_value)
+                    finish_message_value = getattr(candidate, "finish_message", None)
+                    if finish_message_value:
+                        finish_message = str(finish_message_value)
+                    content = getattr(candidate, "content", None)
+                    response_parts = getattr(content, "parts", None) if content is not None else None
+                    for part in response_parts or []:
+                        if getattr(part, "thought", False):
+                            continue
+                        part_text = getattr(part, "text", None)
+                        if part_text:
+                            parts.append(str(part_text))
 
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"Gemini 3.6 timeout sau {GEMINI_FALLBACK_TIMEOUT_SECONDS:.0f}s"
-            ) from exc
-        except Exception as exc:
-            last_exc = exc
-            code = _error_code(exc)
-            detail = str(exc).replace("\n", " ")[:260]
-            quota_hit = (
-                code == 429
-                or "quota" in detail.lower()
-                or "resource_exhausted" in detail.lower()
-            )
-            if quota_hit:
-                mark_key_disabled(key_idx, "Gemini 3.6 quota/429: " + detail)
+                raw_text = "".join(parts).strip()
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                print(
+                    f"[FALLBACK 3.6] Hoan tat | chars={len(raw_text)} | "
+                    f"finish_reason={finish_reason!r} | total={elapsed_ms} ms",
+                    flush=True,
+                )
+                if usage:
+                    print(
+                        f"[FALLBACK 3.6] Usage | prompt={getattr(usage, 'prompt_token_count', None)} | "
+                        f"output={getattr(usage, 'candidates_token_count', None)} | "
+                        f"total={getattr(usage, 'total_token_count', None)}",
+                        flush=True,
+                    )
+
+                upper = finish_reason.upper()
+                if any(x in upper for x in ("MAX_TOKENS", "SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "INCOMPLETE")):
+                    raise RuntimeError(
+                        f"Gemini 3.6 response khong hoan chinh: {finish_reason}"
+                        + (f" | {finish_message}" if finish_message else "")
+                    )
+                if not raw_text:
+                    raise RuntimeError("Gemini 3.6 tra ve rong")
+
+                memory_text, reply_text, action = parse_tagged_response(raw_text)
+                if not reply_text:
+                    raise RuntimeError("Gemini 3.6 tra ve rong REPLY")
+                if not memory_text:
+                    memory_text = "Không trích xuất được tóm tắt lượt này."
+
+                CURRENT_KEY_INDEX = key_idx
+                print(f"[FALLBACK 3.6 REPLY] {reply_text!r}", flush=True)
+                return memory_text, reply_text, action
+
+            except asyncio.TimeoutError as exc:
+                last_exc = RuntimeError(
+                    f"Gemini 3.6 timeout sau {int(time.monotonic() - started)}s | attempt={attempt}"
+                )
+                if attempt < GEMINI_FALLBACK_MAX_ATTEMPTS:
+                    remaining_after = overall_deadline - time.monotonic()
+                    if remaining_after > 0:
+                        delay = min(GEMINI_FALLBACK_RETRY_BACKOFF_SECONDS, max(0.0, remaining_after))
+                        print(
+                            f"[FALLBACK 3.6 TRANSIENT] Timeout Key #{key_idx + 1} -> retry sau {delay:.1f}s | "
+                            f"remaining={remaining_after:.1f}s",
+                            flush=True,
+                        )
+                        if delay > 0:
+                            await asyncio.sleep(delay)
+                    continue
+                print(
+                    f"[FALLBACK 3.6 TRANSIENT] Timeout Key #{key_idx + 1} het retry; khong vo hieu hoa key.",
+                    flush=True,
+                )
                 nxt = next_active_key_after(key_idx)
                 if nxt is not None:
                     print(
-                        f"[FALLBACK 3.6] Key #{key_idx + 1} het quota/429 -> thu Key #{nxt + 1}",
+                        f"[FALLBACK 3.6 TRANSIENT] Thu key active tiep theo #{nxt + 1}.",
                         flush=True,
                     )
                     key_idx = nxt
-                    continue
-                mark_gemini_36_quota_exhausted(detail)
-                raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: " + detail) from exc
-            if classify_gemini_error(exc) == "rotate":
-                mark_key_disabled(key_idx, detail)
-                nxt = next_active_key_after(key_idx)
-                if nxt is None:
+                else:
+                    key_idx = None
+                break
+
+            except Exception as exc:
+                last_exc = exc
+                code = _error_code(exc)
+                detail = str(exc).replace("\n", " ")[:260]
+                kind = classify_gemini_error(exc)
+
+                quota_hit = (
+                    code == 429
+                    or (kind == "quota" and code not in (500, 502, 503, 504))
+                )
+                if quota_hit:
+                    mark_key_disabled(key_idx, "Gemini 3.6 quota/429: " + detail)
+                    nxt = next_active_key_after(key_idx)
+                    if nxt is not None:
+                        print(
+                            f"[FALLBACK 3.6] Key #{key_idx + 1} het quota/429 -> thu Key #{nxt + 1}",
+                            flush=True,
+                        )
+                        key_idx = nxt
+                        break
+                    mark_gemini_36_quota_exhausted(detail)
+                    raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: " + detail) from exc
+
+                if kind == "rotate":
+                    mark_key_disabled(key_idx, detail)
+                    nxt = next_active_key_after(key_idx)
+                    if nxt is None:
+                        key_idx = None
+                        break
+                    print(
+                        f"[FALLBACK 3.6] Key #{key_idx + 1} khong dung duoc -> Key #{nxt + 1}",
+                        flush=True,
+                    )
+                    key_idx = nxt
                     break
+
+                if kind == "transient":
+                    if attempt < GEMINI_FALLBACK_MAX_ATTEMPTS:
+                        remaining_after = overall_deadline - time.monotonic()
+                        if remaining_after > 0:
+                            delay = min(GEMINI_FALLBACK_RETRY_BACKOFF_SECONDS, max(0.0, remaining_after))
+                            print(
+                                f"[FALLBACK 3.6 TRANSIENT] Key #{key_idx + 1} HTTP={code or 'n/a'} -> retry "
+                                f"{attempt + 1}/{GEMINI_FALLBACK_MAX_ATTEMPTS} sau {delay:.1f}s | "
+                                f"error={detail[:180]}",
+                                flush=True,
+                            )
+                            if delay > 0:
+                                await asyncio.sleep(delay)
+                        continue
+
+                    print(
+                        f"[FALLBACK 3.6 TRANSIENT] Key #{key_idx + 1} van con hoat dong; "
+                        f"het retry | error={detail[:220]} | khong vo hieu hoa key",
+                        flush=True,
+                    )
+                    nxt = next_active_key_after(key_idx)
+                    if nxt is not None:
+                        print(
+                            f"[FALLBACK 3.6 TRANSIENT] Thu key active tiep theo #{nxt + 1}.",
+                            flush=True,
+                        )
+                        key_idx = nxt
+                    else:
+                        key_idx = None
+                    break
+
                 print(
-                    f"[FALLBACK 3.6] Key #{key_idx + 1} khong dung duoc -> Key #{nxt + 1}",
+                    f"[FALLBACK 3.6] Loi Key #{key_idx + 1}: {detail}",
                     flush=True,
                 )
-                key_idx = nxt
-                continue
-            print(
-                f"[FALLBACK 3.6] Loi Key #{key_idx + 1}: {detail}",
-                flush=True,
-            )
-            raise RuntimeError(detail) from exc
+                key_idx = None
+                break
 
     if last_exc:
         detail = str(last_exc)
-        if classify_gemini_error(last_exc) == "quota" or "quota" in detail.lower() or "resource_exhausted" in detail.lower():
+        if (
+            classify_gemini_error(last_exc) == "quota"
+            or "quota" in detail.lower()
+            or "resource_exhausted" in detail.lower()
+        ):
             mark_gemini_36_quota_exhausted(detail)
             raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: " + detail) from last_exc
-    raise RuntimeError(str(last_exc) if last_exc else "Khong con Gemini 3.6 key active")
+    raise RuntimeError(
+        str(last_exc) if last_exc else "Gemini 3.6 fallback khong hoan tat trong cua so retry"
+    )
 
 
 # ================================================================================
