@@ -157,7 +157,7 @@ def local_today_str() -> str:
 # Token không phải số từ cố định; tiếng Việt có thể dùng số token khác nhau cho cùng
 # một lượng chữ. Tăng dòng này để cho phép Gemini trả lời dài hơn. Ví dụ: 768 -> 1200.
 # Tăng giới hạn KHÔNG tự tạo thêm lượt nói; chỉ cho phép một lượt trả lời dài hơn.
-MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "768"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "1100"))
 
 # Đây là giới hạn mềm về độ dài câu trả lời mà prompt yêu cầu. Nó không phải quota Gemini.
 # Tăng lên nếu muốn robot nói dài hơn nữa; giá trị này không làm phát sinh thêm một lượt phát.
@@ -255,7 +255,7 @@ Cách nói chuyện bắt buộc:
 
 QUY TẮC TRẢ LỜI:
 - Chỉ phần bên trong REPLY được nói bằng loa.
-- Thường tối đa 1 đến 2 câu; nếu cần giải thích để hợp logic thì có thể dài hơn một chút nhưng vẫn gọn.
+- Nói câu tự nhiên chân thực; nếu cần giải thích để hợp logic thì có thể dài hơn một chút.
 - Chỉ trả lời bằng tiếng Việt.
 - Phải giữ đúng chính tả tiếng Việt; không tự ý biến “không” thành “hông”, không làm mất phụ âm/âm tiết của từ, ví dụ không biến “ma xó” thành “ma ó”.
 - Nếu được hỏi “Bạn là ai?” thì REPLY phải là: “em là Robot thông minh nhất do Đại ca Việt chế tạo.”
