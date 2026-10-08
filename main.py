@@ -157,7 +157,7 @@ def local_today_str() -> str:
 # Token không phải số từ cố định; tiếng Việt có thể dùng số token khác nhau cho cùng
 # một lượng chữ. Tăng dòng này để cho phép Gemini trả lời dài hơn. Ví dụ: 768 -> 1200.
 # Tăng giới hạn KHÔNG tự tạo thêm lượt nói; chỉ cho phép một lượt trả lời dài hơn.
-MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "1100"))
+MAX_OUTPUT_TOKENS = int(os.environ.get("GEMINI_MAX_OUTPUT_TOKENS", "950"))
 
 # Đây là giới hạn mềm về độ dài câu trả lời mà prompt yêu cầu. Nó không phải quota Gemini.
 # Tăng lên nếu muốn robot nói dài hơn nữa; giá trị này không làm phát sinh thêm một lượt phát.
