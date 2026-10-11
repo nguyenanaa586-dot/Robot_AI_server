@@ -1,6 +1,6 @@
 # ================================================================================
-# ROBOT BÚN ĐẬU SERVER - V4.10.6 - MEMORY GUARD + CLIENT CLEANUP
-# Phiên bản: 4.10.6
+# ROBOT BÚN ĐẬU SERVER - V4.10.7 - RECOVERY + MEMORY GUARD
+# Phiên bản: 4.10.7
 #
 # - Gemini 3.8 Live là não chính cho hội thoại realtime và Google Search.
 # - Gemini 3.6 Flash là não dự phòng khi Gemini 3.8 Live hết quota/lỗi.
@@ -10,9 +10,8 @@
 # - Dùng Gemini 3.8 Live làm pipeline hội thoại/âm thanh chính.
 # - Khi Live lỗi/hết quota, lượt đó chuyển sang Gemini 3.6 Flash để robot vẫn trò chuyện.
 # - Gemini lỗi/chậm không đẩy ESP32 vào tts_error; robot nói thông báo bằng TTS.
-# - Gemini 3.6 fallback retry lỗi 503/5xx/timeout ngắn hạn trước khi báo lỗi, không vô hiệu hóa key vì lỗi máy chủ tạm thời.
-# - Đóng async/sync Gemini clients sau mỗi tác vụ và khi đóng Live session để tránh rò rỉ socket/client.
-# - Giới hạn dung lượng audio phía server, giải phóng bytearray sau mỗi lượt và mặc định tắt log chunk chi tiết.
+# - Giữ retry fallback Gemini 3.6; giới hạn audio để tránh bộ đệm tăng vô hạn trên Render.
+# - Chỉ đóng async HTTP client tạm sau tác vụ TTS/fallback; không đóng client của Live khi session còn hoạt động.
 # - Phát hiện quota/rate-limit của Gemini Live và cooldown tạm thời; không giả định daily quota.
 # - Khi hết quota AI, robot nói rõ đã hết lượt miễn phí và sẽ thử lại ngày mai.
 # - Giữ bộ đếm local Search chỉ như safety guard cục bộ, không coi đó là quota Google thật.
@@ -763,8 +762,8 @@ def get_genai_client(key_index: int):
     return genai.Client(api_key=API_KEYS[key_index])
 
 
-async def close_genai_client(client) -> None:
-    """Explicitly release Gemini SDK HTTP resources; safe to call on partial clients."""
+async def close_genai_async_client(client) -> None:
+    """Close only the async HTTP client used by async requests; never close the sync client."""
     if client is None:
         return
     try:
@@ -773,17 +772,11 @@ async def close_genai_client(client) -> None:
         if callable(async_close):
             await async_close()
     except Exception as exc:
-        print(f"[RESOURCE] Khong dong duoc Gemini async client: {str(exc)[:140]}", flush=True)
-    try:
-        sync_close = getattr(client, "close", None)
-        if callable(sync_close):
-            sync_close()
-    except Exception as exc:
-        print(f"[RESOURCE] Khong dong duoc Gemini sync client: {str(exc)[:140]}", flush=True)
+        print(f"[RESOURCE] Khong dong duoc Gemini async client: {str(exc)[:120]}", flush=True)
 
 
 def process_memory_snapshot() -> dict:
-    """Best-effort process memory metrics without third-party dependencies."""
+    """Best-effort memory metrics for Render diagnostics; uses only standard library."""
     result = {"rss_mb": None, "peak_rss_mb": None}
     try:
         with open("/proc/self/status", "r", encoding="utf-8") as fh:
@@ -795,9 +788,7 @@ def process_memory_snapshot() -> dict:
         pass
     try:
         import resource
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # Linux reports KiB; macOS reports bytes. Render runs Linux.
-        result["peak_rss_mb"] = round(float(peak) / 1024, 1)
+        result["peak_rss_mb"] = round(float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / 1024, 1)
     except Exception:
         pass
     return result
@@ -910,9 +901,8 @@ AUDIO_INPUT_SAMPLE_RATE = 16000
 AUDIO_INPUT_CHANNELS = 1
 AUDIO_INPUT_BYTES_PER_SAMPLE = 2
 AUDIO_MIN_TURN_BYTES = 3200
-# ESP32 is configured for at most ~15 seconds (about 480 KB PCM16 at 16 kHz).
-# This guard protects Render if a client accidentally streams without an endpoint.
-MAX_AUDIO_INPUT_BYTES = max(64000, int(os.environ.get("MAX_AUDIO_INPUT_BYTES", "1000000")))
+# 15 seconds of PCM16/16kHz mono is about 480 KB. 768 KB leaves margin but prevents runaway buffers.
+MAX_AUDIO_INPUT_BYTES = max(512000, int(os.environ.get("MAX_AUDIO_INPUT_BYTES", "768000")))
 TTS_CHUNK_SIZE = 2048
 TTS_PREBUFFER_MS = max(0, int(os.environ.get("TTS_PREBUFFER_MS", "320")))
 # Thời gian tối đa cho một lần tổng hợp TTS; tăng nếu cho phép câu trả lời rất dài.
@@ -1057,6 +1047,7 @@ async def stream_gemini_tts_to_esp(
         total_sent = 0
         buffered = bytearray()
         state = {"next_deadline": time.monotonic()}
+
         prompt = (
             f"{GEMINI_TTS_STYLE}\n"
             f"Đọc nguyên văn đúng nội dung sau, không thêm hoặc bớt từ: {text}"
@@ -1076,32 +1067,30 @@ async def stream_gemini_tts_to_esp(
                 ),
             ),
         )
-        prebuffer_bytes = int(PCM_BYTES_PER_SECOND * TTS_PREBUFFER_MS / 1000)
-        try:
-            async for chunk in stream:
-                raw24 = _extract_tts_audio_bytes(chunk)
-                if not raw24:
-                    continue
-                pcm16 = await asyncio.to_thread(_resample_pcm24_to_16, raw24)
-                if not pcm16:
-                    continue
-                buffered.extend(pcm16)
-                if first_audio_ms is None:
-                    first_audio_ms = int((time.monotonic() - started) * 1000)
-                if len(buffered) >= prebuffer_bytes:
-                    total_sent += await _send_pcm_paced(websocket, bytes(buffered), state)
-                    buffered.clear()
-            if buffered:
-                total_sent += await _send_pcm_paced(websocket, bytes(buffered), state)
-        finally:
-            # Some SDK versions expose a close method on the async stream iterator.
-            stream_close = getattr(stream, "aclose", None)
-            if callable(stream_close):
-                try:
-                    await stream_close()
-                except Exception:
-                    pass
-            buffered.clear()
+
+        prebuffer_bytes = int(
+            PCM_BYTES_PER_SECOND * TTS_PREBUFFER_MS / 1000
+        )
+        async for chunk in stream:
+            raw24 = _extract_tts_audio_bytes(chunk)
+            if not raw24:
+                continue
+            pcm16 = await asyncio.to_thread(_resample_pcm24_to_16, raw24)
+            if not pcm16:
+                continue
+            buffered.extend(pcm16)
+            if first_audio_ms is None:
+                first_audio_ms = int((time.monotonic() - started) * 1000)
+            if len(buffered) >= prebuffer_bytes:
+                total_sent += await _send_pcm_paced(
+                    websocket,
+                    bytes(buffered),
+                    state,
+                )
+                buffered.clear()
+
+        if buffered:
+            total_sent += await _send_pcm_paced(websocket, bytes(buffered), state)
 
         if total_sent <= 0:
             raise RuntimeError("Gemini TTS khong tra audio")
@@ -1114,7 +1103,7 @@ async def stream_gemini_tts_to_esp(
         )
         return total_sent, first_audio_ms or elapsed, GEMINI_TTS_VOICE
     finally:
-        await close_genai_client(client)
+        await close_genai_async_client(client)
 
 
 async def send_edge_fallback_to_esp(
@@ -1171,7 +1160,7 @@ def read_root():
     # endpoint must not reference the old LOCAL_STT_* variables.
     return {
         "status": "Robot Bun Dau Server OK",
-        "version": "4.10.6",
+        "version": "4.10.7",
         "gemini_keys": len(API_KEYS),
         "local_stt_enabled": False,
         "local_stt_model": None,
@@ -1224,7 +1213,7 @@ def read_root():
 @app.get("/healthz")
 def healthz():
     # Minimal Render/monitoring health endpoint; never calls Gemini or STT.
-    return {"status": "ok", "version": "4.10.6", "memory": process_memory_snapshot()}
+    return {"status": "ok", "version": "4.10.7", "memory": process_memory_snapshot()}
 
 
 # ================================================================================
@@ -1370,10 +1359,8 @@ def _log_gemini_text_chunk(
 ) -> None:
     if not GEMINI_DEBUG_CHUNKS:
         return
-    preview = text[:400]
-    suffix = "...[truncated]" if len(text) > len(preview) else ""
     print(
-        f"[GEMINI CHUNK] {label} | chunk={chunk_index} | part={part_index} | text={preview!r}{suffix}",
+        f"[GEMINI CHUNK] {label} | chunk={chunk_index} | part={part_index} | text={text!r}",
         flush=True,
     )
 
@@ -1447,10 +1434,14 @@ def _log_gemini_result(
     total_ms: int,
 ) -> None:
     if GEMINI_DEBUG_CHUNKS:
-        # Do not write potentially large model/search payloads twice into Render logs.
-        preview = raw_text[:800]
-        suffix = "...[truncated]" if len(raw_text) > len(preview) else ""
-        print(f"[GEMINI RAW PREVIEW] {label}: {preview!r}{suffix}", flush=True)
+        print(
+            f"[GEMINI RAW REPR] {label}: {raw_text!r}",
+            flush=True,
+        )
+        print(
+            f"[GEMINI RAW NORMAL] {label}: {raw_text}",
+            flush=True,
+        )
     print(
         f"[GEMINI STREAM] {label} | chunks={chunk_count} | "
         f"finish_reason={finish_state.get('reason')!r} | "
@@ -1465,13 +1456,22 @@ async def ask_gemini_36_fallback_audio(
     safety_config,
     history: deque,
 ) -> tuple[str, str, dict]:
-    """Bounded Gemini 3.6 Flash audio fallback with explicit client cleanup."""
+    """Gemini 3.6 Flash fallback with bounded retry for transient service failures.
+
+    503/500/502/504 and request timeouts are treated as temporary service problems:
+    retry the same active key before trying another active key. These failures do NOT
+    disable the key and do NOT mark the daily quota as exhausted.
+
+    Real 429/quota/auth failures still follow the existing key rotation/quota guard.
+    The exact WAV recorded by ESP32 is preserved; no local STT is introduced.
+    """
     global CURRENT_KEY_INDEX
 
     if not API_KEYS:
         raise RuntimeError("Khong co GEMINI_API_KEY")
     if not wav_bytes:
         raise RuntimeError("Audio fallback rong")
+
     if is_gemini_36_quota_exhausted():
         raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: daily guard")
 
@@ -1491,8 +1491,6 @@ async def ask_gemini_36_fallback_audio(
     overall_deadline = time.monotonic() + GEMINI_FALLBACK_TIMEOUT_SECONDS
 
     while key_idx is not None:
-        if key_idx < 0 or key_idx >= len(API_KEYS):
-            break
         if KEY_STATUS[key_idx] != "active":
             key_idx = next_active_key_after(key_idx)
             continue
@@ -1503,7 +1501,6 @@ async def ask_gemini_36_fallback_audio(
             key_idx = next_active_key_after(key_idx)
             continue
 
-        next_key: Optional[int] = None
         try:
             for attempt in range(1, GEMINI_FALLBACK_MAX_ATTEMPTS + 1):
                 remaining = overall_deadline - time.monotonic()
@@ -1514,11 +1511,12 @@ async def ask_gemini_36_fallback_audio(
                 attempt_timeout = min(GEMINI_FALLBACK_ATTEMPT_TIMEOUT_SECONDS, remaining)
                 try:
                     print(
-                        f"[FALLBACK 3.6] Key #{key_idx + 1} | model={FALLBACK_MODEL_NAME} | "
-                        f"attempt={attempt}/{GEMINI_FALLBACK_MAX_ATTEMPTS} | "
-                        f"timeout={attempt_timeout:.1f}s | remaining={remaining:.1f}s",
+                        f"[FALLBACK 3.6] Dung Key #{key_idx + 1} | model={FALLBACK_MODEL_NAME} | search=OFF | "
+                        f"attempt={attempt}/{GEMINI_FALLBACK_MAX_ATTEMPTS} | timeout={attempt_timeout:.1f}s | "
+                        f"total_remaining={remaining:.1f}s",
                         flush=True,
                     )
+
                     response = await asyncio.wait_for(
                         client.aio.models.generate_content(
                             model=FALLBACK_MODEL_NAME,
@@ -1537,6 +1535,7 @@ async def ask_gemini_36_fallback_audio(
                     finish_reason = "UNKNOWN"
                     finish_message = None
                     usage = getattr(response, "usage_metadata", None)
+
                     if candidates:
                         candidate = candidates[0]
                         finish_value = getattr(candidate, "finish_reason", None)
@@ -1588,23 +1587,35 @@ async def ask_gemini_36_fallback_audio(
                     print(f"[FALLBACK 3.6 REPLY] {reply_text!r}", flush=True)
                     return memory_text, reply_text, action
 
-                except asyncio.CancelledError:
-                    raise
-                except asyncio.TimeoutError:
+                except asyncio.TimeoutError as exc:
                     last_exc = RuntimeError(
                         f"Gemini 3.6 timeout sau {int(time.monotonic() - started)}s | attempt={attempt}"
                     )
-                    if attempt < GEMINI_FALLBACK_MAX_ATTEMPTS and overall_deadline > time.monotonic():
-                        delay = min(GEMINI_FALLBACK_RETRY_BACKOFF_SECONDS, overall_deadline - time.monotonic())
+                    if attempt < GEMINI_FALLBACK_MAX_ATTEMPTS:
+                        remaining_after = overall_deadline - time.monotonic()
+                        if remaining_after > 0:
+                            delay = min(GEMINI_FALLBACK_RETRY_BACKOFF_SECONDS, max(0.0, remaining_after))
+                            print(
+                                f"[FALLBACK 3.6 TRANSIENT] Timeout Key #{key_idx + 1} -> retry sau {delay:.1f}s | "
+                                f"remaining={remaining_after:.1f}s",
+                                flush=True,
+                            )
+                            if delay > 0:
+                                await asyncio.sleep(delay)
+                        continue
+                    print(
+                        f"[FALLBACK 3.6 TRANSIENT] Timeout Key #{key_idx + 1} het retry; khong vo hieu hoa key.",
+                        flush=True,
+                    )
+                    nxt = next_active_key_after(key_idx)
+                    if nxt is not None:
                         print(
-                            f"[FALLBACK 3.6 TRANSIENT] Timeout -> retry {attempt + 1}/"
-                            f"{GEMINI_FALLBACK_MAX_ATTEMPTS} sau {delay:.1f}s; key giu active.",
+                            f"[FALLBACK 3.6 TRANSIENT] Thu key active tiep theo #{nxt + 1}.",
                             flush=True,
                         )
-                        if delay > 0:
-                            await asyncio.sleep(delay)
-                        continue
-                    next_key = next_active_key_after(key_idx)
+                        key_idx = nxt
+                    else:
+                        key_idx = None
                     break
 
                 except Exception as exc:
@@ -1612,59 +1623,76 @@ async def ask_gemini_36_fallback_audio(
                     code = _error_code(exc)
                     detail = str(exc).replace("\n", " ")[:260]
                     kind = classify_gemini_error(exc)
-                    quota_hit = code == 429 or (kind == "quota" and code not in (500, 502, 503, 504))
 
+                    quota_hit = (
+                        code == 429
+                        or (kind == "quota" and code not in (500, 502, 503, 504))
+                    )
                     if quota_hit:
                         mark_key_disabled(key_idx, "Gemini 3.6 quota/429: " + detail)
-                        next_key = next_active_key_after(key_idx)
-                        if next_key is not None:
+                        nxt = next_active_key_after(key_idx)
+                        if nxt is not None:
                             print(
-                                f"[FALLBACK 3.6] Key #{key_idx + 1} het quota/429 -> Key #{next_key + 1}",
+                                f"[FALLBACK 3.6] Key #{key_idx + 1} het quota/429 -> thu Key #{nxt + 1}",
                                 flush=True,
                             )
+                            key_idx = nxt
                             break
                         mark_gemini_36_quota_exhausted(detail)
                         raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: " + detail) from exc
 
                     if kind == "rotate":
                         mark_key_disabled(key_idx, detail)
-                        next_key = next_active_key_after(key_idx)
-                        if next_key is not None:
-                            print(
-                                f"[FALLBACK 3.6] Key #{key_idx + 1} khong dung duoc -> Key #{next_key + 1}",
-                                flush=True,
-                            )
+                        nxt = next_active_key_after(key_idx)
+                        if nxt is None:
+                            key_idx = None
+                            break
+                        print(
+                            f"[FALLBACK 3.6] Key #{key_idx + 1} khong dung duoc -> Key #{nxt + 1}",
+                            flush=True,
+                        )
+                        key_idx = nxt
                         break
 
                     if kind == "transient":
-                        if attempt < GEMINI_FALLBACK_MAX_ATTEMPTS and overall_deadline > time.monotonic():
-                            delay = min(GEMINI_FALLBACK_RETRY_BACKOFF_SECONDS, overall_deadline - time.monotonic())
-                            print(
-                                f"[FALLBACK 3.6 TRANSIENT] HTTP={code or 'n/a'} -> retry "
-                                f"{attempt + 1}/{GEMINI_FALLBACK_MAX_ATTEMPTS} sau {delay:.1f}s | "
-                                f"{detail[:160]}",
-                                flush=True,
-                            )
-                            if delay > 0:
-                                await asyncio.sleep(delay)
+                        if attempt < GEMINI_FALLBACK_MAX_ATTEMPTS:
+                            remaining_after = overall_deadline - time.monotonic()
+                            if remaining_after > 0:
+                                delay = min(GEMINI_FALLBACK_RETRY_BACKOFF_SECONDS, max(0.0, remaining_after))
+                                print(
+                                    f"[FALLBACK 3.6 TRANSIENT] Key #{key_idx + 1} HTTP={code or 'n/a'} -> retry "
+                                    f"{attempt + 1}/{GEMINI_FALLBACK_MAX_ATTEMPTS} sau {delay:.1f}s | "
+                                    f"error={detail[:180]}",
+                                    flush=True,
+                                )
+                                if delay > 0:
+                                    await asyncio.sleep(delay)
                             continue
-                        next_key = next_active_key_after(key_idx)
+
                         print(
-                            f"[FALLBACK 3.6 TRANSIENT] Het retry; khong khoa key vi loi tam thoi.",
+                            f"[FALLBACK 3.6 TRANSIENT] Key #{key_idx + 1} van con hoat dong; "
+                            f"het retry | error={detail[:220]} | khong vo hieu hoa key",
                             flush=True,
                         )
+                        nxt = next_active_key_after(key_idx)
+                        if nxt is not None:
+                            print(
+                                f"[FALLBACK 3.6 TRANSIENT] Thu key active tiep theo #{nxt + 1}.",
+                                flush=True,
+                            )
+                            key_idx = nxt
+                        else:
+                            key_idx = None
                         break
 
-                    print(f"[FALLBACK 3.6] Loi Key #{key_idx + 1}: {detail}", flush=True)
-                    raise RuntimeError(detail) from exc
+                    print(
+                        f"[FALLBACK 3.6] Loi Key #{key_idx + 1}: {detail}",
+                        flush=True,
+                    )
+                    key_idx = None
+                    break
         finally:
-            await close_genai_client(client)
-
-        if next_key is not None:
-            key_idx = next_key
-            continue
-        # No active key remains or the total request budget was consumed.
-        key_idx = None
+            await close_genai_async_client(client)
 
     if last_exc:
         detail = str(last_exc)
@@ -1675,8 +1703,9 @@ async def ask_gemini_36_fallback_audio(
         ):
             mark_gemini_36_quota_exhausted(detail)
             raise RuntimeError("GEMINI_36_QUOTA_EXHAUSTED: " + detail) from last_exc
-        raise RuntimeError(detail) from last_exc
-    raise RuntimeError("Gemini 3.6 fallback khong hoan tat trong cua so retry")
+    raise RuntimeError(
+        str(last_exc) if last_exc else "Gemini 3.6 fallback khong hoan tat trong cua so retry"
+    )
 
 
 # ================================================================================
@@ -1754,7 +1783,6 @@ async def close_live_handle(live_handle: Optional[dict]) -> None:
                 await session_cm.__aexit__(None, None, None)
             except Exception:
                 pass
-        await close_genai_client(live_handle.get("client"))
 
 
 def handle_live_key_error(key_idx: int, exc: Exception) -> Optional[int]:
@@ -1869,7 +1897,6 @@ async def open_live_handle(
                 detail = str(exc).replace("\n", " ")[:220]
                 if kind == "live_quota":
                     mark_live_quota_exhausted(detail)
-                    await close_genai_client(client)
                     raise RuntimeError(
                         "GEMINI_LIVE_COOLDOWN: "
                         f"retry_after={int(LIVE_QUOTA_COOLDOWN_SECONDS)}s"
@@ -1882,7 +1909,6 @@ async def open_live_handle(
                         f"[LIVE] Key #{key_idx + 1} bi vo hieu ({'HTTP ' + str(code) if code else 'key/quota error'})",
                         flush=True,
                     )
-                    await close_genai_client(client)
                     key_idx = nxt
                     break
 
@@ -1890,7 +1916,6 @@ async def open_live_handle(
                     await asyncio.sleep(0.5 * (2 ** (attempt - 1)))
                     continue
 
-                await close_genai_client(client)
                 raise RuntimeError(detail) from exc
 
     raise RuntimeError(str(last_exc) if last_exc else "Khong co Gemini Live key active")
@@ -2180,7 +2205,7 @@ async def websocket_chat(websocket: WebSocket):
                 if not speech_active or audio_limit_reached:
                     continue
 
-                # Preserve PCM16 bytes exactly, but guard against runaway uploads on Render.
+                # Keep PCM16 unchanged, but cap pathological turns to protect Render RAM.
                 binary_data = sanitize_pcm16_chunk(binary_data)
                 if not binary_data:
                     continue
@@ -2193,11 +2218,11 @@ async def websocket_chat(websocket: WebSocket):
                     allowed = remaining_audio - (remaining_audio % 2)
                     binary_data = binary_data[:allowed]
                     audio_limit_reached = True
-                    print(f"[AUDIO GUARD] Cham nguong {MAX_AUDIO_INPUT_BYTES} bytes; gioi han audio cua luot nay.", flush=True)
+                    print(f"[AUDIO GUARD] Cham nguong {MAX_AUDIO_INPUT_BYTES} bytes; gioi han luot ghi am nay.", flush=True)
                     if not binary_data:
                         continue
 
-                # Keep only one server-side audio buffer; no local STT/copy is introduced.
+                # Store one copy for fallback; the live path receives this same PCM chunk.
                 pcm_buffer.extend(binary_data)
 
                 if live_handle and live_handle.get("last_error") is None:
@@ -2401,7 +2426,6 @@ async def websocket_chat(websocket: WebSocket):
             if GEMINI_DEBUG_CHUNKS:
                 print(f"[BUN DAU REPR] {cleaned!r}", flush=True)
             print(f"[MEMORY] {user_memory}", flush=True)
-            print(f"[PROCESS MEMORY] {process_memory_snapshot()}", flush=True)
             print(
                 f"[ACTION] type={action.get('type')} emotion={action.get('emotion')} "
                 f"direction={action.get('direction')} degrees={action.get('degrees')} "
